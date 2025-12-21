@@ -1,0 +1,27 @@
+{
+  "name": "@degen-terminal/contracts",
+  "version": "1.0.0",
+  "description": "Degen Terminal Solana smart contracts",
+  "scripts": {
+    "build": "anchor build",
+    "test": "anchor test",
+    "test:local": "anchor test --skip-local-validator",
+    "deploy": "anchor deploy",
+    "deploy:devnet": "anchor deploy --provider.cluster devnet"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.29.0",
+    "@solana/spl-token": "^0.4.8",
+    "@solana/web3.js": "^1.95.3",
+    "bn.js": "^5.2.2"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.2.0",
+    "@types/chai": "^4.3.11",
+    "@types/mocha": "^10.0.6",
+    "chai": "^4.3.10",
+    "mocha": "^10.2.0",
+    "ts-mocha": "^10.0.0",
+    "typescript": "^5.3.3"
+  }
+}

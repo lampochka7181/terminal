@@ -1,0 +1,147 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #0a0a0f;
+  --surface: #12121a;
+  --surface-light: #1a1a25;
+  --border: #2a2a3a;
+  --accent: #00ff88;
+  --long: #00ff88;
+  --short: #ff3366;
+}
+
+* {
+  box-sizing: border-box;
+  padding: 0;
+  margin: 0;
+}
+
+html,
+body {
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--surface);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
+/* Number inputs without spinners */
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type='number'] {
+  -moz-appearance: textfield;
+}
+
+/* Focus styles */
+input:focus,
+button:focus {
+  outline: none;
+  ring: 2px;
+  ring-color: var(--accent);
+}
+
+/* Terminal text effect */
+.terminal-text {
+  font-family: var(--font-mono);
+  text-shadow: 0 0 5px rgba(0, 255, 136, 0.5);
+}
+
+/* Glow effect */
+.glow {
+  box-shadow: 0 0 20px rgba(0, 255, 136, 0.2);
+}
+
+/* Price flash animations */
+.price-up,
+.animate-flash-green {
+  animation: flash-green 0.3s ease-out;
+}
+
+.price-down,
+.animate-flash-red {
+  animation: flash-red 0.3s ease-out;
+}
+
+@keyframes flash-green {
+  0% { background-color: rgba(0, 255, 136, 0.4); }
+  50% { background-color: rgba(0, 255, 136, 0.2); }
+  100% { background-color: transparent; }
+}
+
+@keyframes flash-red {
+  0% { background-color: rgba(255, 51, 102, 0.4); }
+  50% { background-color: rgba(255, 51, 102, 0.2); }
+  100% { background-color: transparent; }
+}
+
+/* Orderbook depth bar animation */
+.orderbook-depth-bar {
+  transition: width 150ms ease-out;
+}
+
+/* Orderbook row hover effects */
+.orderbook-row {
+  transition: background-color 75ms ease-out;
+}
+
+.orderbook-row:hover {
+  background-color: var(--surface-light);
+}
+
+/* Size change pulse */
+@keyframes size-pulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+
+.size-changed {
+  animation: size-pulse 0.2s ease-out;
+}
+
+/* Slide in from bottom animation */
+@keyframes slide-in-from-bottom {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-in {
+  animation-duration: 0.3s;
+  animation-timing-function: ease-out;
+  animation-fill-mode: forwards;
+}
+
+.slide-in-from-bottom {
+  animation-name: slide-in-from-bottom;
+}
+
+
+

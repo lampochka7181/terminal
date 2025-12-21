@@ -1,0 +1,31 @@
+{
+  "name": "degen-terminal",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Binary outcome trading terminal on Solana",
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "clean": "turbo run clean && rm -rf node_modules",
+    "db:start": "docker-compose up -d postgres redis",
+    "db:stop": "docker-compose down",
+    "db:migrate": "pnpm --filter @degen/api run migrate",
+    "generate:types": "pnpm --filter @degen/contracts run build && node scripts/generate-types.js",
+    "format": "prettier --write \"**/*.{ts,tsx,js,json,md}\""
+  },
+  "devDependencies": {
+    "prettier": "^3.2.5",
+    "turbo": "^2.0.0",
+    "typescript": "^5.4.0"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "dependencies": {
+    "bs58": "^6.0.0"
+  }
+}
