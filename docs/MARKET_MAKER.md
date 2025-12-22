@@ -18,6 +18,8 @@ its ok for MM to have lean into yes or no contracts during first 20-30% of marke
 
 6. I thinking for MM it might be better to use websocket to stream orders instead of API 
 
+7. Maybe create a special dashboard on gui to see total exposures for each market on MM wallet 
+
 _____________________________________
 
 # Market Maker Architecture
