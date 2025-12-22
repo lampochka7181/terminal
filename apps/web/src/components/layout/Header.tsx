@@ -40,15 +40,6 @@ export function Header() {
             >
               Markets
             </Link>
-            <Link 
-              href="/orders" 
-              className={cn(
-                "px-2 sm:px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-colors flex items-center gap-2",
-                pathname === '/orders' ? "bg-accent/10 text-accent" : "text-text-muted hover:text-text-primary hover:bg-surface-light"
-              )}
-            >
-              Orders
-            </Link>
           </nav>
         </div>
 

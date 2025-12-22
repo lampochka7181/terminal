@@ -9,12 +9,12 @@ import { logger } from './logger.js';
  */
 
 // Client connection storage (managed by websocket.ts)
-let clients: Map<WebSocket, { subscriptions: Set<string>; wallet?: string }> = new Map();
+let clients: Map<WebSocket, { subscriptions: Set<string>; wallet?: string; userId?: string }> = new Map();
 
 /**
  * Register the clients map from websocket handler
  */
-export function registerClients(clientsMap: Map<WebSocket, { subscriptions: Set<string>; wallet?: string }>) {
+export function registerClients(clientsMap: Map<WebSocket, { subscriptions: Set<string>; wallet?: string; userId?: string }>) {
   clients = clientsMap;
 }
 
@@ -41,15 +41,23 @@ function broadcast(channel: string, data: any): void {
 }
 
 /**
- * Broadcast to a specific user
+ * Broadcast to a specific user by their UUID
+ * Direct format for frontend 'user' channel
  */
-function broadcastToUser(wallet: string, data: any): void {
+function broadcastToUser(userId: string, event: string, data: any): void {
+  const message = JSON.stringify({
+    channel: 'user',
+    event,
+    data,
+    timestamp: Date.now(),
+  });
+
   for (const [ws, client] of clients) {
-    if (ws.readyState === WebSocket.OPEN && client.wallet === wallet) {
+    if (ws.readyState === WebSocket.OPEN && client.userId === userId) {
       try {
-        ws.send(JSON.stringify(data));
+        ws.send(message);
       } catch (err) {
-        logger.error(`Failed to send to user ${wallet}:`, err);
+        logger.error(`Failed to send to user ${userId}:`, err);
       }
     }
   }
@@ -139,7 +147,7 @@ export function broadcastMarketResolved(
 }
 
 export function broadcastUserFill(
-  wallet: string,
+  userId: string,
   fill: {
     tradeId?: string;
     orderId: string;
@@ -151,14 +159,11 @@ export function broadcastUserFill(
     fee: number;
   }
 ): void {
-  broadcastToUser(wallet, {
-    type: 'fill',
-    data: fill,
-  });
+  broadcastToUser(userId, 'fill', fill);
 }
 
 export function broadcastUserSettlement(
-  wallet: string,
+  userId: string,
   settlement: {
     marketId: string;
     outcome: string;
@@ -166,11 +171,5 @@ export function broadcastUserSettlement(
     payout: number;
   }
 ): void {
-  broadcastToUser(wallet, {
-    type: 'settlement',
-    data: settlement,
-  });
+  broadcastToUser(userId, 'settlement', settlement);
 }
-
-
-

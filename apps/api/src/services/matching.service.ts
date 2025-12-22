@@ -79,6 +79,7 @@ export interface DollarMarketOrder {
 }
 
 export interface DollarMatchResult {
+  orderId: string;
   fills: Fill[];
   totalSpent: number;
   totalContracts: number;
@@ -103,11 +104,12 @@ export interface SellOrder {
 }
 
 export interface SellMatchResult {
+  orderId: string;
   fills: Fill[];
-  totalProceeds: number;    // Total USDC received
-  totalSold: number;        // Total contracts sold
+  totalProceeds: number;
+  totalSold: number;
   avgPrice: number;
-  remainingSize: number;    // Unsold contracts
+  remainingSize: number;
 }
 
 /**
@@ -493,6 +495,7 @@ export class MatchingService {
     );
     
     return {
+      orderId: '',
       fills,
       totalSpent,
       totalContracts,
@@ -506,14 +509,14 @@ export class MatchingService {
    * Creates fills, updates positions, and executes on-chain
    */
   async processMarketOrderByDollar(order: DollarMarketOrder): Promise<DollarMatchResult> {
-    // Match against the orderbook (in-memory, instant)
+    // 1. Match against the in-memory orderbook (RAM speed)
     const result = await this.matchMarketOrderByDollar(order);
     
     if (result.fills.length === 0) {
-      return result;
+      return { ...result, orderId: 'cancelled' };
     }
     
-    // Create taker order record synchronously (needed for response)
+    // 2. Create taker order record synchronously with final status
     const takerOrder = await orderService.create({
       clientOrderId: order.clientOrderId || Date.now(),
       marketId: order.marketId,
@@ -527,6 +530,8 @@ export class MatchingService {
       encodedInstruction: null,
       isMmOrder: false,
       expiresAt: order.expiresAt ? new Date(order.expiresAt) : new Date(Date.now() + 3600000),
+      status: result.unfilledDollars > 0.01 ? 'PARTIAL' : 'FILLED',
+      filledSize: result.totalContracts,
     });
     
     // Update fills with the real taker order ID
@@ -534,13 +539,19 @@ export class MatchingService {
       fill.takerOrderId = takerOrder.id;
     }
     
-    // FIRE-AND-FORGET: Process fills asynchronously for instant response
-    // All DB writes, position updates, and on-chain execution happen in background
-    this.processFillsAsync(result.fills, order, takerOrder.id, result.totalContracts)
-      .catch(err => logger.error(`Async fill processing failed: ${err.message}`));
+    // 3. PROCESS DB UPDATES SYNCHRONOUSLY
+    // We process these sequentially to avoid exhausting the database connection pool
+    // (especially important on Supabase/limited plans).
+    for (const fill of result.fills) {
+      await this.processFillForDollarOrderFast(fill, order, true);
+    }
     
-    // Return immediately - user sees instant fill
-    return result;
+    // 4. EXECUTE ON-CHAIN ASYNCHRONOUSLY (Background)
+    // The user already has their shares in our DB, we settle on Solana in the background.
+    this.executeFillsOnChain(result.fills, order.marketId)
+      .catch(err => logger.error(`Background on-chain execution failed: ${err.message}`));
+    
+    return { ...result, orderId: takerOrder.id };
   }
 
   /**
@@ -638,6 +649,7 @@ export class MatchingService {
     );
     
     return {
+      orderId: '',
       fills,
       totalProceeds,
       totalSold: order.size - remainingSize,
@@ -651,14 +663,14 @@ export class MatchingService {
    * Creates fills, updates positions, and executes on-chain via execute_close
    */
   async processSellOrder(order: SellOrder): Promise<SellMatchResult> {
-    // Match against the orderbook (in-memory, instant)
+    // 1. Match against the bids (in-memory)
     const result = await this.matchSellOrder(order);
     
     if (result.fills.length === 0) {
-      return result;
+      return { ...result, orderId: 'cancelled' };
     }
     
-    // Create taker order record synchronously (needed for response)
+    // 2. Create taker order record synchronously with final status
     const takerOrder = await orderService.create({
       clientOrderId: order.clientOrderId || Date.now(),
       marketId: order.marketId,
@@ -672,6 +684,8 @@ export class MatchingService {
       encodedInstruction: null,  // No on-chain order for sell via delegation
       isMmOrder: false,
       expiresAt: order.expiresAt ? new Date(order.expiresAt) : new Date(Date.now() + 3600000),
+      status: result.remainingSize > 0.001 ? 'PARTIAL' : 'FILLED',
+      filledSize: result.totalSold,
     });
     
     // Update fills with the real taker order ID
@@ -679,12 +693,31 @@ export class MatchingService {
       fill.takerOrderId = takerOrder.id;
     }
     
-    // FIRE-AND-FORGET: Process fills asynchronously for instant response
-    this.processSellFillsAsync(result.fills, order, takerOrder.id, result.totalSold)
-      .catch(err => logger.error(`Async sell fill processing failed: ${err.message}`));
+    // 3. PROCESS DB UPDATES SYNCHRONOUSLY
+    // Convert SellOrder to DollarMarketOrder format for reusing update logic
+    const asMarketOrder: DollarMarketOrder = {
+      marketId: order.marketId,
+      userId: order.userId,
+      side: 'ASK',
+      outcome: order.outcome,
+      dollarAmount: 0,
+      maxPrice: order.minPrice,
+      clientOrderId: order.clientOrderId,
+      expiresAt: order.expiresAt,
+      signature: order.signature,
+      binaryMessage: order.binaryMessage,
+    };
     
-    // Return immediately - user sees instant fill
-    return result;
+    // Process sequentially to keep connection pool usage low
+    for (const fill of result.fills) {
+      await this.processFillForDollarOrderFast(fill, asMarketOrder, true);
+    }
+    
+    // 4. EXECUTE ON-CHAIN ASYNCHRONOUSLY
+    this.executeFillsOnChain(result.fills, order.marketId)
+      .catch(err => logger.error(`Background on-chain execution failed: ${err.message}`));
+    
+    return { ...result, orderId: takerOrder.id };
   }
 
   /**
@@ -769,18 +802,8 @@ export class MatchingService {
     takerOrderId: string,
     totalContracts: number
   ): Promise<void> {
-    try {
-      // 1. Process all fills for DB/Stats/Positions (individual records)
-      await Promise.all(fills.map(fill => this.processFillForDollarOrderFast(fill, order, true)));
-      
-      // 2. Execute aggregated matches on-chain
-      await this.executeFillsOnChain(fills, order.marketId);
-
-      // 3. Mark taker order as filled
-      await orderService.updateAfterFill(takerOrderId, totalContracts);
-    } catch (err: any) {
-      logger.error(`Error in async fill processing: ${err.message}`);
-    }
+    // Legacy: kept for compatibility, but matching should now call processFillForDollarOrderFast sync
+    await this.executeFillsOnChain(fills, order.marketId);
   }
 
   /**
@@ -792,32 +815,8 @@ export class MatchingService {
     takerOrderId: string,
     totalSold: number
   ): Promise<void> {
-    try {
-      // Convert SellOrder to DollarMarketOrder format for reusing processFillForDollarOrderFast
-      const asMarketOrder: DollarMarketOrder = {
-        marketId: order.marketId,
-        userId: order.userId,
-        side: 'ASK',  // Seller
-        outcome: order.outcome,
-        dollarAmount: 0,  // Not used for sells
-        maxPrice: order.minPrice,  // Using minPrice as the threshold
-        clientOrderId: order.clientOrderId,
-        expiresAt: order.expiresAt,
-        signature: order.signature,
-        binaryMessage: order.binaryMessage,
-      };
-      
-      // 1. Process all fills for DB/Stats/Positions (individual records)
-      await Promise.all(fills.map(fill => this.processFillForDollarOrderFast(fill, asMarketOrder, true)));
-      
-      // 2. Execute aggregated matches on-chain
-      await this.executeFillsOnChain(fills, order.marketId);
-
-      // 3. Mark taker order as filled
-      await orderService.updateAfterFill(takerOrderId, totalSold);
-    } catch (err: any) {
-      logger.error(`Error in async sell fill processing: ${err.message}`);
-    }
+    // Legacy: kept for compatibility
+    await this.executeFillsOnChain(fills, order.marketId);
   }
 
   /**
@@ -831,11 +830,11 @@ export class MatchingService {
   ): Promise<void> {
     const takerSide = order.side;
     const takerOutcome = fill.outcome;
-    const takerPrice = fill.price;
-    const takerNotional = takerPrice * fill.size;
-    const makerOutcome = takerOutcome === 'YES' ? 'NO' : 'YES';
-    const makerPrice = 1 - takerPrice;
-    const makerNotional = makerPrice * fill.size;
+    const price = fill.price;
+    const notional = price * fill.size;
+    
+    const takerNotional = notional;
+    const makerNotional = notional;
 
     // Get market data first (needed for on-chain execution)
     const market = await marketService.getById(order.marketId);
@@ -853,64 +852,66 @@ export class MatchingService {
       logger.debug(`Closing trade check: seller has ${sellerShares} ${takerOutcome} shares, need ${fill.size}, isClosing=${sellerHasShares}`);
     }
 
-    // PARALLEL: All independent DB operations at once
-    const [tradeResult, , , , , , , , makerWallet, takerWallet] = await Promise.all([
-      // 1. Insert trade record
-      db.insert(trades).values({
-        marketId: order.marketId,
-        makerOrderId: fill.makerOrderId,
-        takerOrderId: fill.takerOrderId,
-        makerUserId: fill.makerUserId,
-        takerUserId: fill.takerUserId,
-        takerSide: takerSide,
-        takerOutcome: takerOutcome,
-        takerPrice: takerPrice.toString(),
-        takerNotional: takerNotional.toString(),
-        takerFee: fill.takerFee.toString(),
-        makerOutcome: makerOutcome,
-        makerPrice: makerPrice.toString(),
-        makerNotional: makerNotional.toString(),
-        makerFee: fill.makerFee.toString(),
-        size: fill.size.toString(),
-        txStatus: 'PENDING',
-        outcome: fill.outcome,
-        price: fill.price.toString(),
-        notional: takerNotional.toString(),
-      }).returning(),
-      // 2. Update maker order
-      orderService.updateAfterFill(fill.makerOrderId, fill.size),
-      // 3. Update taker position (BID = buying, ASK = selling)
-      positionService.updateAfterTrade(
-        fill.takerUserId, 
-        order.marketId, 
-        takerSide === 'BID' ? takerOutcome : takerOutcome,  // Same outcome either way
-        fill.size, 
-        takerSide === 'BID' ? takerNotional + fill.takerFee : takerNotional - fill.takerFee,
-        takerSide === 'BID'  // true if buying, false if selling
-      ),
-      // 4. Update maker position (for closing trades, maker buys what taker sells)
-      positionService.updateAfterTrade(
-        fill.makerUserId, 
-        order.marketId, 
-        takerSide === 'BID' ? makerOutcome : takerOutcome,  // If taker sells, maker buys same outcome
-        fill.size, 
-        takerSide === 'BID' ? makerNotional - fill.makerFee : takerNotional + fill.makerFee,
-        true  // Maker is always acquiring
-      ),
-      // 5. Update taker stats
-      userService.updateTradeStats(fill.takerUserId, takerNotional),
-      // 6. Update maker stats
-      userService.updateTradeStats(fill.makerUserId, makerNotional),
-      // 7. Update market volume
-      marketService.incrementStats(order.marketId, takerNotional + makerNotional),
-      // 8. Update market prices
-      marketService.updatePrices(order.marketId, fill.price, 1 - fill.price),
-      // 9. Get wallets for on-chain (parallel with above)
-      this.getWalletForUser(fill.makerUserId),
-      this.getWalletForUser(fill.takerUserId),
-    ]);
+    // SEQUENTIAL DB OPERATIONS: One by one to prevent connection pool exhaustion
+    // 1. Insert trade record
+    const [trade] = await db.insert(trades).values({
+      marketId: order.marketId,
+      makerOrderId: fill.makerOrderId,
+      takerOrderId: fill.takerOrderId,
+      makerUserId: fill.makerUserId,
+      takerUserId: fill.takerUserId,
+      takerSide: takerSide,
+      takerOutcome: takerOutcome,
+      takerPrice: price.toString(),
+      takerNotional: takerNotional.toString(),
+      takerFee: fill.takerFee.toString(),
+      makerOutcome: takerOutcome,
+      makerPrice: price.toString(),
+      makerNotional: makerNotional.toString(),
+      makerFee: fill.makerFee.toString(),
+      size: fill.size.toString(),
+      txStatus: 'PENDING',
+      outcome: fill.outcome,
+      price: fill.price.toString(),
+      notional: takerNotional.toString(),
+    }).returning();
 
-    const trade = tradeResult[0];
+    // 2. Update maker order
+    await orderService.updateAfterFill(fill.makerOrderId, fill.size);
+
+    // 3. Update taker position
+    const isTakerBuy = takerSide === 'BID';
+    await positionService.updateAfterTrade(
+      fill.takerUserId, 
+      order.marketId, 
+      takerOutcome,
+      fill.size, 
+      isTakerBuy ? takerNotional + fill.takerFee : takerNotional - fill.takerFee,
+      isTakerBuy
+    );
+
+    // 4. Update maker position
+    const isMakerBuy = !isTakerBuy;
+    await positionService.updateAfterTrade(
+      fill.makerUserId, 
+      order.marketId, 
+      takerOutcome,
+      fill.size, 
+      isMakerBuy ? makerNotional + fill.makerFee : makerNotional - fill.makerFee,
+      isMakerBuy
+    );
+
+    // 5. Update user stats
+    await userService.updateTradeStats(fill.takerUserId, takerNotional);
+    await userService.updateTradeStats(fill.makerUserId, makerNotional);
+
+    // 6. Update market volume & prices
+    await marketService.incrementStats(order.marketId, takerNotional + makerNotional);
+    await marketService.updatePrices(order.marketId, fill.price, 1 - fill.price);
+
+    // 7. Get wallets for on-chain
+    const makerWallet = await this.getWalletForUser(fill.makerUserId);
+    const takerWallet = await this.getWalletForUser(fill.takerUserId);
 
     // On-chain execution (fire-and-forget)
     if (market && makerWallet && takerWallet && !skipOnChain) {

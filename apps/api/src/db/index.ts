@@ -16,10 +16,10 @@ if (!config.databaseUrl) {
 // Optimized for Supabase's connection pooler (Supavisor)
 const pool = new Pool({
   connectionString: config.databaseUrl,
-  max: 10,                    // Lowered from 20 to stay within Supabase physical connection limits
-  min: 2,                     // Keep a few connections ready
+  max: 20,                    // Increased from 10 to prevent job-contention timeouts
+  min: 5,                     // Keep more connections ready for bursts
   idleTimeoutMillis: 30000,   // Release idle connections after 30s
-  connectionTimeoutMillis: 15000, // Increased timeout for slow Supabase starts
+  connectionTimeoutMillis: 30000, // Increased from 15s for extra resilience against Supabase cold-starts
   ssl: config.databaseUrl?.includes('supabase') 
     ? { rejectUnauthorized: false } 
     : undefined,

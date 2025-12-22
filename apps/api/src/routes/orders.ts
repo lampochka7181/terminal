@@ -138,13 +138,13 @@ export async function orderRoutes(app: FastifyInstance) {
       });
       
       logEvents.orderPlaced({
-        orderId: `sell-${data.clientOrderId}`,
+        orderId: result.orderId,
         userId, wallet, marketId: market.id, asset: market.asset, timeframe: market.timeframe,
         side: 'ASK', outcome: outcomeUpper, price: result.avgPrice, size: result.totalSold, orderType: 'MARKET',
       });
       
       return {
-        orderId: `sell-${data.clientOrderId}`,
+        orderId: result.orderId,
         status: result.totalSold > 0 ? (result.remainingSize > 0.001 ? 'partial' : 'filled') : 'cancelled',
         fills: result.fills.length,
         filledSize: result.totalSold,
@@ -204,13 +204,13 @@ export async function orderRoutes(app: FastifyInstance) {
       });
       
       logEvents.orderPlaced({
-        orderId: `market-${data.clientOrderId}`,
+        orderId: result.orderId,
         userId, wallet, marketId: market.id, asset: market.asset, timeframe: market.timeframe,
         side: 'BID', outcome: outcomeUpper, price: result.avgPrice, size: result.totalContracts, orderType: 'MARKET',
       });
       
       return {
-        orderId: `market-${data.clientOrderId}`,
+        orderId: result.orderId,
         status: result.totalContracts > 0 ? (result.unfilledDollars > 0.01 ? 'partial' : 'filled') : 'cancelled',
         fills: result.fills.length,
         filledSize: result.totalContracts,

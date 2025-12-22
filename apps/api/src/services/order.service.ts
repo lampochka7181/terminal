@@ -115,16 +115,21 @@ export class OrderService {
   /**
    * Create a new order
    */
-  async create(data: NewOrder): Promise<Order> {
+  async create(data: NewOrder & { status?: OrderStatus, filledSize?: number }): Promise<Order> {
+    const { status = 'OPEN', filledSize = 0, ...orderData } = data;
+    const remainingSize = parseFloat(orderData.size) - filledSize;
+
     const [order] = await db
       .insert(orders)
       .values({
-        ...data,
-        remainingSize: data.size,
+        ...orderData,
+        status,
+        filledSize: filledSize.toString(),
+        remainingSize: Math.max(0, remainingSize).toString(),
       })
       .returning();
     
-    logger.debug(`Order created: ${order.id}`);
+    logger.debug(`Order created: ${order.id} (${status})`);
     return order;
   }
 

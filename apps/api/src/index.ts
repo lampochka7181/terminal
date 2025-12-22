@@ -45,6 +45,11 @@ const app = Fastify({
   disableRequestLogging: true, // Disable standard verbose request logging
 });
 
+// Add hook to capture errors for onResponse logging
+app.addHook('onError', async (request, reply, error) => {
+  (reply as any).error = error;
+});
+
 // Add hook to log requests to apiLogger (writes to file, suppressed from console)
 app.addHook('onResponse', async (request, reply) => {
   const duration = reply.elapsedTime;
@@ -59,8 +64,8 @@ app.addHook('onResponse', async (request, reply) => {
   // If it's a 500 error, also log it to the system logger so it shows in the terminal
   if (reply.statusCode >= 500) {
     const error = (reply as any).error || (request as any).error;
-    const msg = error ? ` - ${error.message}` : '';
-    logger.error(`API 500 Error: ${request.method} ${request.url}${msg} (${duration.toFixed(2)}ms)`);
+    const msg = error ? (error.stack || error.message) : 'Unknown Error';
+    logger.error(`API 500 Error: ${request.method} ${request.url} (${duration.toFixed(2)}ms)\n${msg}`);
   }
 });
 

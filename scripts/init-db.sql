@@ -66,8 +66,10 @@ CREATE TABLE orders (
     filled_size DECIMAL(20,6) DEFAULT 0,
     remaining_size DECIMAL(20,6),
     status order_status DEFAULT 'OPEN',
-    signature TEXT NOT NULL,
-    encoded_instruction TEXT NOT NULL,
+    signature TEXT,
+    encoded_instruction TEXT,
+    binary_message TEXT,
+    is_mm_order BOOLEAN DEFAULT FALSE NOT NULL,
     expires_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
@@ -89,16 +91,31 @@ CREATE TABLE trades (
     taker_order_id UUID REFERENCES orders(id),
     maker_user_id UUID REFERENCES users(id),
     taker_user_id UUID REFERENCES users(id),
-    outcome order_outcome NOT NULL,
-    price DECIMAL(10,6) NOT NULL,
-    size DECIMAL(20,6) NOT NULL,
-    notional DECIMAL(20,6) NOT NULL,
-    maker_fee DECIMAL(20,6) DEFAULT 0,
+    
+    -- Taker's perspective
+    taker_side order_side NOT NULL,
+    taker_outcome order_outcome NOT NULL,
+    taker_price DECIMAL(10,6) NOT NULL,
+    taker_notional DECIMAL(20,6) NOT NULL,
     taker_fee DECIMAL(20,6) NOT NULL,
+    
+    -- Maker's perspective
+    maker_outcome order_outcome NOT NULL,
+    maker_price DECIMAL(10,6) NOT NULL,
+    maker_notional DECIMAL(20,6) NOT NULL,
+    maker_fee DECIMAL(20,6) DEFAULT 0,
+
+    -- Common fields
+    size DECIMAL(20,6) NOT NULL,
     tx_signature VARCHAR(88),
     tx_status tx_status DEFAULT 'PENDING',
     executed_at TIMESTAMP DEFAULT NOW(),
-    confirmed_at TIMESTAMP
+    confirmed_at TIMESTAMP,
+
+    -- Legacy fields
+    outcome order_outcome,
+    price DECIMAL(10,6),
+    notional DECIMAL(20,6)
 );
 
 CREATE INDEX idx_trades_market ON trades(market_id, executed_at DESC);

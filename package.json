@@ -5,6 +5,7 @@
   "description": "Binary outcome trading terminal on Solana",
   "scripts": {
     "dev": "turbo run dev",
+    "start:fresh": "./start-fresh.sh",
     "build": "turbo run build",
     "test": "turbo run test",
     "lint": "turbo run lint",

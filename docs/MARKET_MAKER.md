@@ -1,3 +1,25 @@
+Alex notes
+
+Market maker 
+
+1. spread should be configurable 
+2. size should be configurable 
+3. MM order book should be in relation to underlying asset( MM bid/asks should be in correlation to how far underlying asset is from strike price in either direction)
+for exanmple strike 95000, current price of underlying 98000 then above strike should be quoted for much higher than below strike 
+
+4. MM order book should also be in relation to how much time until market expiry or theta.
+
+it should be as percent of time left for current market. if 10% left until expiry for lets say 5M market and market price is way above current  strike price the order book should have very low or even 0 bids for below strike contracts. 
+
+5. MM should always stay delta neutral or very close to delta neutral at end of market expiration 
+
+its ok for MM to have lean into yes or no contracts during first 20-30% of market trading session. If market maker has high exposure to one contract with market less than 60-70% left it should aggresively adjust its order book to become delta neutral. 
+
+
+6. I thinking for MM it might be better to use websocket to stream orders instead of API 
+
+_____________________________________
+
 # Market Maker Architecture
 
 ## 1. Overview

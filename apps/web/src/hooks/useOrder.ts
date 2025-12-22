@@ -10,6 +10,7 @@ import { useState, useCallback } from 'react';
 import { useWallet, useConnection } from '@solana/wallet-adapter-react';
 import { PublicKey } from '@solana/web3.js';
 import { useAuthStore } from '@/stores/authStore';
+import { useUserStore } from '@/stores/userStore';
 import { api, ApiError } from '@/lib/api';
 import {
   submitCancelOrder,
@@ -222,6 +223,9 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
 
       console.log('[Order] Order response:', response);
 
+      // Trigger user data refetch to update UI (positions, orders, balance)
+      useUserStore.getState().fetchAll();
+
       const result: OrderResult = {
         orderId: response.orderId || `delegated-${clientOrderId}`,
         orderPda: '',
@@ -310,6 +314,8 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         // Notify backend
         try {
           await api.cancelOrder(orderId, signature);
+          // Refresh user data after successful cancellation
+          useUserStore.getState().fetchAll();
         } catch (apiErr) {
           console.warn('[Order] Backend notification failed, but order cancelled on-chain');
         }
@@ -329,6 +335,10 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
 
         await api.cancelOrder(orderId, signature);
         console.log('[Order] Order cancelled:', orderId);
+        
+        // Refresh user data after successful cancellation
+        useUserStore.getState().fetchAll();
+        
         return true;
       }
 
@@ -389,6 +399,10 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
       const result = await api.cancelAllOrders(signature, marketAddress);
       
       console.log('[Order] Cancelled orders:', result.cancelledCount);
+      
+      // Refresh user data after successful cancellation
+      useUserStore.getState().fetchAll();
+      
       return result.cancelledCount;
 
     } catch (err) {

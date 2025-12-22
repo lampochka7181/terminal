@@ -108,18 +108,23 @@ export const useUserStore = create<UserState>((set, get) => ({
   },
 
   handleFill: (fill) => {
-    // Refetch data after fill to ensure consistency
+    // Refetch data IMMEDIATELY after fill
+    get().fetchAll();
+    
+    // Also refetch again slightly later to catch any backend DB replication lag
     setTimeout(() => {
       get().fetchAll();
-    }, 500);
+    }, 1500);
   },
 
   handleSettlement: (settlement) => {
-    // Refetch full data after settlement
-    // Don't try to manually update balance here if we don't have the new balance
+    // Refetch full data immediately after settlement
+    get().fetchAll();
+
+    // Refetch again later
     setTimeout(() => {
       get().fetchAll();
-    }, 1000);
+    }, 2000);
   },
 
   clearUserData: () => {
@@ -140,6 +145,7 @@ export function subscribeToUserUpdates(): () => void {
   const unsubscribe = ws.onMessage((message) => {
     if (message.channel !== 'user') return;
     
+    console.log('[UserStore] WebSocket update received:', message);
     const store = useUserStore.getState();
     
     if (message.event === 'fill') {

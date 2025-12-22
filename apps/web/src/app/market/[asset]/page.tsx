@@ -10,10 +10,13 @@ import { useAuth } from '@/hooks/useAuth';
 import { useQuickOrder } from '@/hooks/useOrder';
 import { useDelegation } from '@/hooks/useDelegation';
 import { cn } from '@/lib/utils';
-import { ArrowLeft, TrendingUp, TrendingDown, RefreshCw, CheckCircle, XCircle, Loader2, ChevronDown, ChevronUp, Settings, ArrowRightLeft, AlertCircle } from 'lucide-react';
+import { ArrowLeft, TrendingUp, TrendingDown, RefreshCw, CheckCircle, XCircle, Loader2, ChevronDown, ChevronUp, Settings, ArrowRightLeft, AlertCircle, Clock } from 'lucide-react';
 import type { Asset, Timeframe } from '@degen/types';
 import { DualMiniOrderbook } from '@/components/MiniOrderbook';
 import { MarketPosition } from '@/components/trading/MarketPosition';
+import { Chart } from '@/components/trading/Chart';
+import { Positions } from '@/components/trading/Positions';
+import { useMarketStore } from '@/stores/marketStore';
 
 const TIMEFRAMES: Timeframe[] = ['5m', '15m', '1h', '4h'];
 
@@ -22,8 +25,14 @@ export default function MarketPage() {
   const router = useRouter();
   const { connected } = useWallet();
   const { isAuthenticated, signIn, isAuthenticating } = useAuth();
+  const { selectedTimeframe, setTimeframe, setAsset } = useMarketStore();
   
   const asset = (params.asset as string)?.toUpperCase() as Asset || 'BTC';
+
+  // Ensure store matches URL asset
+  useEffect(() => {
+    setAsset(asset);
+  }, [asset, setAsset]);
   
   // Use usePrices to set up WebSocket subscription for live updates
   const { prices, loading: pricesLoading } = usePrices();
@@ -34,6 +43,11 @@ export default function MarketPage() {
     asset, 
     status: 'OPEN' 
   });
+
+  // Find the market for the selected timeframe
+  const activeMarket = useMemo(() => {
+    return markets.find(m => m.timeframe === selectedTimeframe);
+  }, [markets, selectedTimeframe]);
   
   // Handle market expiry - just refetch, the next market is already pre-created
   const handleMarketExpired = useCallback((marketId: string, timeframe: string) => {
@@ -69,15 +83,15 @@ export default function MarketPage() {
     <div className="min-h-screen bg-background">
       <Header />
 
-      <main className="max-w-lg mx-auto p-4 space-y-4">
+      <main className="max-w-lg mx-auto p-4 space-y-6">
         {/* Back button and Asset Info */}
-        <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center justify-between">
            <button 
              onClick={() => router.back()}
              className="flex items-center gap-2 text-text-muted hover:text-text-primary transition-colors text-sm font-medium"
            >
              <ArrowLeft className="w-4 h-4" />
-             Back to Markets
+             Back
            </button>
            <div className="flex items-center gap-2">
              <div className="w-6 h-6 rounded-full bg-surface-light flex items-center justify-center font-bold text-accent text-xs">
@@ -87,102 +101,87 @@ export default function MarketPage() {
            </div>
         </div>
 
-        {/* Current Price Banner */}
-        <div className="bg-surface rounded-xl border border-border p-4 flex items-center justify-between">
-          <div>
-            <div className="flex items-center gap-2 text-sm text-text-muted">
-              <span>Current Price</span>
-              <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-long animate-pulse" />
-                <span className="text-xs text-long">LIVE</span>
-              </span>
-            </div>
-            <div className="text-2xl font-bold font-mono" suppressHydrationWarning>
-              {pricesLoading && !currentPrice ? (
-                <span className="text-text-muted">Loading...</span>
-              ) : (
-                `$${formatPrice(currentPrice)}`
-              )}
-            </div>
-          </div>
-          <div className="text-right">
-            <div className="text-xs text-text-muted">Price Feed</div>
-            <div className="text-sm text-accent">Binance</div>
-          </div>
+        {/* Chart Section */}
+        <div className="h-[350px]">
+          <Chart />
         </div>
 
-        {/* Timeframe Cards */}
-        <div className="space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold">Select Timeframe</h2>
-            {marketsLoading && (
-              <RefreshCw className="w-4 h-4 text-text-muted animate-spin" />
-            )}
+        {/* Timeframe Selector */}
+        <div className="flex flex-col space-y-4">
+          <div className="flex gap-2 p-1 bg-surface rounded-xl border border-border w-fit mx-auto">
+            {TIMEFRAMES.map((tf) => (
+              <button
+                key={tf}
+                onClick={() => setTimeframe(tf)}
+                className={cn(
+                  "px-5 py-2 rounded-lg text-sm font-medium transition-all",
+                  selectedTimeframe === tf 
+                    ? "bg-accent text-background shadow-lg" 
+                    : "text-text-muted hover:text-text-primary hover:bg-surface-light"
+                )}
+              >
+                {tf}
+              </button>
+            ))}
           </div>
-          
+
+          {/* Active Market Card */}
           {marketsLoading && markets.length === 0 ? (
-            <div className="text-center py-12 text-text-muted">
+            <div className="bg-surface rounded-xl border border-border p-12 text-center text-text-muted">
               <RefreshCw className="w-6 h-6 mx-auto animate-spin mb-2" />
               Loading markets...
             </div>
-          ) : markets.length === 0 ? (
-            <div className="text-center py-12 text-text-muted">
-              <p>No active markets for {asset}</p>
+          ) : !activeMarket ? (
+            <div className="bg-surface rounded-xl border border-border p-12 text-center text-text-muted">
+              <p>No active {selectedTimeframe} market for {asset}</p>
               <button 
                 onClick={() => refetch()}
-                className="mt-2 text-accent hover:text-accent-dim"
+                className="mt-2 text-accent hover:text-accent-dim font-bold"
               >
                 Refresh
               </button>
             </div>
           ) : (
-            markets.map((market) => (
-              <div key={market.id} className="space-y-2">
-                {/* User Position for this market */}
-                {isAuthenticated && (
-                  <MarketPosition
-                    marketAddress={market.address}
-                    currentYesPrice={market.yesPrice ?? 0.5}
-                    currentNoPrice={market.noPrice ?? 0.5}
-                    onSell={(outcome, shares, avgEntry) => {
-                      setSelectedTrade({
-                        timeframe: market.timeframe,
-                        outcome,
-                        price: outcome === 'YES' ? (market.yesPrice ?? 0.5) : (market.noPrice ?? 0.5),
-                        marketAddress: market.address,
-                        marketExpiry: market.expiry,
-                        mode: 'sell',
-                        shares,
-                        avgEntry,
-                      });
-                    }}
-                  />
-                )}
-                
-                {/* Market Card */}
-                <TimeframeCard
-                  market={market}
-                  currentPrice={currentPrice || 0}
-                  onSelectTrade={(outcome, price) => {
-                    setSelectedTrade({
-                      timeframe: market.timeframe,
-                      outcome,
-                      price,
-                      marketAddress: market.address,
-                      marketExpiry: market.expiry,
-                      mode: 'buy',
-                    });
-                  }}
-                  onExpired={() => handleMarketExpired(market.id, market.timeframe)}
-                />
-              </div>
-            ))
+            <div className="space-y-4">
+              <TimeframeCard
+                market={activeMarket}
+                currentPrice={currentPrice || 0}
+                onSelectTrade={(outcome, price) => {
+                  setSelectedTrade({
+                    timeframe: activeMarket.timeframe,
+                    outcome,
+                    price,
+                    marketAddress: activeMarket.address,
+                    marketExpiry: activeMarket.expiry,
+                    mode: 'buy',
+                  });
+                }}
+                onExpired={() => handleMarketExpired(activeMarket.id, activeMarket.timeframe)}
+              />
+            </div>
           )}
         </div>
 
-        {/* Info */}
-        <div className="text-center text-sm text-text-muted py-4">
-          <p>Prices show probability of {asset} being above or below strike at expiry</p>
+        {/* User Positions & Orders Section */}
+        <div className="pt-4">
+          <div className="flex items-center gap-2 mb-4">
+            <h2 className="text-xl font-bold">Your Portfolio</h2>
+            <div className="h-px flex-1 bg-border" />
+          </div>
+          <div className="min-h-[300px]">
+            <Positions onSell={(marketAddress, outcome, shares, avgEntry, price, timeframe, expiry) => {
+              setSelectedTrade({
+                timeframe,
+                outcome,
+                price,
+                marketAddress,
+                marketExpiry: expiry,
+                mode: 'sell',
+                shares,
+                avgEntry,
+              });
+            }} />
+          </div>
         </div>
       </main>
 

@@ -5,7 +5,7 @@ import { marketService } from '../services/market.service.js';
 import { transactionService } from '../services/transaction.service.js';
 import { userService } from '../services/user.service.js';
 import { logger, positionLogger, marketLogger, logEvents } from '../lib/logger.js';
-import { notifySettlement } from '../routes/websocket.js';
+import { broadcastUserSettlement } from '../lib/broadcasts.js';
 import { anchorClient } from '../lib/anchor-client.js';
 
 /**
@@ -427,13 +427,11 @@ async function finalizeSettlement(
     
     // Notify user via WebSocket
     if (item.position.userId) {
-      notifySettlement(item.position.userId, {
-        marketAddress: market.pubkey,
+      broadcastUserSettlement(item.position.userId, {
+        marketId: market.id,
         outcome: item.outcome,
-        shares: item.winningShares,
+        size: item.winningShares,
         payout: item.payout,
-        profit: item.profit,
-        txSignature: txSignature || '',
       });
     }
     

@@ -31,31 +31,22 @@ function generateMockData(basePrice: number, numCandles: number = 100): Candlest
 }
 
 // Generate strike line data
-function generateStrikeLine(strike: number, data: CandlestickData[]): LineData[] {
-  return data.map(candle => ({
-    time: candle.time,
-    value: strike,
-  }));
-}
-
 export function Chart() {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
-  const strikeLineRef = useRef<ISeriesApi<'Line'> | null>(null);
   
   const { selectedAsset, selectedTimeframe } = useMarketStore();
   const { prices } = usePriceStore();
   
   const [currentPrice, setCurrentPrice] = useState<number>(0);
   const [priceChange, setPriceChange] = useState<number>(0);
-  const [strike, setStrike] = useState<number>(0);
 
-  // Base prices for mock data
+  // Initial prices if real prices aren't loaded yet
   const basePrices: Record<string, number> = {
-    BTC: 95000,
-    ETH: 3200,
-    SOL: 140,
+    BTC: 88700,
+    ETH: 2200,
+    SOL: 180,
   };
 
   useEffect(() => {
@@ -64,7 +55,7 @@ export function Chart() {
     // Create chart
     const chart = createChart(containerRef.current, {
       layout: {
-        background: { color: '#12121a' },
+        background: { color: '#0B0B0E' },
         textColor: '#8888aa',
       },
       grid: {
@@ -93,6 +84,7 @@ export function Chart() {
       },
       rightPriceScale: {
         borderColor: '#2a2a3a',
+        autoScale: true,
       },
     });
 
@@ -106,18 +98,13 @@ export function Chart() {
       borderDownColor: '#ff3366',
       wickUpColor: '#00ff88',
       wickDownColor: '#ff3366',
+      priceFormat: {
+        type: 'price',
+        precision: 2,
+        minMove: 0.01,
+      },
     });
     candleSeriesRef.current = candleSeries;
-
-    // Add strike price line
-    const strikeLine = chart.addLineSeries({
-      color: '#ffaa00',
-      lineWidth: 2,
-      lineStyle: 2, // Dashed
-      crosshairMarkerVisible: false,
-      priceLineVisible: false,
-    });
-    strikeLineRef.current = strikeLine;
 
     // Handle resize
     const handleResize = () => {
@@ -140,20 +127,18 @@ export function Chart() {
 
   // Update data when asset changes
   useEffect(() => {
-    if (!candleSeriesRef.current || !strikeLineRef.current) return;
+    if (!candleSeriesRef.current) return;
 
-    const basePrice = basePrices[selectedAsset] || 95000;
-    const mockData = generateMockData(basePrice);
-    const strikePrice = basePrice; // Strike is typically ATM
+    // Use current price if available, otherwise fallback to base
+    const startPrice = prices[selectedAsset] || basePrices[selectedAsset] || 88000;
+    const mockData = generateMockData(startPrice);
     
     candleSeriesRef.current.setData(mockData);
-    strikeLineRef.current.setData(generateStrikeLine(strikePrice, mockData));
     
     // Set current price from last candle
     const lastCandle = mockData[mockData.length - 1];
     setCurrentPrice(lastCandle.close);
     setPriceChange(((lastCandle.close - lastCandle.open) / lastCandle.open) * 100);
-    setStrike(strikePrice);
 
     // Fit content
     if (chartRef.current) {
@@ -166,66 +151,59 @@ export function Chart() {
     const interval = setInterval(() => {
       if (!candleSeriesRef.current) return;
 
-      const basePrice = prices[selectedAsset] || basePrices[selectedAsset];
-      const volatility = basePrice * 0.0001;
+      const livePrice = prices[selectedAsset];
+      if (!livePrice) return;
+
+      const volatility = livePrice * 0.0001;
       const change = (Math.random() - 0.5) * volatility * 2;
-      const newPrice = basePrice + change;
+      const newPrice = livePrice + change;
 
       // Update last candle
       const now = Math.floor(Date.now() / 1000) as Time;
       candleSeriesRef.current.update({
         time: now,
-        open: basePrice,
-        high: Math.max(basePrice, newPrice),
-        low: Math.min(basePrice, newPrice),
+        open: livePrice,
+        high: Math.max(livePrice, newPrice),
+        low: Math.min(livePrice, newPrice),
         close: newPrice,
       });
 
       setCurrentPrice(newPrice);
-      setPriceChange(change / basePrice * 100);
+      setPriceChange(change / livePrice * 100);
     }, 1000);
 
     return () => clearInterval(interval);
   }, [selectedAsset, prices]);
 
-  const isAboveStrike = currentPrice > strike;
-
   return (
-    <div className="bg-surface rounded-lg border border-border p-4 h-full flex flex-col">
+    <div className="bg-surface rounded-xl border border-border p-4 h-full flex flex-col shadow-2xl">
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-4">
-          <h2 className="text-lg font-semibold">{selectedAsset}/USD</h2>
-          <div className="flex items-center gap-2">
-            <span className="font-mono text-xl text-text-primary" suppressHydrationWarning>
-              ${currentPrice.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
-            </span>
-            <span className={cn(
-              'text-sm font-mono',
-              priceChange >= 0 ? 'text-long' : 'text-short'
-            )} suppressHydrationWarning>
-              {priceChange >= 0 ? '+' : ''}{priceChange.toFixed(3)}%
-            </span>
+      <div className="flex items-center justify-between mb-6">
+        <div className="flex items-center gap-6">
+          <div className="flex flex-col">
+            <h2 className="text-xl font-bold terminal-text">{selectedAsset}/USD</h2>
+            <span className="text-[10px] text-text-muted uppercase tracking-widest font-bold">Real-time TradingView</span>
+          </div>
+          <div className="h-10 w-px bg-border/50" />
+          <div className="flex flex-col">
+            <div className="flex items-center gap-3">
+              <span className="font-mono text-2xl font-black text-text-primary tracking-tighter" suppressHydrationWarning>
+                ${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </span>
+              <div className={cn(
+                'px-2 py-0.5 rounded text-[10px] font-black flex items-center gap-1',
+                priceChange >= 0 ? 'bg-long/20 text-long' : 'bg-short/20 text-short'
+              )} suppressHydrationWarning>
+                {priceChange >= 0 ? '+' : ''}{priceChange.toFixed(3)}%
+              </div>
+            </div>
           </div>
         </div>
         
-        <div className="flex items-center gap-6 text-sm">
-          <div>
-            <span className="text-text-muted">Strike: </span>
-            <span className="font-mono text-warning" suppressHydrationWarning>
-              ${strike.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-text-muted">Status: </span>
-            <span className={cn(
-              'px-2 py-0.5 rounded text-xs font-medium',
-              isAboveStrike 
-                ? 'bg-long/20 text-long' 
-                : 'bg-short/20 text-short'
-            )}>
-              {isAboveStrike ? 'ABOVE' : 'BELOW'} STRIKE
-            </span>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 px-3 py-1.5 bg-surface-light rounded-lg border border-border/50">
+            <div className="w-2 h-2 rounded-full bg-accent animate-pulse" />
+            <span className="text-[10px] font-bold text-text-muted uppercase tracking-wider">Live</span>
           </div>
         </div>
       </div>
@@ -233,22 +211,21 @@ export function Chart() {
       {/* Chart Container */}
       <div 
         ref={containerRef} 
-        className="flex-1 min-h-0"
+        className="flex-1 min-h-0 rounded-lg overflow-hidden"
       />
 
       {/* Legend */}
-      <div className="flex items-center gap-4 mt-2 text-xs text-text-muted">
-        <div className="flex items-center gap-1">
-          <div className="w-3 h-0.5 bg-warning" />
-          <span>Strike Price</span>
-        </div>
-        <div className="flex items-center gap-1">
-          <div className="w-3 h-3 bg-long rounded-sm" />
+      <div className="flex items-center gap-6 mt-4 text-[10px] text-text-muted uppercase tracking-widest font-bold">
+        <div className="flex items-center gap-2">
+          <div className="w-2.5 h-2.5 bg-long rounded-sm shadow-[0_0_8px_rgba(0,255,136,0.4)]" />
           <span>Bullish</span>
         </div>
-        <div className="flex items-center gap-1">
-          <div className="w-3 h-3 bg-short rounded-sm" />
+        <div className="flex items-center gap-2">
+          <div className="w-2.5 h-2.5 bg-short rounded-sm shadow-[0_0_8px_rgba(255,51,102,0.4)]" />
           <span>Bearish</span>
+        </div>
+        <div className="ml-auto flex items-center gap-4">
+          <span className="text-text-muted/50">Source: Binance</span>
         </div>
       </div>
     </div>

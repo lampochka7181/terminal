@@ -2,7 +2,15 @@ import { FastifyRequest, FastifyInstance } from 'fastify';
 import { WebSocket } from 'ws';
 import { logger } from '../lib/logger.js';
 import { redis, RedisKeys } from '../db/redis.js';
-import { registerClients } from '../lib/broadcasts.js';
+import { 
+  registerClients, 
+  broadcastOrderbookUpdate, 
+  broadcastTrade, 
+  broadcastPriceUpdate, 
+  broadcastMarketResolved,
+  broadcastUserFill,
+  broadcastUserSettlement
+} from '../lib/broadcasts.js';
 
 interface Subscription {
   channel: string;
@@ -22,7 +30,7 @@ interface ClientState {
 const clients = new Map<WebSocket, ClientState>();
 
 // Broadcast clients (simpler format for broadcasts.ts)
-const broadcastClients = new Map<WebSocket, { subscriptions: Set<string>; wallet?: string }>();
+const broadcastClients = new Map<WebSocket, { subscriptions: Set<string>; wallet?: string; userId?: string }>();
 registerClients(broadcastClients);
 
 // Ping interval (30 seconds)
@@ -56,6 +64,7 @@ function updateBroadcastClient(socket: WebSocket, client: ClientState) {
   broadcastClients.set(socket, {
     subscriptions: subs,
     wallet: client.address,
+    userId: client.userId,
   });
 }
 
@@ -88,7 +97,7 @@ export async function wsHandler(
     lastPing: Date.now(),
   };
   clients.set(socket, initialState);
-  broadcastClients.set(socket, { subscriptions: new Set(), wallet: undefined });
+  broadcastClients.set(socket, { subscriptions: new Set(), wallet: undefined, userId: undefined });
 
   // Start heartbeat checker if not running
   startHeartbeatChecker();
@@ -384,165 +393,12 @@ function parseOrderbookData(data: string[]): [number, number][] {
   return result;
 }
 
-// ========================
-// Broadcasting Functions
-// ========================
-
-/**
- * Broadcast message to all clients subscribed to a channel/market
- */
-export function broadcast(
-  channel: string,
-  market: string | null,
-  data: any
-) {
-  const message = JSON.stringify({
-    channel,
-    market,
-    data,
-    timestamp: Date.now(),
-  });
-
-  for (const [socket, client] of clients) {
-    const isSubscribed = client.subscriptions.some(
-      (sub) =>
-        sub.channel === channel &&
-        (!market || sub.market === market || sub.market === '*')
-    );
-
-    if (isSubscribed) {
-      try {
-        socket.send(message);
-      } catch (err) {
-        logger.error('Error broadcasting to client:', err);
-      }
-    }
-  }
-}
-
-/**
- * Broadcast to a specific user (for fills, settlements, etc.)
- */
-export function broadcastToUser(
-  userId: string,
-  event: string,
-  data: any
-) {
-  const message = JSON.stringify({
-    channel: 'user',
-    event,
-    data,
-    timestamp: Date.now(),
-  });
-
-  for (const [socket, client] of clients) {
-    if (client.authenticated && client.userId === userId) {
-      try {
-        socket.send(message);
-      } catch (err) {
-        logger.error('Error broadcasting to user:', err);
-      }
-    }
-  }
-}
-
-/**
- * Broadcast orderbook update
- */
-export function broadcastOrderbookUpdate(
-  marketId: string,
-  bids: [number, number][],
-  asks: [number, number][],
-  sequenceId: number
-) {
-  broadcast('orderbook', marketId, {
-    bids,
-    asks,
-    sequenceId,
-  });
-}
-
-/**
- * Broadcast trade
- */
-export function broadcastTrade(
-  marketId: string,
-  trade: {
-    price: number;
-    size: number;
-    outcome: string;
-    side: string;
-    timestamp: number;
-  }
-) {
-  broadcast('trades', marketId, trade);
-}
-
-/**
- * Broadcast price update
- */
-export function broadcastPriceUpdate(
-  asset: string,
-  price: number,
-  timestamp: number
-) {
-  broadcast('prices', null, {
-    asset,
-    price,
-    timestamp,
-  });
-}
-
-/**
- * Broadcast market resolution
- */
-export function broadcastMarketResolved(
-  marketId: string,
-  outcome: string,
-  finalPrice: number,
-  strikePrice: number
-) {
-  broadcast('market', marketId, {
-    event: 'resolved',
-    outcome,
-    finalPrice,
-    strikePrice,
-    resolvedAt: Date.now(),
-  });
-}
-
-/**
- * Notify user of order fill
- */
-export function notifyOrderFill(
-  userId: string,
-  fill: {
-    orderId: string;
-    marketAddress: string;
-    side: string;
-    outcome: string;
-    price: number;
-    filledSize: number;
-    remainingSize: number;
-    status: string;
-  }
-) {
-  broadcastToUser(userId, 'fill', fill);
-}
-
-/**
- * Notify user of settlement
- */
-export function notifySettlement(
-  userId: string,
-  settlement: {
-    marketAddress: string;
-    outcome: string;
-    shares: number;
-    payout: number;
-    profit: number;
-    txSignature: string;
-  }
-) {
-  broadcastToUser(userId, 'settlement', settlement);
-}
+// Export broadcasting functions moved to broadcasts.ts
+export { 
+  broadcastOrderbookUpdate, 
+  broadcastTrade, 
+  broadcastPriceUpdate, 
+  broadcastMarketResolved,
+  broadcastUserFill,
+  broadcastUserSettlement
+};
