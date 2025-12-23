@@ -1,5 +1,5 @@
 import { eq, and, or, desc, sql, inArray } from 'drizzle-orm';
-import { db, orders, markets, type Order, type NewOrder } from '../db/index.js';
+import { db, orders, markets, users, type Order, type NewOrder } from '../db/index.js';
 import { logger } from '../lib/logger.js';
 
 export type OrderSide = 'BID' | 'ASK';
@@ -230,7 +230,21 @@ export class OrderService {
    * Cancel all open orders for a market (used at market close)
    */
   async cancelAllForMarket(marketId: string): Promise<number> {
-    const result = await db
+    const openOrders = await db
+      .select({ id: orders.id })
+      .from(orders)
+      .where(
+        and(
+          eq(orders.marketId, marketId),
+          or(eq(orders.status, 'OPEN'), eq(orders.status, 'PARTIAL'))
+        )
+      );
+
+    if (openOrders.length === 0) {
+      return 0;
+    }
+
+    await db
       .update(orders)
       .set({
         status: 'CANCELLED',
@@ -245,8 +259,29 @@ export class OrderService {
         )
       );
     
-    // Count is not directly returned, we'd need to query first
-    return 0; // TODO: Return actual count
+    return openOrders.length;
+  }
+
+  /**
+   * Get open user (non-MM) orders for a market to force-cancel on-chain at close.
+   */
+  async getOpenUserOrdersForMarket(marketId: string): Promise<Array<{ ownerWallet: string; clientOrderId: number }>> {
+    const result = await db
+      .select({
+        ownerWallet: users.walletAddress,
+        clientOrderId: orders.clientOrderId,
+      })
+      .from(orders)
+      .innerJoin(users, eq(orders.userId, users.id))
+      .where(
+        and(
+          eq(orders.marketId, marketId),
+          eq(orders.isMmOrder, false),
+          or(eq(orders.status, 'OPEN'), eq(orders.status, 'PARTIAL'))
+        )
+      );
+
+    return result;
   }
 
   /**

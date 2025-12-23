@@ -14,18 +14,16 @@ if (!config.databaseUrl) {
 
 // Create PostgreSQL connection pool
 // Optimized for Supabase's connection pooler (Supavisor)
-const pool = new Pool({
+export const pool = new Pool({
   connectionString: config.databaseUrl,
-  max: 20,                    // Increased from 10 to prevent job-contention timeouts
-  min: 5,                     // Keep more connections ready for bursts
-  idleTimeoutMillis: 30000,   // Release idle connections after 30s
-  connectionTimeoutMillis: 30000, // Increased from 15s for extra resilience against Supabase cold-starts
+  max: 10,                    // Reduced to 10 to play nicer with Supabase limits
+  min: 0,                     // Let the pool shrink to 0 (Supavisor can kill idles; avoid holding stale conns)
+  idleTimeoutMillis: 10000,   // Release idle connections faster (10s)
+  connectionTimeoutMillis: 15000, // Be more tolerant of pooler / network jitter (15s)
   ssl: config.databaseUrl?.includes('supabase') 
     ? { rejectUnauthorized: false } 
     : undefined,
-  // Keepalive settings to prevent connection drops
   keepAlive: true,
-  keepAliveInitialDelayMillis: 10000,
 });
 
 // Monitor pool metrics

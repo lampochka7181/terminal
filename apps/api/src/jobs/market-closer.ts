@@ -20,8 +20,12 @@ import { logger } from '../lib/logger.js';
 // Track markets being closed to prevent duplicate attempts
 const closingMarkets = new Set<string>();
 
-// Minimum age before closing (wait 5 minutes after settlement)
-const MIN_AGE_BEFORE_CLOSE_MS = 5 * 60 * 1000;
+// Safety delay before closing markets with trading activity
+// (Wait 5 minutes after settlement to ensure all payouts are processed)
+const TRADED_MARKET_MIN_AGE_MS = 5 * 60 * 1000;
+
+// Short delay for markets with ZERO trading activity (save gas faster)
+const ZERO_TRADE_MIN_AGE_MS = 5 * 1000; 
 
 export async function marketCloserJob(): Promise<void> {
   if (!anchorClient.isReady()) {
@@ -36,6 +40,10 @@ export async function marketCloserJob(): Promise<void> {
 
   const settledMarkets = allSettledMarkets.filter(m => !m.pubkey.startsWith('arc-'));
 
+  if (settledMarkets.length > 0) {
+    logger.debug(`Market Closer: found ${settledMarkets.length} settled markets potentially ready for closure`);
+  }
+
   const now = Date.now();
   const marketsToClose = [];
 
@@ -45,9 +53,18 @@ export async function marketCloserJob(): Promise<void> {
       continue;
     }
 
-    // Skip if settled too recently (give time for any pending operations)
-    const settledAt = market.updatedAt?.getTime() || 0;
-    if (now - settledAt < MIN_AGE_BEFORE_CLOSE_MS) {
+    // Determine required delay based on activity
+    const hasTrades = parseFloat(market.totalVolume || '0') > 0;
+    const minAge = hasTrades ? TRADED_MARKET_MIN_AGE_MS : ZERO_TRADE_MIN_AGE_MS;
+    
+    // Skip if settled too recently (use settledAt as safety timestamp)
+    const settledAt = market.settledAt?.getTime() || 0;
+    const age = now - settledAt;
+    
+    if (age < minAge) {
+      if (hasTrades) {
+        logger.debug(`Market ${market.id} (${market.asset}) has trades, waiting ${Math.ceil((minAge - age)/1000)}s longer for safety`);
+      }
       continue;
     }
 

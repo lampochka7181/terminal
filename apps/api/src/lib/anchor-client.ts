@@ -11,6 +11,7 @@ import {
 import {
   getAssociatedTokenAddress,
   getAccount,
+  createAssociatedTokenAccountInstruction,
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
@@ -202,6 +203,18 @@ export function getUserPositionPda(marketPubkey: PublicKey, user: PublicKey): Pu
   return pda;
 }
 
+export function getOrderPda(marketPubkey: PublicKey, owner: PublicKey, clientOrderId: number): PublicKey {
+  // Seeds must match on-chain:
+  // ["order", market.key(), owner.key(), client_order_id.to_le_bytes()]
+  const clientIdBuffer = Buffer.alloc(8);
+  clientIdBuffer.writeBigUInt64LE(BigInt(clientOrderId), 0);
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('order'), marketPubkey.toBuffer(), owner.toBuffer(), clientIdBuffer],
+    PROGRAM_ID
+  );
+  return pda;
+}
+
 /**
  * Solana client for interacting with the Degen Terminal program
  * Uses raw instruction building for maximum compatibility
@@ -210,6 +223,7 @@ export class AnchorClient {
   private connection: Connection;
   private relayerKeypair: Keypair | null = null;
   private mmKeypair: Keypair | null = null;
+  private relayerUsdcAtaReady: boolean | null = null;
 
   constructor() {
     this.connection = new Connection(
@@ -278,6 +292,38 @@ export class AnchorClient {
    */
   getConnection(): Connection {
     return this.connection;
+  }
+
+  /**
+   * Ensure the relayer has a USDC ATA.
+   * Needed for `close_market` which expects `relayer_usdc` to be initialized.
+   *
+   * Returns zero or one instructions (create ATA).
+   */
+  async ensureRelayerUsdcAtaIxs(): Promise<TransactionInstruction[]> {
+    if (!this.relayerKeypair) throw new Error('Relayer not initialized');
+    if (this.relayerUsdcAtaReady === true) return [];
+
+    const relayer = this.relayerKeypair.publicKey;
+    const ata = await getAssociatedTokenAddress(USDC_MINT, relayer);
+
+    const info = await this.connection.getAccountInfo(ata, 'confirmed');
+    if (info) {
+      this.relayerUsdcAtaReady = true;
+      return [];
+    }
+
+    // Avoid spamming ATA creates in the same process loop
+    this.relayerUsdcAtaReady = false;
+
+    return [
+      createAssociatedTokenAccountInstruction(
+        relayer, // payer
+        ata,     // ata
+        relayer, // owner
+        USDC_MINT
+      ),
+    ];
   }
 
   /**
@@ -549,10 +595,33 @@ export class AnchorClient {
       );
 
       // Confirm transaction
-      await this.connection.confirmTransaction(
+      const confirmation = await this.connection.confirmTransaction(
         { signature, blockhash, lastValidBlockHeight },
         'confirmed'
       );
+
+      // IMPORTANT: confirmTransaction does NOT throw if the tx executed and failed.
+      // We must explicitly check `err` and surface a real failure so callers don't
+      // assume the transaction succeeded (e.g. market creation).
+      if (confirmation?.value?.err) {
+        // Best-effort fetch logs for debugging (may be null depending on RPC)
+        let logMessages: string[] | undefined;
+        try {
+          const tx = await this.connection.getTransaction(signature, {
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0,
+          } as any);
+          logMessages = (tx as any)?.meta?.logMessages;
+        } catch {
+          // ignore
+        }
+        const errJson = JSON.stringify(confirmation.value.err);
+        const logsStr = logMessages ? JSON.stringify(logMessages, null, 2) : 'No logs available';
+        const error = new Error(`[${contextLabel}] CONFIRMED BUT FAILED: ${errJson}\nLogs: ${logsStr}`);
+        // Attach logs for existing error handler formatting
+        (error as any).logs = logMessages;
+        throw error;
+      }
 
       return signature;
     } catch (err: any) {
@@ -1007,14 +1076,108 @@ export class AnchorClient {
   }
 
   /**
+   * Build cancel_order_by_relayer instruction (force-cancel user orders after market close)
+   */
+  async buildCancelOrderByRelayerInstruction(params: {
+    marketPubkey: string;
+    ownerPubkey: string;
+    clientOrderId: number;
+  }): Promise<TransactionInstruction> {
+    if (!this.relayerKeypair) {
+      throw new Error('Relayer not initialized');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const owner = new PublicKey(params.ownerPubkey);
+
+    // Market vault is the USDC ATA owned by the market PDA
+    const vault = await getAssociatedTokenAddress(USDC_MINT, market, true);
+    const userUsdc = await getAssociatedTokenAddress(USDC_MINT, owner);
+    const orderPda = getOrderPda(market, owner, params.clientOrderId);
+
+    const discriminator = computeDiscriminator('cancel_order_by_relayer');
+
+    return new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: market, isSigner: false, isWritable: false }, // market
+        { pubkey: vault, isSigner: false, isWritable: true }, // vault
+        { pubkey: userUsdc, isSigner: false, isWritable: true }, // user_usdc
+        { pubkey: orderPda, isSigner: false, isWritable: true }, // order (close = owner)
+        { pubkey: owner, isSigner: false, isWritable: true }, // owner (rent recipient)
+        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: false }, // authority
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }, // token_program
+      ],
+      data: discriminator,
+    });
+  }
+
+  /**
+   * Force-cancel a batch of user orders after market close to recover user rent + refund escrow.
+   * Retries individually if a batch fails.
+   */
+  async cancelOrdersByRelayer(params: {
+    marketPubkey: string;
+    orders: Array<{ ownerPubkey: string; clientOrderId: number }>;
+    batchSize?: number;
+  }): Promise<void> {
+    const batchSize = params.batchSize ?? 3;
+    if (params.orders.length === 0) return;
+
+    for (let i = 0; i < params.orders.length; i += batchSize) {
+      const batch = params.orders.slice(i, i + batchSize);
+      try {
+        const instructions = await Promise.all(
+          batch.map((o) =>
+            this.buildCancelOrderByRelayerInstruction({
+              marketPubkey: params.marketPubkey,
+              ownerPubkey: o.ownerPubkey,
+              clientOrderId: o.clientOrderId,
+            })
+          )
+        );
+        const sig = await this.submitTransaction(instructions, [], `Force-cancel ${batch.length} orders`);
+        logger.info(`✅ Force-cancelled ${batch.length} orders on-chain: ${sig}`);
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        logger.warn(`Batch force-cancel failed (${batch.length} orders), retrying individually: ${msg}`);
+        for (const o of batch) {
+          try {
+            const ix = await this.buildCancelOrderByRelayerInstruction({
+              marketPubkey: params.marketPubkey,
+              ownerPubkey: o.ownerPubkey,
+              clientOrderId: o.clientOrderId,
+            });
+            const sig = await this.submitTransaction([ix], [], `Force-cancel 1 order`);
+            logger.info(`✅ Force-cancelled order on-chain (clientOrderId=${o.clientOrderId}): ${sig}`);
+          } catch (inner: any) {
+            const innerMsg = inner?.message || String(inner);
+            // Common cases: already closed, never existed, wrong network
+            if (
+              innerMsg.includes('AccountNotFound') ||
+              innerMsg.includes('AccountNotInitialized') ||
+              innerMsg.includes('0xbc4')
+            ) {
+              logger.debug(`Order PDA missing for clientOrderId=${o.clientOrderId}; skipping`);
+            } else {
+              logger.error(`Force-cancel failed for clientOrderId=${o.clientOrderId}: ${innerMsg}`);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
    * Close a fully settled market and recover rent
    * Returns ~0.0039 SOL to the relayer wallet
    */
   async closeMarket(params: {
     marketPubkey: string;
   }): Promise<string> {
+    const pre = await this.ensureRelayerUsdcAtaIxs();
     const instruction = await this.buildCloseMarketInstruction(params);
-    const signature = await this.submitTransaction([instruction], [], `Close Market ${params.marketPubkey.slice(0, 8)}`);
+    const signature = await this.submitTransaction([...pre, instruction], [], `Close Market ${params.marketPubkey.slice(0, 8)}`);
     logger.info(`Market closed on-chain: ${params.marketPubkey} (tx: ${signature})`);
     
     return signature;

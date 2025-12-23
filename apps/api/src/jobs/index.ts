@@ -4,6 +4,7 @@ import { marketResolverJob } from './market-resolver.js';
 import { positionSettlerJob } from './position-settler.js';
 import { orderExpirerJob } from './order-expirer.js';
 import { marketCloserJob } from './market-closer.js';
+import { db, pool } from '../db/index.js'; // To check pool load directly
 
 /**
  * Keeper Jobs Manager
@@ -50,7 +51,7 @@ const jobs: JobConfig[] = [
   },
   {
     name: 'Market Closer',
-    intervalMs: 60 * 1000, // Every 60 seconds (no rush, just rent recovery)
+    intervalMs: 20 * 1000, // Every 20 seconds (recover rent faster)
     job: marketCloserJob,
     enabled: true,
   },
@@ -71,6 +72,18 @@ async function runJobLoop(config: JobConfig): Promise<void> {
 
 const runningTimers = new Map<string, NodeJS.Timeout>();
 const runningJobs = new Set<string>();
+
+function isTransientDbError(err: unknown): boolean {
+  const msg = (err as any)?.message ? String((err as any).message) : String(err);
+  return (
+    msg.includes('Connection terminated') ||
+    msg.includes('connection terminated unexpectedly') ||
+    msg.includes('server closed the connection unexpectedly') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('Connection terminated due to connection timeout') ||
+    msg.includes('timeout') // conservative; job-level retry is bounded
+  );
+}
 
 /**
  * Start all keeper jobs
@@ -119,11 +132,46 @@ const runningIntervals = new Set<string>();
  * Run a job with error handling and timing
  */
 async function runJobSafe(config: JobConfig): Promise<void> {
+  // HIGH LOAD SHIELD: If the DB is already struggling, don't add more pressure.
+  // This helps prioritize existing queries and prevents the pool from freezing.
+  const waitingCount = (pool as any).waitingCount || 0;
+  
+  if (waitingCount > 5 && config.name !== 'Market Closer') {
+    keeperLogger.warn(`[KEEPER] Skipping "${config.name}" - DB load high (waiting=${waitingCount})`);
+    return;
+  }
+
   const startTime = Date.now();
   logEvents.keeperJobStarted(config.name);
   
   try {
-    await config.job();
+    // Retry transient DB failures (Supavisor/network blips) a couple times.
+    // IMPORTANT: keep this bounded so we don't create overlapping backlog.
+    const maxAttempts = 3;
+    let attempt = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      attempt += 1;
+      try {
+        await config.job();
+        break;
+      } catch (e) {
+        if (attempt >= maxAttempts || !isTransientDbError(e)) {
+          throw e;
+        }
+
+        const waitingCount = (pool as any).waitingCount || 0;
+        const total = (pool as any).totalCount ?? 'n/a';
+        const idle = (pool as any).idleCount ?? 'n/a';
+        keeperLogger.warn(
+          `[KEEPER] "${config.name}" transient DB error (attempt ${attempt}/${maxAttempts}); retrying soon... pool(total=${total}, idle=${idle}, waiting=${waitingCount})`
+        );
+
+        // small exponential backoff with jitter
+        const delayMs = Math.min(1000 * 2 ** (attempt - 1), 5000) + Math.floor(Math.random() * 250);
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
     const duration = Date.now() - startTime;
     logEvents.keeperJobCompleted(config.name, duration);
   } catch (err) {

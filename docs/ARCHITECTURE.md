@@ -1,3 +1,13 @@
+Alex notes 
+
+need one more box in actitecture for validation layer 
+
+-minimum order sizes 
+-other order validation rules 
+
+___________________________________________________________
+
+
 # Degen Terminal - System Architecture
 
 ## 1. High-Level Overview
@@ -141,21 +151,21 @@ This platform is a Peer-to-Peer (CLOB) prediction market on Solana.
        │
        ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  USER ORDER FLOW (On-Chain, Trustless):                             │
-│  ──────────────────────────────────────                             │
-│  1. Build Solana Transaction (place_order instruction)              │
-│  2. Prompt Phantom to SIGN and SUBMIT transaction                   │
-│  3. Transaction executes on-chain → Order PDA created               │
-│  4. Backend listens for OrderPlaced event                           │
-│  5. Backend adds order to matching engine                           │
-│  6. On match → Backend submits execute_match TX                     │
-│  7. WebSocket pushes update → UI refreshes                          │
+│  USER ORDER FLOW (On-Chain, Trustless):                              │
+│  ──────────────────────────────────────                              │
+│  1. Build Solana Transaction (place_order instruction)               │
+│  2. Prompt Phantom to SIGN and SUBMIT transaction                    │ 
+│  3. Transaction executes on-chain → Order PDA created                │
+│  4. Backend listens for OrderPlaced event                            │
+│  5. Backend adds order to matching engine                            │
+│  6. On match → Backend submits execute_match TX                      │
+│  7. WebSocket pushes update → UI refreshes                           │
 │                                                                      │
 │  Benefits:                                                           │
-│  • User's order is cryptographically secured on-chain               │
-│  • Cannot be censored or manipulated by relayer                     │
-│  • Full audit trail on blockchain                                   │
-│  • ~0.002 SOL rent (returned when order fills/cancels)              │
+│  • User's order is cryptographically secured on-chain                │
+│  • Cannot be censored or manipulated by relayer                      │
+│  • Full audit trail on blockchain                                    │
+│  • ~0.002 SOL rent (returned when order fills/cancels)               │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 

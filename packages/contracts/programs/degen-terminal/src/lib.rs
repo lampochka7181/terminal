@@ -118,6 +118,14 @@ pub mod degen_terminal {
         instructions::cancel_order(ctx)
     }
 
+    /// Cancel an order after the market has closed, called by the market authority (relayer).
+    ///
+    /// This is used to recover user SOL rent + refund escrowed USDC when users leave open
+    /// on-chain orders past market close/expiry.
+    pub fn cancel_order_by_relayer(ctx: Context<CancelOrderByRelayer>) -> Result<()> {
+        instructions::cancel_order_by_relayer(ctx)
+    }
+
     /// Execute a match between maker and taker orders (Opening Trade)
     /// 
     /// This is the core trading instruction that atomically:

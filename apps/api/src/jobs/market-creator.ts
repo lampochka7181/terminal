@@ -134,6 +134,51 @@ export async function marketCreatorJob(): Promise<void> {
       }
       
       // Only reach here if we're sure it's on-chain
+      // HARD CHECK (with short retry): Verify the Market account actually exists on-chain before inserting into DB.
+      // Some RPCs can lag briefly after confirmation, so we retry a couple times to avoid false negatives.
+      const verifyOnChain = async (): Promise<boolean> => {
+        const conn = anchorClient.getConnection();
+        const pk = new PublicKey(marketPubkey);
+        const maxAttempts = 6;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          try {
+            const info = await conn.getAccountInfo(pk, 'confirmed');
+            if (info) {
+              if (!info.owner.equals(PROGRAM_ID)) {
+                logger.error(
+                  `❌ On-chain market owner mismatch for ${marketPubkey}: expected=${PROGRAM_ID.toBase58()} actual=${info.owner.toBase58()}`
+                );
+                return false;
+              }
+              return true;
+            }
+          } catch (e: any) {
+            // keep retrying; we surface final failure below
+            if (attempt === maxAttempts) {
+              logger.error(`❌ Failed to verify on-chain market account for ${marketPubkey}: ${e?.message || e}`);
+              return false;
+            }
+          }
+
+          // backoff ~2.5s total worst case
+          await new Promise((r) => setTimeout(r, 250 + attempt * 100));
+        }
+        return false;
+      };
+
+      const ok = await verifyOnChain();
+      if (!ok) {
+        logger.error(`❌ On-chain market account missing after creation attempt: ${m.asset}-${m.timeframe} ${marketPubkey}`);
+        continue;
+      }
+
+      // Check if it already exists in DB to prevent duplicates
+      const existing = await marketService.getByPubkey(marketPubkey);
+      if (existing) {
+        logger.debug(`Market ${marketPubkey.slice(0, 8)} already exists in DB, skipping create`);
+        continue;
+      }
+
       await marketService.create({
         pubkey: marketPubkey,
         asset: m.asset as any,

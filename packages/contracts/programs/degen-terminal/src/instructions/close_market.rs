@@ -8,9 +8,6 @@ pub struct CloseMarket<'info> {
     /// Market account to close - must be fully settled
     #[account(
         mut,
-        constraint = (market.status == MarketStatus::Settled || 
-                     (market.status == MarketStatus::Resolved && market.total_positions == 0)) 
-                     @ DegenError::MarketNotSettled,
         close = rent_recipient
     )]
     pub market: Account<'info, Market>,
@@ -53,6 +50,30 @@ pub struct CloseMarket<'info> {
 /// 5. Returns all rent to the specified recipient
 pub fn close_market(ctx: Context<CloseMarket>) -> Result<()> {
     let market = &ctx.accounts.market;
+    let clock = Clock::get()?;
+
+    // Market must be expired before it can be closed (even for empty/no-trade markets)
+    require!(clock.unix_timestamp >= market.expiry_at, DegenError::MarketNotExpired);
+
+    // Allow closure in two safe cases:
+    // 1) Normal path: market is Settled (all payouts complete) OR Resolved with 0 positions (legacy)
+    // 2) No-trade path: market has no trades (open_interest==0 and total_positions==0)
+    let is_settled_or_resolved_empty =
+        market.status == MarketStatus::Settled ||
+        (market.status == MarketStatus::Resolved && market.total_positions == 0);
+    let is_no_trade_market = market.total_positions == 0 && market.open_interest == 0;
+
+    require!(
+        is_settled_or_resolved_empty || is_no_trade_market,
+        DegenError::MarketNotSettled
+    );
+
+    // SAFETY: For no-trade markets, the vault must be empty. Otherwise, there are still
+    // user funds escrowed (e.g. open orders) and we must not sweep them to the relayer.
+    if is_no_trade_market {
+        require!(ctx.accounts.vault.amount == 0, DegenError::VaultNotEmpty);
+    }
+
     let vault_lamports = ctx.accounts.vault.to_account_info().lamports();
     let market_lamports = market.to_account_info().lamports();
     let dust_amount = ctx.accounts.vault.amount;

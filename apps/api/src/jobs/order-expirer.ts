@@ -41,12 +41,18 @@ async function cancelOrdersForClosingMarkets(now: Date): Promise<void> {
   
   for (const market of expiringMarkets) {
     try {
-      // Get count of open orders
-      const { orders: openOrders } = await orderService.getUserOrders('', {
-        marketId: market.id,
-        status: 'OPEN',
-        limit: 1000,
-      });
+      // Get count of open orders for this market
+      // Using a direct DB query instead of userService to avoid UUID type errors with empty userIds
+      const openOrders = await db
+        .select()
+        .from(orders)
+        .where(
+          and(
+            eq(orders.marketId, market.id),
+            or(eq(orders.status, 'OPEN'), eq(orders.status, 'PARTIAL'))
+          )
+        )
+        .limit(1000);
       
       if (openOrders.length === 0) continue;
       
