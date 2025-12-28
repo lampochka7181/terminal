@@ -114,6 +114,13 @@ export async function orderRoutes(app: FastifyInstance) {
       });
     }
 
+    // Markets with strikePrice = '0' are pending activation (trading suspended)
+    if (market.strikePrice === '0') {
+      return reply.code(409).send({
+        error: { code: 'MARKET_PENDING', message: 'Trading suspended - market strike price not yet set' },
+      });
+    }
+
     const isMarketOrder = data.type.toUpperCase() === 'MARKET';
     const isSellOrder = data.side.toUpperCase() === 'ASK';
     const outcomeUpper = data.outcome.toUpperCase() as 'YES' | 'NO';

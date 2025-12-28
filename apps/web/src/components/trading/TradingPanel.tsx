@@ -205,8 +205,12 @@ export function TradingPanel() {
     clearError();
   };
 
-  const canSubmitMarket = connected && selectedMarket && parseFloat(dollarAmount) > 0 && marketEstimate.contracts > 0;
-  const canSubmitLimit = connected && selectedMarket && limitSizeNum > 0 && limitPriceNum >= 0.01 && limitPriceNum <= 0.99;
+  // Check if market has a valid strike price (0 = pending activation, trading suspended)
+  const marketHasStrike = selectedMarket && selectedMarket.strike > 0;
+  const isTradingSuspended = selectedMarket && selectedMarket.strike === 0;
+  
+  const canSubmitMarket = connected && marketHasStrike && parseFloat(dollarAmount) > 0 && marketEstimate.contracts > 0;
+  const canSubmitLimit = connected && marketHasStrike && limitSizeNum > 0 && limitPriceNum >= 0.01 && limitPriceNum <= 0.99;
   const canSubmit = orderType === 'market' ? canSubmitMarket : canSubmitLimit;
 
   return (
@@ -480,6 +484,14 @@ export function TradingPanel() {
         <div className="flex items-center gap-2 p-3 mb-4 bg-warning/10 border border-warning/20 rounded-lg text-warning text-sm">
           <AlertCircle className="w-4 h-4 flex-shrink-0" />
           <span>Select a market to place orders</span>
+        </div>
+      )}
+
+      {/* Trading suspended warning - strike price not yet set */}
+      {connected && isTradingSuspended && (
+        <div className="flex items-center gap-2 p-3 mb-4 bg-yellow-500/10 border border-yellow-500/20 rounded-lg text-yellow-400 text-sm">
+          <Loader2 className="w-4 h-4 flex-shrink-0 animate-spin" />
+          <span>Waiting for strike price... Trading will begin shortly</span>
         </div>
       )}
 

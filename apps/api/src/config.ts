@@ -76,6 +76,12 @@ export const config = {
   // Market Maker
   mmEnabled: process.env.MM_ENABLED === 'true',
   mmPrivateKey: process.env.MM_PRIVATE_KEY || process.env.MM_WALLET_PRIVATE_KEY || '',
+
+  // Temporary: reduce DB usage by not persisting MM orders (they remain in Redis orderbook only)
+  disableMmOrderPersistence: process.env.DISABLE_MM_ORDER_PERSISTENCE === 'true',
+
+  // Devnet/testing: if the book is empty, force-fill market orders against MM at a reasonable price.
+  devAlwaysFillMarketOrders: process.env.DEV_ALWAYS_FILL_MARKET_ORDERS === 'true',
   
   // Fees
   makerFeeBps: 0,    // 0.00%

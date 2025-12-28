@@ -20,3 +20,4 @@ echo "🛰️  Starting API and Web in development mode..."
 echo "----------------------------------------"
 pnpm dev
 
+

@@ -64,8 +64,19 @@ app.addHook('onResponse', async (request, reply) => {
   // If it's a 500 error, also log it to the system logger so it shows in the terminal
   if (reply.statusCode >= 500) {
     const error = (reply as any).error || (request as any).error;
-    const msg = error ? (error.stack || error.message) : 'Unknown Error';
-    logger.error(`API 500 Error: ${request.method} ${request.url} (${duration.toFixed(2)}ms)\n${msg}`);
+    let msg = 'Unknown Error';
+    if (error) {
+      // Handle different error formats
+      if (error.stack) {
+        msg = error.stack;
+      } else if (error.message) {
+        msg = error.message;
+      } else if (typeof error === 'object') {
+        // For rate limit and other structured errors
+        msg = JSON.stringify(error, null, 2);
+      }
+    }
+    logger.error(`API ${reply.statusCode} Error: ${request.method} ${request.url} (${duration.toFixed(2)}ms)\n${msg}`);
   }
 });
 
@@ -115,9 +126,11 @@ async function main() {
   });
 
   // Rate Limiting
+  // 300/minute is generous for development (React StrictMode + multiple components)
+  // In production, consider lowering to 100-150/minute
   await app.register(rateLimit, {
     global: true,
-    max: 100,
+    max: 300,
     timeWindow: '1 minute',
     keyGenerator: (request) => {
       // Use user ID for authenticated requests, IP for anonymous
@@ -332,8 +345,33 @@ async function main() {
 
   // Global error handler
   app.setErrorHandler((error, request, reply) => {
+    // Handle rate limit errors - @fastify/rate-limit uses statusCode 429
+    // Check multiple ways since error structure can vary
+    const hasRateLimitStatus = error.statusCode === 429;
+    const hasRateLimitCode = (error as any)?.error?.code === 'RATE_LIMITED';
+    const hasRateLimitMessage = error.message?.includes('Rate limit') || 
+      error.message?.includes('Too many requests');
+    
+    const isRateLimitError = hasRateLimitStatus || hasRateLimitCode || hasRateLimitMessage;
+    
+    if (isRateLimitError) {
+      // Return proper 429 with the rate limit response body
+      // The errorResponseBuilder output is spread into the error object
+      const rateLimitBody = (error as any).error 
+        ? { error: (error as any).error }
+        : {
+            error: {
+              code: 'RATE_LIMITED',
+              message: 'Too many requests. Please slow down.',
+              details: { limit: 100, resetAt: '1 minute' }
+            }
+          };
+      return reply.code(429).send(rateLimitBody);
+    }
+
     // Log detailed error to apiLogger (writes to file)
-    apiLogger.error(`Request error: ${request.method} ${request.url} - ${error.message}`, {
+    const errorMessage = error.message || error.code || 'Unknown error';
+    apiLogger.error(`Request error: ${request.method} ${request.url} - ${errorMessage}`, {
       err: error,
       url: request.url,
       method: request.method,
@@ -345,6 +383,7 @@ async function main() {
     if (process.env.NODE_ENV !== 'production') {
       logger.error({ err: error, url: request.url }, 'Request error');
     }
+    
     if (error.validation) {
       return reply.code(400).send({
         error: {
@@ -372,7 +411,7 @@ async function main() {
     return reply.code(statusCode).send({
       error: {
         code: statusCode === 500 ? 'INTERNAL_ERROR' : 'ERROR',
-        message: statusCode === 500 ? 'An unexpected error occurred' : error.message,
+        message: statusCode === 500 ? 'An unexpected error occurred' : errorMessage,
       },
     });
   });
@@ -426,9 +465,9 @@ async function main() {
     logger.info(`📡 WebSocket available at ws://${config.host}:${config.port}/ws`);
     logger.info(`📋 Health check at http://${config.host}:${config.port}/health`);
     
-    // Start price feed (Binance WebSocket)
+    // Start price feed (Coinbase WebSocket)
     priceFeedService.start();
-    logger.info('📈 Price feed started (Binance)');
+    logger.info('📈 Price feed started (Coinbase)');
     
     // Start keeper jobs (market creator, resolver, settler, etc.)
     startKeeperJobs();

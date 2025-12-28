@@ -272,32 +272,38 @@ class TransactionService {
    */
   private async handleMatchSuccess(params: MatchParams, signature: string): Promise<void> {
     await this.updateTradeStatus(params.makerOrderId, params.takerOrderId, signature);
-    logger.debug(`Match success: maker=${params.makerOrderId}, taker=${params.takerOrderId}, tx=${signature}`);
+    logger.info(`Match success: market=${params.marketPubkey.slice(0,8)}, size=${params.matchSize}, tx=${signature}`);
   }
 
   /**
    * Update trade transaction status
    */
   private async updateTradeStatus(makerOrderId: string, takerOrderId: string, signature: string): Promise<void> {
-    // Update trades table with signature
-    await db
-      .update(trades)
-      .set({
-        txSignature: signature,
-        txStatus: signature.startsWith('sim_') ? 'PENDING' : 'CONFIRMED',
-        confirmedAt: signature.startsWith('sim_') ? null : new Date(),
-      })
-      .where(eq(trades.makerOrderId, makerOrderId));
+    const updateData = {
+      txSignature: signature,
+      txStatus: signature.startsWith('sim_') ? 'PENDING' as const : 'CONFIRMED' as const,
+      confirmedAt: signature.startsWith('sim_') ? null : new Date(),
+    };
 
-    // Also update by taker order ID in case it's a different row
-    await db
-      .update(trades)
-      .set({
-        txSignature: signature,
-        txStatus: signature.startsWith('sim_') ? 'PENDING' : 'CONFIRMED',
-        confirmedAt: signature.startsWith('sim_') ? null : new Date(),
-      })
-      .where(eq(trades.takerOrderId, takerOrderId));
+    // Skip makerOrderId lookup for synthetic MM orders (they're stored with null makerOrderId)
+    const isSyntheticMaker = makerOrderId.startsWith('mm_synth_') || makerOrderId.startsWith('aggregated-mm-');
+    
+    if (!isSyntheticMaker) {
+      // Update trades table by maker order ID
+      await db
+        .update(trades)
+        .set(updateData)
+        .where(eq(trades.makerOrderId, makerOrderId));
+    }
+
+    // Also update by taker order ID (this is the reliable identifier for synthetic MM trades)
+    const isSyntheticTaker = takerOrderId === 'pending' || takerOrderId.startsWith('mm_synth_');
+    if (!isSyntheticTaker) {
+      await db
+        .update(trades)
+        .set(updateData)
+        .where(eq(trades.takerOrderId, takerOrderId));
+    }
   }
 
   /**

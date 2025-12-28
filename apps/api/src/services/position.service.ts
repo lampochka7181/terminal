@@ -104,6 +104,12 @@ export class PositionService {
   ): Promise<void> {
     const position = await this.getOrCreate(userId, marketId);
     
+    // Truncate shares to 6 decimal places to match on-chain precision
+    // On-chain stores shares as u64 with 6 decimals (e.g., 1.5 shares = 1_500_000)
+    // Using Math.floor ensures DB matches exactly what's credited on-chain
+    const truncateToOnChainPrecision = (n: number) => Math.floor(n * 1_000_000) / 1_000_000;
+    const sharesToAdd = truncateToOnChainPrecision(shares);
+    
     const currentYes = parseFloat(position.yesShares || '0');
     const currentNo = parseFloat(position.noShares || '0');
     const currentCost = parseFloat(position.totalCost || '0');
@@ -121,36 +127,36 @@ export class PositionService {
     if (isBuy) {
       // BUYING: Add shares and increase cost basis
       if (outcome === 'YES') {
-        const avgPrice = cost / shares;
+        const avgPrice = cost / sharesToAdd;
         newAvgYes = currentYes > 0 
-          ? (currentYes * currentAvgYes + shares * avgPrice) / (currentYes + shares)
+          ? (currentYes * currentAvgYes + sharesToAdd * avgPrice) / (currentYes + sharesToAdd)
           : avgPrice;
-        newYes = currentYes + shares;
+        newYes = truncateToOnChainPrecision(currentYes + sharesToAdd);
       } else {
-        const avgPrice = cost / shares;
+        const avgPrice = cost / sharesToAdd;
         newAvgNo = currentNo > 0
-          ? (currentNo * currentAvgNo + shares * avgPrice) / (currentNo + shares)
+          ? (currentNo * currentAvgNo + sharesToAdd * avgPrice) / (currentNo + sharesToAdd)
           : avgPrice;
-        newNo = currentNo + shares;
+        newNo = truncateToOnChainPrecision(currentNo + sharesToAdd);
       }
       newCost = currentCost + cost;
     } else {
       // SELLING: Reduce shares and calculate realized PnL
       if (outcome === 'YES') {
         // Calculate realized PnL: proceeds - cost basis for sold shares
-        const costBasisSold = currentAvgYes * shares;
+        const costBasisSold = currentAvgYes * sharesToAdd;
         const realizedPnL = cost - costBasisSold;  // cost is actually proceeds when selling
         newRealizedPnl = currentRealizedPnl + realizedPnL;
-        newYes = Math.max(0, currentYes - shares);
+        newYes = truncateToOnChainPrecision(Math.max(0, currentYes - sharesToAdd));
         // Reduce total cost by the cost basis of sold shares
         newCost = Math.max(0, currentCost - costBasisSold);
         // Average entry stays the same for remaining shares
       } else {
         // Calculate realized PnL for NO shares
-        const costBasisSold = currentAvgNo * shares;
+        const costBasisSold = currentAvgNo * sharesToAdd;
         const realizedPnL = cost - costBasisSold;
         newRealizedPnl = currentRealizedPnl + realizedPnL;
-        newNo = Math.max(0, currentNo - shares);
+        newNo = truncateToOnChainPrecision(Math.max(0, currentNo - sharesToAdd));
         newCost = Math.max(0, currentCost - costBasisSold);
       }
     }

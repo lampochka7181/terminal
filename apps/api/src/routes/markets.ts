@@ -9,7 +9,7 @@ import { logger } from '../lib/logger.js';
 const listMarketsSchema = z.object({
   asset: z.enum(['BTC', 'ETH', 'SOL']).optional(),
   status: z.enum(['OPEN', 'CLOSED', 'RESOLVED', 'SETTLED']).optional(),
-  timeframe: z.enum(['5m', '15m', '1h', '4h']).optional(),
+  timeframe: z.enum(['5m', '15m', '1h', '4h', '24h']).optional(),
 });
 
 const marketParamsSchema = z.object({
@@ -20,6 +20,124 @@ const tradesQuerySchema = z.object({
   limit: z.coerce.number().min(1).max(200).default(50),
   before: z.string().optional(),
 });
+
+const candlesQuerySchema = z.object({
+  asset: z.enum(['BTC', 'ETH', 'SOL']),
+  intervalSec: z.coerce.number().min(1).max(60).default(5),
+  lookbackSec: z.coerce.number().min(60).max(6 * 60 * 60).default(60 * 60), // 1h default, max 6h
+});
+
+type Candle = { time: number; open: number; high: number; low: number; close: number };
+
+async function fetchCoinbaseTradesTicks(params: {
+  productId: string;
+  startMs: number;
+  endMs: number;
+}): Promise<Array<{ ts: number; price: number }>> {
+  const { productId, startMs, endMs } = params;
+  let before: string | undefined = undefined;
+  const out: Array<{ ts: number; price: number }> = [];
+
+  // Best-effort backfill; cap pages to avoid rate limit / long tail.
+  const MAX_PAGES = 8;
+  const LIMIT = 1000;
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const url = new URL(`https://api.exchange.coinbase.com/products/${productId}/trades`);
+    url.searchParams.set('limit', String(LIMIT));
+    if (before) url.searchParams.set('before', before);
+
+    const res = await fetch(url.toString(), { headers: { Accept: 'application/json' } });
+    if (!res.ok) break;
+    const rows = (await res.json()) as Array<{ trade_id: number; price: string; time: string }>;
+    if (!Array.isArray(rows) || rows.length === 0) break;
+
+    // Coinbase returns newest-first. Append and page backwards.
+    for (const r of rows) {
+      const ts = Date.parse(r.time);
+      const price = Number(r.price);
+      if (!Number.isFinite(ts) || !Number.isFinite(price)) continue;
+      if (ts >= startMs && ts <= endMs) out.push({ ts, price });
+    }
+
+    const last = rows[rows.length - 1];
+    if (!last?.trade_id) break;
+    before = String(last.trade_id);
+
+    // Stop if we've reached (or passed) the start window based on the oldest trade in this page.
+    const oldestTs = Date.parse(last.time);
+    if (Number.isFinite(oldestTs) && oldestTs <= startMs) break;
+
+    // Small delay to be polite to the API
+    await new Promise((r) => setTimeout(r, 150));
+  }
+
+  // Sort ascending for candle aggregation
+  out.sort((a, b) => a.ts - b.ts);
+  return out;
+}
+
+function buildCandlesFromTicks(params: {
+  ticks: Array<{ ts: number; price: number }>;
+  intervalSec: number;
+  startMs: number;
+  endMs: number;
+}): Candle[] {
+  const { ticks, intervalSec, startMs, endMs } = params;
+  const startSec = Math.floor(startMs / 1000);
+  const endSec = Math.floor(endMs / 1000);
+  const startBucket = Math.floor(startSec / intervalSec) * intervalSec;
+  const endBucket = Math.floor(endSec / intervalSec) * intervalSec;
+
+  const candles: Candle[] = [];
+  let tickIdx = 0;
+  let prevClose: number | null = null;
+
+  for (let bucket = startBucket; bucket <= endBucket; bucket += intervalSec) {
+    const bucketStartMs = bucket * 1000;
+    const bucketEndMs = (bucket + intervalSec) * 1000;
+
+    // Advance tick index to first tick in/after bucket
+    while (tickIdx < ticks.length && ticks[tickIdx].ts < bucketStartMs) tickIdx++;
+
+    const firstIdx = tickIdx;
+    let open: number | null = null;
+    let high: number | null = null;
+    let low: number | null = null;
+    let close: number | null = null;
+
+    while (tickIdx < ticks.length && ticks[tickIdx].ts < bucketEndMs) {
+      const p = ticks[tickIdx].price;
+      if (open == null) open = p;
+      high = high == null ? p : Math.max(high, p);
+      low = low == null ? p : Math.min(low, p);
+      close = p;
+      tickIdx++;
+    }
+
+    if (open == null) {
+      // No trades in this bucket; carry forward last close if we have it.
+      if (prevClose == null) {
+        // Still no price context; skip until we get our first trade.
+        continue;
+      }
+      open = prevClose;
+      high = prevClose;
+      low = prevClose;
+      close = prevClose;
+    }
+
+    prevClose = close!;
+    candles.push({ time: bucket, open: open!, high: high!, low: low!, close: close! });
+
+    // If bucket had no ticks, tickIdx didn't move; ensure we don't get stuck (we won't, since bucket increments)
+    if (firstIdx === tickIdx) {
+      // noop
+    }
+  }
+
+  return candles;
+}
 
 export async function marketRoutes(app: FastifyInstance) {
   /**
@@ -90,6 +208,72 @@ export async function marketRoutes(app: FastifyInstance) {
     }
     
     return result;
+  });
+
+  /**
+   * GET /markets/candles
+   * Return aggregated candles (default 5s) for charting.
+   * Uses Redis tick history; best-effort backfills from Coinbase REST trades if needed.
+   */
+  app.get('/candles', async (request: FastifyRequest, reply: FastifyReply) => {
+    const query = candlesQuerySchema.safeParse(request.query);
+    if (!query.success) {
+      return reply.code(400).send({
+        error: {
+          code: 'INVALID_REQUEST',
+          message: 'Invalid query parameters',
+          details: query.error.flatten(),
+        },
+      });
+    }
+
+    const { asset, intervalSec, lookbackSec } = query.data;
+    const endMs = Date.now();
+    const startMs = endMs - lookbackSec * 1000;
+
+    const key = RedisKeys.ticks(asset);
+    let ticks: Array<{ ts: number; price: number }> = [];
+
+    try {
+      const raw = await redis.zrangebyscore(key, startMs, endMs, 'WITHSCORES');
+      for (let i = 0; i < raw.length; i += 2) {
+        const member = raw[i];
+        const score = Number(raw[i + 1]);
+        const price = Number(String(member).split(':')[0]);
+        if (!Number.isFinite(score) || !Number.isFinite(price)) continue;
+        ticks.push({ ts: score, price });
+      }
+      ticks.sort((a, b) => a.ts - b.ts);
+    } catch {
+      // ignore
+    }
+
+    // Backfill if we have too little data (common after restart)
+    if (ticks.length < 200) {
+      const productId = asset === 'BTC' ? 'BTC-USD' : asset === 'ETH' ? 'ETH-USD' : 'SOL-USD';
+      try {
+        const backfilled = await fetchCoinbaseTradesTicks({ productId, startMs, endMs });
+        if (backfilled.length > 0) {
+          ticks = backfilled;
+          // Best-effort seed Redis so subsequent requests are cheap
+          try {
+            const pipeline = redis.pipeline();
+            for (const t of backfilled) {
+              pipeline.zadd(key, String(t.ts), `${t.price}:${Math.random().toString(36).slice(2)}`);
+            }
+            pipeline.zremrangebyscore(key, 0, endMs - 6 * 60 * 60 * 1000);
+            await pipeline.exec();
+          } catch {
+            // ignore
+          }
+        }
+      } catch (e: any) {
+        logger.warn(`Failed to backfill candles from Coinbase trades for ${asset}: ${e?.message || e}`);
+      }
+    }
+
+    const candles = buildCandlesFromTicks({ ticks, intervalSec, startMs, endMs });
+    return { asset, intervalSec, candles };
   });
 
   /**

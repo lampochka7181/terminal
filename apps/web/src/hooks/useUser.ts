@@ -39,6 +39,15 @@ export function useUser() {
     orders: user.orders,
     ordersLoading: user.ordersLoading,
     
+    // Settlements (history) - DEPRECATED, use transactions
+    settlements: user.settlements,
+    settlementsLoading: user.settlementsLoading,
+    
+    // Transactions (all trade history)
+    transactions: user.transactions,
+    transactionsLoading: user.transactionsLoading,
+    transactionsHasMore: user.transactionsHasMore,
+    
     // Status
     lastUpdate: user.lastUpdate,
     error: user.error,
@@ -47,6 +56,8 @@ export function useUser() {
     refetchBalance: user.fetchBalance,
     refetchPositions: user.fetchPositions,
     refetchOrders: user.fetchOrders,
+    refetchSettlements: user.fetchSettlements,
+    refetchTransactions: user.fetchTransactions,
     refetchAll: user.fetchAll,
   };
 }

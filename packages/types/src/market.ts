@@ -1,5 +1,5 @@
 export type Asset = 'BTC' | 'ETH' | 'SOL';
-export type Timeframe = '5m' | '15m' | '1h' | '4h';
+export type Timeframe = '5m' | '15m' | '1h' | '4h' | '24h';
 export type MarketStatus = 'OPEN' | 'CLOSED' | 'RESOLVED' | 'SETTLED';
 export type Outcome = 'YES' | 'NO';
 

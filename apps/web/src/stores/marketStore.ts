@@ -77,29 +77,47 @@ export const useMarketStore = create<MarketStore>((set, get) => ({
 // Helper to get the best market for current selection
 export function useSelectedMarket() {
   const { selectedAsset, selectedTimeframe, markets, selectedMarket } = useMarketStore();
+  const now = Date.now();
   
-  // If we have a specifically selected market, return it
+  const pickFromList = () => {
+    // Prefer the soonest-expiring *active* market for this asset/timeframe
+    const candidates = markets
+      .filter((m) => m.asset === selectedAsset && m.timeframe === selectedTimeframe)
+      .filter((m) => typeof m.expiry === 'number' && m.expiry > now)
+      .sort((a, b) => (a.expiry || 0) - (b.expiry || 0));
+
+    const market = candidates[0];
+    if (!market) return null;
+
+    return {
+      id: market.id,
+      address: market.address,
+      asset: market.asset,
+      timeframe: market.timeframe,
+      strike: market.strike,
+      expiry: market.expiry,
+      status: market.status,
+      yesPrice: market.yesPrice,
+      noPrice: market.noPrice,
+    };
+  };
+
+  // If we have a specifically selected market, only trust it if it matches the current selection
+  // and hasn't expired. Otherwise prefer the up-to-date market list.
   if (selectedMarket) {
-    return selectedMarket;
+    const matchesSelection =
+      selectedMarket.asset === selectedAsset && selectedMarket.timeframe === selectedTimeframe;
+    const notExpired = typeof selectedMarket.expiry === 'number' && selectedMarket.expiry > now;
+
+    if (matchesSelection && notExpired) {
+      // If the market list has a replacement (common after refresh/expiry), prefer the list.
+      const fromList = pickFromList();
+      if (fromList && fromList.address !== selectedMarket.address) {
+        return fromList;
+      }
+      return selectedMarket;
+    }
   }
   
-  // Otherwise find from market list
-  const market = markets.find(
-    m => m.asset === selectedAsset && m.timeframe === selectedTimeframe
-  );
-  
-  if (!market) return null;
-  
-  // Convert MarketSummary to Market format
-  return {
-    id: market.id,
-    address: market.address,
-    asset: market.asset,
-    timeframe: market.timeframe,
-    strike: market.strike,
-    expiry: market.expiry,
-    status: market.status,
-    yesPrice: market.yesPrice,
-    noPrice: market.noPrice,
-  };
+  return pickFromList();
 }

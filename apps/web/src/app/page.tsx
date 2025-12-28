@@ -1,44 +1,27 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { Header } from '@/components/layout/Header';
 import { usePrices } from '@/hooks/usePrices';
 import { useUser, useTotalPnL } from '@/hooks/useUser';
 import { useAuth } from '@/hooks/useAuth';
 import { cn } from '@/lib/utils';
-import { TrendingUp, TrendingDown, Activity, Wallet, ChevronRight, RefreshCw, CheckCircle, Settings } from 'lucide-react';
+import { TrendingUp, TrendingDown, Activity, Wallet, ChevronRight, RefreshCw, CheckCircle, Settings, X } from 'lucide-react';
 import Link from 'next/link';
 import { useDelegation } from '@/hooks/useDelegation';
 
 export default function Home() {
   const { connected } = useWallet();
   const { prices, loading: pricesLoading, refetch: refetchPrices } = usePrices();
-  const { isAuthenticated, signIn, isAuthenticating } = useAuth();
+  const { isAuthenticated, isAuthenticating } = useAuth();
   const { balance, positions, balanceLoading, positionsLoading, refetchAll } = useUser();
-  const { isApproved: isDelegationApproved, delegatedAmount, approve: approveDelegation, isApproving } = useDelegation();
+  const { isApproved: isDelegationApproved, delegatedAmount, approve: approveDelegation, revoke: revokeDelegation, isApproving } = useDelegation();
   const totalPnL = useTotalPnL();
+  const [showDelegationSettings, setShowDelegationSettings] = useState(false);
+  const [delegationInput, setDelegationInput] = useState('');
 
-  // Track if we've already attempted sign-in to prevent infinite loops
-  const signInAttemptedRef = useRef(false);
-  
-  // Reset the flag when wallet disconnects
-  useEffect(() => {
-    if (!connected) {
-      signInAttemptedRef.current = false;
-    }
-  }, [connected]);
-
-  // Sign in automatically when wallet connects (only once per connection)
-  useEffect(() => {
-    if (connected && !isAuthenticated && !isAuthenticating && !signInAttemptedRef.current) {
-      signInAttemptedRef.current = true;
-      signIn().catch((err) => {
-        console.error('[Home] Auto sign-in failed:', err);
-        // Don't reset the flag on error - user can manually try again
-      });
-    }
-  }, [connected, isAuthenticated, isAuthenticating, signIn]);
+  // NOTE: Auto sign-in is handled globally in `Header` so it works from any page.
 
   const totalValue = positions.reduce((sum, p) => {
     const shares = p.yesShares + p.noShares;
@@ -90,9 +73,21 @@ export default function Home() {
                   <span className="text-sm">Fast Trading</span>
                 </div>
                 {isDelegationApproved ? (
-                  <span className="text-sm font-mono font-medium text-text-primary">
-                    ${(delegatedAmount / 1_000_000).toFixed(2)} Delegated
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-mono font-medium text-text-primary">
+                      ${(delegatedAmount / 1_000_000).toFixed(2)} Delegated
+                    </span>
+                    <button
+                      onClick={() => {
+                        setDelegationInput(((delegatedAmount || 0) / 1_000_000).toFixed(2));
+                        setShowDelegationSettings(true);
+                      }}
+                      className="p-1 hover:bg-surface-light rounded transition-colors"
+                      title="Fast Trading Settings"
+                    >
+                      <Settings className="w-4 h-4 text-text-muted" />
+                    </button>
+                  </div>
                 ) : (
                   <button 
                     onClick={() => approveDelegation()}
@@ -112,10 +107,10 @@ export default function Home() {
           )}
         </div>
 
-        {/* Portfolio Card */}
+        {/* Positions Card */}
         <div className="bg-surface rounded-xl border border-border p-4">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-lg font-semibold">Portfolio</h2>
+            <h2 className="text-lg font-semibold">Positions</h2>
             {connected && positions.length > 0 && (
               <div className={cn(
                 'text-sm font-mono font-medium',
@@ -187,6 +182,84 @@ export default function Home() {
           <span className="text-accent">Devnet</span>
         </div>
       </footer>
+
+      {/* Delegation Settings Modal */}
+      {showDelegationSettings && connected && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60">
+          <div className="w-full max-w-md bg-surface rounded-xl border border-border overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-surface-light/30">
+              <div>
+                <div className="font-semibold">Fast Trading Settings</div>
+                <div className="text-xs text-text-muted">Adjust the USDC amount delegated to the relayer.</div>
+              </div>
+              <button
+                onClick={() => setShowDelegationSettings(false)}
+                className="p-2 hover:bg-surface-light rounded-lg transition-colors"
+                aria-label="Close"
+              >
+                <X className="w-4 h-4 text-text-muted" />
+              </button>
+            </div>
+
+            <div className="p-4 space-y-4">
+              <div className="text-sm text-text-muted">
+                Current delegation: <span className="font-mono text-text-primary font-semibold">${(delegatedAmount / 1_000_000).toFixed(2)}</span>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-text-primary">Delegated amount (USDC)</label>
+                <input
+                  value={delegationInput}
+                  onChange={(e) => setDelegationInput(e.target.value)}
+                  inputMode="decimal"
+                  placeholder="e.g. 1000"
+                  className="w-full px-3 py-2 rounded-lg bg-surface-light border border-border text-text-primary outline-none focus:border-accent"
+                />
+                <div className="flex flex-wrap gap-2">
+                  {[1000, 5000, 10000, 25000].map((amt) => (
+                    <button
+                      key={amt}
+                      onClick={() => setDelegationInput(amt.toString())}
+                      className="px-2.5 py-1.5 text-xs font-mono rounded-lg bg-surface-light hover:bg-surface-light/80 border border-border text-text-primary"
+                    >
+                      ${amt.toLocaleString()}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-text-muted">
+                  This lets the relayer execute your MARKET orders without extra approvals. You can change or revoke anytime.
+                </p>
+              </div>
+
+              <div className="flex items-center justify-between gap-3 pt-2">
+                <button
+                  onClick={async () => {
+                    await revokeDelegation();
+                    setShowDelegationSettings(false);
+                  }}
+                  disabled={isApproving}
+                  className="px-3 py-2 rounded-lg border border-border text-text-muted hover:text-text-primary hover:bg-surface-light transition-colors"
+                >
+                  Revoke
+                </button>
+                <button
+                  onClick={async () => {
+                    const parsed = Number(delegationInput);
+                    if (!Number.isFinite(parsed) || parsed < 0) return;
+                    const micro = Math.floor(parsed * 1_000_000);
+                    await approveDelegation(micro);
+                    setShowDelegationSettings(false);
+                  }}
+                  disabled={isApproving}
+                  className="px-3 py-2 rounded-lg bg-accent text-background font-semibold hover:opacity-90 transition-opacity"
+                >
+                  {isApproving ? 'Saving...' : 'Save'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

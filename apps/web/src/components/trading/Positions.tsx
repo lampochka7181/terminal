@@ -3,10 +3,10 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useUser } from '@/hooks/useUser';
 import { cn } from '@/lib/utils';
-import { Clock, TrendingUp, TrendingDown, X, RefreshCw, ArrowRightLeft } from 'lucide-react';
+import { Clock, TrendingUp, TrendingDown, X, RefreshCw, ArrowRightLeft, ExternalLink, History } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useOrder } from '@/hooks/useOrder';
-import type { Position as ApiPosition, Order as ApiOrder } from '@/lib/api';
+import type { Position as ApiPosition, Order as ApiOrder, Settlement, UserTransaction } from '@/lib/api';
 
 type Tab = 'active' | 'history';
 
@@ -37,8 +37,10 @@ export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome
   const { 
     positions: apiPositions, 
     orders: apiOrders, 
+    transactions,
     positionsLoading,
     ordersLoading,
+    transactionsLoading,
     refetchAll
   } = useUser();
 
@@ -153,7 +155,7 @@ export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome
           <Clock className="w-6 h-6 text-text-muted" />
         </div>
         <div>
-          <h3 className="font-bold text-lg">Portfolio Locked</h3>
+          <h3 className="font-bold text-lg">Positions Locked</h3>
           <p className="text-text-muted text-sm max-w-xs">Connect your wallet to see your active positions and open orders.</p>
         </div>
       </div>
@@ -175,13 +177,21 @@ export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome
                   : 'text-text-muted hover:text-text-primary hover:bg-surface-light'
               )}
             >
-              {tab === 'active' ? 'Live Trades' : tab}
+              {tab === 'active' ? 'Live Trades' : 'History'}
               {tab === 'active' && combinedActive.length > 0 && (
                 <span className={cn(
                   "ml-2 px-1.5 py-0.5 text-[10px] rounded-full font-black",
                   activeTab === tab ? "bg-background/20 text-background" : "bg-accent/20 text-accent"
                 )}>
                   {combinedActive.length}
+                </span>
+              )}
+              {tab === 'history' && transactions && transactions.length > 0 && (
+                <span className={cn(
+                  "ml-2 px-1.5 py-0.5 text-[10px] rounded-full font-black",
+                  activeTab === tab ? "bg-background/20 text-background" : "bg-accent/20 text-accent"
+                )}>
+                  {transactions.length}
                 </span>
               )}
             </button>
@@ -210,10 +220,10 @@ export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome
           />
         )}
         {activeTab === 'history' && (
-          <div className="text-center py-12 text-text-muted space-y-2">
-            <Clock className="w-8 h-8 mx-auto opacity-20" />
-            <p>No trade history yet</p>
-          </div>
+          <TransactionHistoryTable 
+            transactions={transactions || []} 
+            isLoading={transactionsLoading} 
+          />
         )}
       </div>
 
@@ -453,4 +463,217 @@ function ExpiryCountdown({ expiry }: { expiry: number }) {
   }, [expiry]);
 
   return <span>{timeLeft}</span>;
+}
+
+// Transaction History Table Component - Shows all trades and settlements
+function TransactionHistoryTable({ 
+  transactions, 
+  isLoading 
+}: { 
+  transactions: UserTransaction[]; 
+  isLoading: boolean;
+}) {
+  // Calculate realized P&L from closing transactions (settlements with pnl)
+  const totalPnl = transactions
+    .filter(t => t.transactionType === 'close' && t.pnl !== undefined)
+    .reduce((sum, t) => sum + (t.pnl ?? 0), 0);
+
+  if (isLoading && transactions.length === 0) {
+    return (
+      <div className="divide-y divide-border">
+        {[1, 2, 3].map(i => <div key={i} className="h-16 bg-surface animate-pulse" />)}
+      </div>
+    );
+  }
+
+  if (transactions.length === 0) {
+    return (
+      <div className="text-center py-16 text-text-muted">
+        <History className="w-8 h-8 mx-auto opacity-20 mb-2" />
+        <p>No transaction history yet</p>
+        <p className="text-xs mt-1">Your trades will appear here</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Summary Stats */}
+      <div className="px-4 py-3 bg-surface-light/30 border-b border-border flex items-center justify-end text-sm">
+        <div className="flex items-center gap-2">
+          <span className="text-text-muted">Realized P&L:</span>
+          <span className={cn(
+            'font-mono font-bold',
+            totalPnl >= 0 ? 'text-long' : 'text-short'
+          )}>
+            {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
+          </span>
+        </div>
+      </div>
+
+      {/* Table */}
+      <div className="flex-1 overflow-auto">
+        <table className="w-full text-left border-collapse table-fixed">
+          <thead>
+            <tr className="text-[9px] sm:text-[10px] text-text-muted uppercase tracking-widest border-b border-border bg-surface-light/10 sticky top-0">
+              <th className="px-2 sm:px-4 py-3 font-bold w-[22%]">Market</th>
+              <th className="px-2 py-3 font-bold text-center w-[12%]">Type</th>
+              <th className="px-2 py-3 font-bold text-center w-[15%]">Side</th>
+              <th className="px-2 py-3 font-bold text-right w-[13%]">Size</th>
+              <th className="px-2 py-3 font-bold text-right w-[13%]">Price</th>
+              <th className="px-2 py-3 font-bold text-right w-[15%]">P&L</th>
+              <th className="px-2 sm:px-4 py-3 font-bold text-right w-[10%]">Tx</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-border/50">
+            {transactions.map((tx, idx) => (
+              <TransactionRow key={`${tx.id}-${idx}`} transaction={tx} />
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function TransactionRow({ transaction }: { transaction: UserTransaction }) {
+  const isOpening = transaction.transactionType === 'open';
+  const isSettlement = transaction.type === 'settlement';
+  const pnl = transaction.pnl;
+  const hasPnl = pnl !== undefined && pnl !== null;
+  
+  // Format date
+  const timestamp = transaction.timestamp || 0;
+  const txDate = new Date(timestamp);
+  const formattedDate = timestamp > 0 
+    ? txDate.toLocaleDateString('en-US', { 
+        month: 'short', 
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      })
+    : '--';
+
+  // Solscan link
+  const solscanUrl = transaction.txSignature 
+    ? `https://solscan.io/tx/${transaction.txSignature}` 
+    : null;
+
+  // Type badge
+  const getTypeBadge = () => {
+    if (isSettlement) {
+      return (
+        <span className="px-2 py-0.5 rounded text-[9px] font-black uppercase bg-purple-500/20 text-purple-400">
+          SETTLED
+        </span>
+      );
+    }
+    if (isOpening) {
+      return (
+        <span className="px-2 py-0.5 rounded text-[9px] font-black uppercase bg-accent/20 text-accent">
+          OPEN
+        </span>
+      );
+    }
+    return (
+      <span className="px-2 py-0.5 rounded text-[9px] font-black uppercase bg-warning/20 text-warning">
+        CLOSE
+      </span>
+    );
+  };
+
+  // Side/Position display
+  const getSideBadge = () => {
+    if (isSettlement) {
+      const isWin = (pnl ?? 0) > 0;
+      return (
+        <div className="flex flex-col items-center gap-0.5">
+          <span className={cn(
+            'px-2 py-0.5 rounded text-[9px] font-black uppercase',
+            transaction.outcome === 'yes' ? 'bg-long/20 text-long' : 'bg-short/20 text-short'
+          )}>
+            {transaction.outcome === 'yes' ? 'YES' : 'NO'}
+          </span>
+          <span className={cn(
+            'text-[8px] font-bold',
+            isWin ? 'text-long' : 'text-short'
+          )}>
+            {isWin ? '→ $1.00' : '→ $0.00'}
+          </span>
+        </div>
+      );
+    }
+    
+    const isBuy = transaction.side === 'buy';
+    return (
+      <div className="flex flex-col items-center gap-0.5">
+        <span className={cn(
+          'px-2 py-0.5 rounded text-[9px] font-black uppercase',
+          isBuy ? 'bg-long/20 text-long' : 'bg-short/20 text-short'
+        )}>
+          {isBuy ? 'BUY' : 'SELL'}
+        </span>
+        <span className={cn(
+          'text-[8px] font-bold',
+          transaction.outcome === 'yes' ? 'text-long' : 'text-short'
+        )}>
+          {transaction.outcome === 'yes' ? 'YES' : 'NO'}
+        </span>
+      </div>
+    );
+  };
+
+  return (
+    <tr className="hover:bg-surface-light/30 transition-colors">
+      <td className="px-2 sm:px-4 py-3">
+        <div className="flex flex-col min-w-0">
+          <span className="font-bold text-xs sm:text-sm truncate">{transaction.market || '--'}</span>
+          <span className="text-[9px] text-text-muted">{formattedDate}</span>
+        </div>
+      </td>
+      <td className="px-2 py-3 text-center">
+        {getTypeBadge()}
+      </td>
+      <td className="px-2 py-3 text-center">
+        {getSideBadge()}
+      </td>
+      <td className="px-2 py-3 text-right">
+        <span className="font-mono text-xs sm:text-sm font-bold">
+          {transaction.size.toFixed(0)}
+        </span>
+      </td>
+      <td className="px-2 py-3 text-right">
+        <span className="font-mono text-xs sm:text-sm font-medium">
+          ${transaction.price.toFixed(2)}
+        </span>
+      </td>
+      <td className="px-2 py-3 text-right">
+        {hasPnl ? (
+          <span className={cn(
+            'font-mono text-xs sm:text-sm font-bold',
+            pnl >= 0 ? 'text-long' : 'text-short'
+          )}>
+            {pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}
+          </span>
+        ) : (
+          <span className="text-text-muted font-mono text-xs">--</span>
+        )}
+      </td>
+      <td className="px-2 sm:px-4 py-3 text-right">
+        {solscanUrl ? (
+          <a 
+            href={solscanUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="p-1.5 text-text-muted hover:text-accent hover:bg-accent/10 rounded-lg transition-all inline-flex"
+            title="View on Solscan"
+          >
+            <ExternalLink className="w-3.5 h-3.5" />
+          </a>
+        ) : (
+          <span className="text-text-muted text-[9px]">--</span>
+        )}
+      </td>
+    </tr>
+  );
 }

@@ -1,6 +1,7 @@
 import { Keypair, PublicKey } from '@solana/web3.js';
 import nacl from 'tweetnacl';
 import bs58 from 'bs58';
+import { randomUUID } from 'crypto';
 import { config } from '../config.js';
 import { mmLogger } from '../lib/logger.js';
 import { priceFeedService } from '../services/price-feed.service.js';
@@ -19,7 +20,7 @@ const ORDER_MESSAGE_PREFIX = 'DEGEN_ORDER_V1:';
  * Build binary order message for signing
  */
 function buildOrderMessage(
-  marketPubkey: PublicKey,
+  marketPubkey: any,
   side: 'BID' | 'ASK',
   outcome: 'YES' | 'NO',
   price: number,
@@ -90,7 +91,7 @@ interface MMConfig {
 // Load spread from env, default to 0.04 (4 cents)
 const MM_SPREAD = parseFloat(process.env.MM_SPREAD || '0.04');
 // Load assets from env, default to BTC only
-const MM_ASSETS = (process.env.MM_ASSETS || 'BTC').split(',').map(a => a.trim());
+const MM_ASSETS = (process.env.MM_ASSETS || 'BTC').split(',').map((a: string) => a.trim());
 
 const DEFAULT_CONFIG: MMConfig = {
   spread: MM_SPREAD,
@@ -237,7 +238,7 @@ class MarketMakerBot {
   private config: MMConfig;
   private running: boolean = false;
   private markets: Map<string, MarketState> = new Map();
-  private keypair: Keypair | null = null;
+  private keypair: any = null;
   private walletAddress: string | null = null;
   private userId: string | null = null;
   private updateInterval: NodeJS.Timeout | null = null;
@@ -381,11 +382,13 @@ class MarketMakerBot {
       
       // Get current price
       const priceData = await priceFeedService.getPrice(state.asset);
-      if (!priceData) continue;
+      // If the price feed is briefly unavailable (common on startup), still quote around strike.
+      // This ensures devnet market orders have liquidity immediately.
+      const effectivePrice = priceData?.price ?? state.strike;
       
       // Calculate fair value
       const fairValue = calculateFairValue(
-        priceData.price,
+        effectivePrice,
         state.strike,
         timeToExpiry / 1000
       );
@@ -397,7 +400,10 @@ class MarketMakerBot {
       
       // Update market prices in database
       try {
-        await marketService.updatePrices(marketId, fairValue, 1 - fairValue);
+        // When DB pressure is high (or MM order persistence is disabled), skip these frequent writes.
+        if (!config.disableMmOrderPersistence) {
+          await marketService.updatePrices(marketId, fairValue, 1 - fairValue);
+        }
       } catch {}
       
       // Update orders
@@ -495,21 +501,25 @@ class MarketMakerBot {
       
       const signature = bs58.encode(nacl.sign.detached(binaryMessage, this.keypair.secretKey));
       const binaryMessageBase64 = Buffer.from(binaryMessage).toString('base64');
-      
-      const order = await orderService.create({
-        clientOrderId,
-        marketId,
-        userId: this.userId,
-        side,
-        outcome,
-        orderType: 'LIMIT',
-        price: price.toString(),
-        size: size.toString(),
-        signature,
-        encodedInstruction: null, // MM orders don't have on-chain instructions
-        isMmOrder: true, // Mark as Market Maker order
-        expiresAt,
-      });
+
+      // Optional: skip persisting MM orders in Postgres to reduce DB write volume.
+      // We still publish them to the Redis orderbook and match normally.
+      const order = config.disableMmOrderPersistence
+        ? ({ id: randomUUID() } as any)
+        : await orderService.create({
+            clientOrderId,
+            marketId,
+            userId: this.userId,
+            side,
+            outcome,
+            orderType: 'LIMIT',
+            price: price.toString(),
+            size: size.toString(),
+            signature,
+            encodedInstruction: null, // MM orders don't have on-chain instructions
+            isMmOrder: true, // Mark as Market Maker order
+            expiresAt,
+          });
       
       const orderbookOrder = {
         id: order.id,
@@ -565,7 +575,25 @@ class MarketMakerBot {
     
     for (const orderId of state.orders.keys()) {
       try {
-        await orderService.cancel(orderId, 'MM_CANCEL');
+        // Always remove from Redis orderbook; DB row may not exist when persistence is disabled.
+        const o = state.orders.get(orderId);
+        if (o && this.userId) {
+          await orderbookService.removeOrder({
+            id: orderId,
+            marketId,
+            userId: this.userId,
+            side: o.side,
+            outcome: o.outcome,
+            price: o.price,
+            size: o.size,
+            remainingSize: o.size,
+            createdAt: Date.now(),
+          });
+        }
+
+        if (!config.disableMmOrderPersistence) {
+          await orderService.cancel(orderId, 'MM_CANCEL');
+        }
       } catch {}
     }
     

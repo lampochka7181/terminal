@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useRef } from 'react';
 import { WalletButton } from '@/components/WalletButton';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { usePriceStore } from '@/stores/priceStore';
@@ -8,12 +9,51 @@ import { TrendingUp, TrendingDown, Activity, Clock, Wallet } from 'lucide-react'
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useBalance } from '@/hooks/useUser';
+import { useAuth } from '@/hooks/useAuth';
+import { useAuthStore } from '@/stores/authStore';
 
 export function Header() {
   const { connected, publicKey } = useWallet();
   const { prices } = usePriceStore();
   const pathname = usePathname();
   const { balance } = useBalance();
+  const { isAuthenticated, isAuthenticating, signIn, signOut } = useAuth();
+  const authedWalletAddress = useAuthStore((s) => s.walletAddress);
+
+  const lastAttemptRef = useRef<{ wallet: string | null; at: number }>({ wallet: null, at: 0 });
+
+  // Ensure SIWS runs from any page:
+  // - When wallet connects and we're not authenticated -> prompt sign message
+  // - When wallet changes while authenticated -> sign out and prompt sign-in for the new wallet
+  useEffect(() => {
+    const wallet = publicKey?.toBase58() ?? null;
+    if (!connected || !wallet) return;
+
+    // Throttle repeated attempts (hot reload, reconnect storms)
+    const now = Date.now();
+    if (lastAttemptRef.current.wallet === wallet && now - lastAttemptRef.current.at < 20_000) {
+      return;
+    }
+
+    const walletMismatch = Boolean(authedWalletAddress && authedWalletAddress !== wallet);
+
+    // If authenticated for a different wallet, clear session first.
+    if (walletMismatch && isAuthenticated && !isAuthenticating) {
+      lastAttemptRef.current = { wallet, at: now };
+      signOut().catch(() => {});
+      // Then prompt sign-in for the new wallet (small delay to let state settle)
+      setTimeout(() => {
+        signIn().catch(() => {});
+      }, 150);
+      return;
+    }
+
+    // If not authenticated, always prompt sign-in from any page.
+    if (!isAuthenticated && !isAuthenticating) {
+      lastAttemptRef.current = { wallet, at: now };
+      signIn().catch(() => {});
+    }
+  }, [connected, publicKey, authedWalletAddress, isAuthenticated, isAuthenticating, signIn, signOut]);
 
   return (
     <header className="border-b border-border bg-surface px-4 py-3">
@@ -79,11 +119,17 @@ function PriceTicker({ symbol, price }: { symbol: string; price?: number }) {
     return p.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   };
 
+  // Market URL for this asset
+  const marketUrl = `/market/${symbol.toLowerCase()}`;
+
   return (
-    <div className="flex items-center gap-3 px-3 py-1.5 bg-surface-light rounded-lg">
+    <Link 
+      href={marketUrl}
+      className="flex items-center gap-3 px-3 py-1.5 bg-surface-light rounded-lg hover:bg-surface-light/80 hover:border-accent/30 border border-transparent transition-all cursor-pointer group"
+    >
       <div className="flex flex-col">
-        <span className="text-text-muted text-xs">{symbol}/USD</span>
-        <span className="font-mono text-text-primary font-medium" suppressHydrationWarning>
+        <span className="text-text-muted text-xs group-hover:text-accent transition-colors">{symbol}/USD</span>
+        <span className="font-mono text-text-primary font-medium group-hover:text-accent transition-colors" suppressHydrationWarning>
           ${price ? formatPrice(price) : '---'}
         </span>
       </div>
@@ -98,6 +144,6 @@ function PriceTicker({ symbol, price }: { symbol: string; price?: number }) {
         )}
         <span>{isPositive ? '+' : ''}{change24h.toFixed(2)}%</span>
       </div>
-    </div>
+    </Link>
   );
 }

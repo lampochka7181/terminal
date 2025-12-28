@@ -633,10 +633,12 @@ export class AnchorClient {
         errorMsg.includes('already in use') || 
         errorMsg.includes('0x0') ||
         errorMsg.includes('AccountNotInitialized') ||
-        errorMsg.includes('0xbc4');
+        errorMsg.includes('0xbc4') ||
+        errorMsg.includes('MarketNotPending') ||
+        errorMsg.includes('0x1774'); // MarketNotPending error code (6004)
 
       if (isCommonError) {
-        logger.debug(`[${contextLabel}] failed (Expected/Drift): ${errorMsg}\nLogs: ${logsStr}`);
+        logger.debug(`[${contextLabel}] skipped (expected): ${errorMsg.slice(0, 100)}...`);
       } else {
         logger.error(`[${contextLabel}] FAILED: ${errorMsg}\nLogs: ${logsStr}`);
       }
@@ -776,7 +778,8 @@ export class AnchorClient {
     const data = Buffer.concat([discriminator, argsBuffer]);
 
     logger.info(`execute_close: market=${market.toBase58()}`);
-    logger.info(`execute_close: buyer=${params.buyerWallet.toBase58()}, seller=${params.sellerWallet.toBase58()}`);
+    logger.info(`execute_close: buyer=${params.buyerWallet.toBase58()}, buyerPosition=${buyerPosition.toBase58()}`);
+    logger.info(`execute_close: seller=${params.sellerWallet.toBase58()}, sellerPosition=${sellerPosition.toBase58()}`);
     logger.info(`execute_close: outcome=${params.outcome}, price=${params.price}, size=${params.size}`);
 
     return new TransactionInstruction({
@@ -1030,6 +1033,8 @@ export class AnchorClient {
 
   /**
    * Initialize a market on-chain
+   * If strikePrice = 0, market is created with PENDING status
+   * If strikePrice > 0, market is created with OPEN status
    */
   async initializeMarket(params: {
     asset: string;
@@ -1039,9 +1044,62 @@ export class AnchorClient {
   }): Promise<string> {
     const market = getMarketPda(params.asset, params.timeframe, params.expiryTs);
     const instruction = await this.buildInitializeMarketInstruction(params);
-    const signature = await this.submitTransaction([instruction], [], `Init Market ${params.asset}-${params.timeframe} (${market.toBase58().slice(0, 8)})`);
+    const status = params.strikePrice > 0 ? 'OPEN' : 'PENDING';
+    const signature = await this.submitTransaction([instruction], [], `Init Market ${params.asset}-${params.timeframe} (${status}) (${market.toBase58().slice(0, 8)})`);
     
-    logger.info(`Market initialized on-chain: ${market.toBase58()} (tx: ${signature})`);
+    logger.info(`Market initialized on-chain: ${market.toBase58()} (status=${status}, tx: ${signature})`);
+    
+    return signature;
+  }
+
+  /**
+   * Build activate_market instruction
+   * Sets the strike price and changes status from PENDING to OPEN
+   */
+  async buildActivateMarketInstruction(params: {
+    marketPubkey: string;
+    strikePrice: number;  // Strike price in dollars (e.g., 95432.50)
+  }): Promise<TransactionInstruction> {
+    if (!this.relayerKeypair) {
+      throw new Error('Relayer not initialized');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const discriminator = computeDiscriminator('activate_market');
+    
+    // Strike price with 8 decimals (matching on-chain format)
+    const strikePriceU64 = BigInt(Math.floor(params.strikePrice * 100_000_000));
+    const strikePriceBuffer = Buffer.alloc(8);
+    strikePriceBuffer.writeBigUInt64LE(strikePriceU64, 0);
+
+    const data = Buffer.concat([discriminator, strikePriceBuffer]);
+
+    return new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: market, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
+      ],
+      data,
+    });
+  }
+
+  /**
+   * Activate a pending market on-chain
+   * Sets the strike price and changes status from PENDING to OPEN
+   */
+  async activateMarket(params: {
+    marketPubkey: string;
+    strikePrice: number;  // Strike price in dollars (e.g., 95432.50)
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
+    }
+
+    const instruction = await this.buildActivateMarketInstruction(params);
+    const signature = await this.submitTransaction([instruction], [], `Activate Market ${params.marketPubkey.slice(0, 8)} (strike=${params.strikePrice})`);
+    
+    logger.info(`Market activated on-chain: ${params.marketPubkey} (strike=${params.strikePrice}, tx: ${signature})`);
     
     return signature;
   }

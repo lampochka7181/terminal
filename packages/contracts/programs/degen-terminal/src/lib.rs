@@ -66,10 +66,13 @@ pub mod degen_terminal {
 
     /// Create a new binary outcome market
     /// 
+    /// If strike_price = 0, market is created with PENDING status.
+    /// If strike_price > 0, market is created with OPEN status (direct activation).
+    /// 
     /// # Arguments
     /// * `asset` - Asset symbol (BTC, ETH, SOL)
-    /// * `timeframe` - Market timeframe (5m, 15m, 1h, 4h)
-    /// * `strike_price` - Strike price with 8 decimals
+    /// * `timeframe` - Market timeframe (5m, 15m, 1h, 4h, 24h)
+    /// * `strike_price` - Strike price with 8 decimals (0 for pending markets)
     /// * `expiry_ts` - Unix timestamp when market expires
     pub fn initialize_market(
         ctx: Context<InitializeMarket>,
@@ -79,6 +82,20 @@ pub mod degen_terminal {
         expiry_ts: i64,
     ) -> Result<()> {
         instructions::initialize_market(ctx, asset, timeframe, strike_price, expiry_ts)
+    }
+
+    /// Activate a pending market by setting the strike price
+    /// 
+    /// Called when a market's trading window starts. Sets the real strike price
+    /// from the current WebSocket feed and changes status from Pending to Open.
+    /// 
+    /// # Arguments
+    /// * `strike_price` - The actual strike price (from live price feed)
+    pub fn activate_market(
+        ctx: Context<ActivateMarket>,
+        strike_price: u64,
+    ) -> Result<()> {
+        instructions::activate_market(ctx, strike_price)
     }
 
     /// Resolve a market with outcome from relayer

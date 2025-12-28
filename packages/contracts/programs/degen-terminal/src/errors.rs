@@ -22,6 +22,9 @@ pub enum DegenError {
     #[msg("Market is not open for trading")]
     MarketNotOpen,
     
+    #[msg("Market is not pending (cannot activate)")]
+    MarketNotPending,
+    
     #[msg("Market is closing soon (within 30 seconds)")]
     MarketClosing,
     

@@ -60,7 +60,7 @@ pub fn initialize_market(
     // Validate inputs
     require!(asset.len() <= MAX_ASSET_LEN, DegenError::InvalidAsset);
     require!(timeframe.len() <= MAX_TIMEFRAME_LEN, DegenError::InvalidTimeframe);
-    require!(strike_price > 0, DegenError::InvalidMarketParams);
+    // strike_price = 0 is allowed for PENDING markets (will be set at activation)
     require!(expiry_ts > clock.unix_timestamp + 60, DegenError::InvalidExpiry); // At least 1 minute in future
     
     // Validate asset is supported (BTC, ETH, SOL)
@@ -68,7 +68,7 @@ pub fn initialize_market(
     require!(valid_assets.contains(&asset.as_str()), DegenError::InvalidAsset);
     
     // Validate timeframe
-    let valid_timeframes = ["5m", "15m", "1h", "4h"];
+    let valid_timeframes = ["5m", "15m", "1h", "4h", "24h"];
     require!(valid_timeframes.contains(&timeframe.as_str()), DegenError::InvalidTimeframe);
     
     // Update global state
@@ -77,6 +77,8 @@ pub fn initialize_market(
     let market_id = global_state.total_markets;
     
     // Initialize market
+    // If strike_price = 0, market is created as PENDING and will be activated later
+    // If strike_price > 0, market is created as OPEN (direct activation)
     let market = &mut ctx.accounts.market;
     market.id = market_id;
     market.authority = ctx.accounts.authority.key();
@@ -88,7 +90,7 @@ pub fn initialize_market(
     market.expiry_at = expiry_ts;
     market.resolved_at = 0;
     market.settled_at = 0;
-    market.status = MarketStatus::Open;
+    market.status = if strike_price > 0 { MarketStatus::Open } else { MarketStatus::Pending };
     market.outcome = MarketOutcome::Pending;
     market.total_volume = 0;
     market.total_trades = 0;
@@ -98,8 +100,8 @@ pub fn initialize_market(
     market.bump = ctx.bumps.market;
     
     msg!(
-        "Market #{} initialized: {} {} strike={} expiry={}", 
-        market_id, asset, timeframe, strike_price, expiry_ts
+        "Market #{} initialized: {} {} strike={} expiry={} status={:?}", 
+        market_id, asset, timeframe, strike_price, expiry_ts, market.status
     );
     
     Ok(())

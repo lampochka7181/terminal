@@ -280,6 +280,22 @@ async function settleMarketFast(
       positionsSettled: settlementBatch.length,
       totalPayout,
     });
+
+    // Immediately recover on-chain market/vault rent after settlement (no 5m delay).
+    // This is safe because `settle_positions` should have paid out all positions and
+    // the program's `close_market` sweeps any leftover dust before closing the vault.
+    //
+    // We keep the Market Closer job as a fallback in case this fails (RPC issues, etc.).
+    if (anchorClient.isReady() && !market.pubkey.startsWith('arc-')) {
+      try {
+        const sig = await anchorClient.closeMarket({ marketPubkey: market.pubkey });
+        logger.info(`🧹 Market rent recovered immediately after settlement: ${sig}`);
+        await marketService.markArchived(market.id);
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        logger.warn(`Market ${market.id} close_market failed post-settlement (will retry via Market Closer): ${msg}`);
+      }
+    }
   }
 }
 

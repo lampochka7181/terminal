@@ -147,6 +147,25 @@ export class MatchingService {
   }
 
   /**
+   * When MM order persistence is disabled, MM orders do not exist in Postgres.
+   * Any foreign keys to `orders.id` must therefore be NULL for the MM side.
+   */
+  private tradeOrderIdForDb(userId: string, orderId: string): string | null {
+    if (config.disableMmOrderPersistence && this.isMarketMaker(userId)) {
+      return null;
+    }
+    return orderId;
+  }
+
+  private toWsSide(side: string): 'bid' | 'ask' {
+    return String(side).toUpperCase() === 'BID' ? 'bid' : 'ask';
+  }
+
+  private toWsOutcome(outcome: string): 'yes' | 'no' {
+    return String(outcome).toUpperCase() === 'YES' ? 'yes' : 'no';
+  }
+
+  /**
    * Aggregate multiple fills for the same taker order against the Market Maker.
    * This reduces on-chain gas costs by settling multiple logical fills as one physical match.
    */
@@ -397,7 +416,51 @@ export class MatchingService {
         : await orderbookService.getBestBid(order.marketId, order.outcome);
       
       if (!bestOrder) {
-        logger.debug('Walk-the-book: No more opposing orders');
+        // Devnet/testing: force-fill against MM if the book is empty so market orders always fill.
+        if (config.devAlwaysFillMarketOrders) {
+          const mmUserId = mmBot.getStatus().userId;
+          if (!mmUserId) {
+            logger.warn('DEV_ALWAYS_FILL_MARKET_ORDERS enabled but MM user is not initialized');
+            break;
+          }
+
+          // Use current market prices as a sane fill price (defaults to 0.50).
+          const market = await marketService.getById(order.marketId);
+          const yesPx = market?.yesPrice ? parseFloat(market.yesPrice) : 0.5;
+          const noPx = market?.noPrice ? parseFloat(market.noPrice) : 0.5;
+          const basePrice = order.outcome === 'YES' ? yesPx : noPx;
+          const price = Math.min(0.99, Math.max(0.01, basePrice || 0.5));
+
+          const fillSize = remainingDollars / price;
+          const fillCost = fillSize * price;
+          const makerFee = (fillCost * MAKER_FEE_BPS) / 10000;
+          const takerFee = (fillCost * TAKER_FEE_BPS) / 10000;
+
+          const fill: Fill = {
+            makerOrderId: `mm_synth_${Date.now()}`,
+            takerOrderId: 'pending',
+            makerUserId: mmUserId,
+            takerUserId: order.userId,
+            price,
+            size: fillSize,
+            outcome: order.outcome,
+            makerFee,
+            takerFee,
+            makerSide: matchSide, // maker provides the opposing side
+            takerSide: order.side,
+            makerClientOrderId: Date.now(),
+            takerClientOrderId: order.clientOrderId || Date.now(),
+          };
+
+          fills.push(fill);
+          totalContracts += fillSize;
+          totalSpent += fillCost;
+          remainingDollars -= fillCost;
+
+          logger.info(
+            `DEV fill: synthetic MM liquidity ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for ${order.side} ${order.outcome}`
+          );
+        }
         break;
       }
       
@@ -407,10 +470,12 @@ export class MatchingService {
         : bestOrder.price < order.maxPrice;
       
       if (exceedsMaxPrice) {
-        logger.debug(
-          `Walk-the-book: Price ${bestOrder.price} exceeds max ${order.maxPrice}`
-        );
-        break;
+        if (!config.devAlwaysFillMarketOrders) {
+          logger.debug(
+            `Walk-the-book: Price ${bestOrder.price} exceeds max ${order.maxPrice}`
+          );
+          break;
+        }
       }
       
       // Self-trade prevention
@@ -572,12 +637,94 @@ export class MatchingService {
       const bestBid = await orderbookService.getBestBid(order.marketId, order.outcome);
       
       if (!bestBid) {
-        logger.debug('Sell order: No more bids');
+        // Devnet/testing: force-fill sell orders against MM if the book is empty
+        if (config.devAlwaysFillMarketOrders) {
+          const mmUserId = mmBot.getStatus().userId;
+          if (!mmUserId) {
+            logger.warn('DEV_ALWAYS_FILL_MARKET_ORDERS enabled but MM user is not initialized');
+            break;
+          }
+
+          // Use current market prices as a sane fill price (defaults to 0.50)
+          const market = await marketService.getById(order.marketId);
+          const yesPx = market?.yesPrice ? parseFloat(market.yesPrice) : 0.5;
+          const noPx = market?.noPrice ? parseFloat(market.noPrice) : 0.5;
+          const basePrice = order.outcome === 'YES' ? yesPx : noPx;
+          // For sells, use the market price but ensure it meets min price
+          const price = Math.max(order.minPrice, Math.min(0.99, Math.max(0.01, basePrice || 0.5)));
+
+          const fillSize = remainingSize;
+          const fillProceeds = fillSize * price;
+          const makerFee = (fillProceeds * MAKER_FEE_BPS) / 10000;
+          const takerFee = (fillProceeds * TAKER_FEE_BPS) / 10000;
+
+          const fill: Fill = {
+            makerOrderId: `mm_synth_${Date.now()}`,
+            takerOrderId: 'pending',
+            makerUserId: mmUserId,
+            takerUserId: order.userId,
+            price,
+            size: fillSize,
+            outcome: order.outcome,
+            makerFee,
+            takerFee,
+            makerSide: 'BID',   // MM is buying
+            takerSide: 'ASK',   // User is selling
+            makerClientOrderId: Date.now(),
+            takerClientOrderId: order.clientOrderId || Date.now(),
+          };
+
+          fills.push(fill);
+          totalProceeds += fillProceeds;
+          remainingSize = 0;
+
+          logger.info(
+            `DEV fill: synthetic MM bid ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for SELL ${order.outcome}`
+          );
+        } else {
+          logger.debug('Sell order: No more bids');
+        }
         break;
       }
       
       // Check price floor (seller won't accept below minPrice)
       if (bestBid.price < order.minPrice) {
+        // Devnet/testing: still fill at the user's min price if MM is available
+        if (config.devAlwaysFillMarketOrders) {
+          const mmUserId = mmBot.getStatus().userId;
+          if (mmUserId) {
+            const fillSize = remainingSize;
+            const price = order.minPrice;
+            const fillProceeds = fillSize * price;
+            const makerFee = (fillProceeds * MAKER_FEE_BPS) / 10000;
+            const takerFee = (fillProceeds * TAKER_FEE_BPS) / 10000;
+
+            const fill: Fill = {
+              makerOrderId: `mm_synth_${Date.now()}`,
+              takerOrderId: 'pending',
+              makerUserId: mmUserId,
+              takerUserId: order.userId,
+              price,
+              size: fillSize,
+              outcome: order.outcome,
+              makerFee,
+              takerFee,
+              makerSide: 'BID',
+              takerSide: 'ASK',
+              makerClientOrderId: Date.now(),
+              takerClientOrderId: order.clientOrderId || Date.now(),
+            };
+
+            fills.push(fill);
+            totalProceeds += fillProceeds;
+            remainingSize = 0;
+
+            logger.info(
+              `DEV fill: synthetic MM bid at min price ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for SELL ${order.outcome}`
+            );
+            break;
+          }
+        }
         logger.debug(`Sell order: Bid ${bestBid.price} below min ${order.minPrice}`);
         break;
       }
@@ -714,7 +861,10 @@ export class MatchingService {
     }
     
     // 4. EXECUTE ON-CHAIN ASYNCHRONOUSLY
-    this.executeFillsOnChain(result.fills, order.marketId)
+    // IMPORTANT: Pass isClosingTrade=true because sell orders are ALWAYS closing trades
+    // (user is selling their existing holdings). We must pass this explicitly because
+    // by this point the DB position has already been updated/deducted.
+    this.executeFillsOnChain(result.fills, order.marketId, true)
       .catch(err => logger.error(`Background on-chain execution failed: ${err.message}`));
     
     return { ...result, orderId: takerOrder.id };
@@ -838,6 +988,7 @@ export class MatchingService {
 
     // Get market data first (needed for on-chain execution)
     const market = await marketService.getById(order.marketId);
+    const marketAddress = market?.pubkey || '';
 
     // IMPORTANT: Check if this is a closing trade BEFORE updating positions!
     // For sell orders (ASK), check seller's shares before we reduce them
@@ -856,8 +1007,8 @@ export class MatchingService {
     // 1. Insert trade record
     const [trade] = await db.insert(trades).values({
       marketId: order.marketId,
-      makerOrderId: fill.makerOrderId,
-      takerOrderId: fill.takerOrderId,
+      makerOrderId: this.tradeOrderIdForDb(fill.makerUserId, fill.makerOrderId),
+      takerOrderId: this.tradeOrderIdForDb(fill.takerUserId, fill.takerOrderId),
       makerUserId: fill.makerUserId,
       takerUserId: fill.takerUserId,
       takerSide: takerSide,
@@ -877,7 +1028,10 @@ export class MatchingService {
     }).returning();
 
     // 2. Update maker order
-    await orderService.updateAfterFill(fill.makerOrderId, fill.size);
+    const makerOrderIsSynthetic = String(fill.makerOrderId || '').startsWith('mm_synth_');
+    if (!makerOrderIsSynthetic && !(config.disableMmOrderPersistence && this.isMarketMaker(fill.makerUserId))) {
+      await orderService.updateAfterFill(fill.makerOrderId, fill.size);
+    }
 
     // 3. Update taker position
     const isTakerBuy = takerSide === 'BID';
@@ -909,7 +1063,49 @@ export class MatchingService {
     await marketService.incrementStats(order.marketId, takerNotional + makerNotional);
     await marketService.updatePrices(order.marketId, fill.price, 1 - fill.price);
 
-    // 7. Get wallets for on-chain
+    // 7. Broadcast trade + user fills ALWAYS (even if on-chain execution is skipped/fails).
+    // This is needed for realtime UX (and chart animations) in simulation mode or transient wallet lookup issues.
+    // Best-effort: include taker wallet on the public trade stream so UI can display a wallet prefix.
+    let takerWalletForWs: string | undefined = undefined;
+    try {
+      takerWalletForWs = await this.getWalletForUser(fill.takerUserId);
+    } catch {}
+    if (marketAddress) {
+      broadcastTrade(marketAddress, {
+        price: fill.price,
+        size: fill.size,
+        side: fill.takerSide === 'BID' ? 'buy' : 'sell',
+        outcome: String(fill.outcome).toLowerCase(),
+        timestamp: Date.now(),
+        takerWallet: takerWalletForWs,
+      });
+    }
+
+    broadcastUserFill(fill.takerUserId, {
+      orderId: fill.takerOrderId,
+      marketAddress,
+      side: this.toWsSide(fill.takerSide),
+      outcome: this.toWsOutcome(fill.outcome),
+      price: fill.price,
+      filledSize: fill.size,
+      remainingSize: 0,
+      status: 'filled',
+      timestamp: Date.now(),
+    });
+
+    broadcastUserFill(fill.makerUserId, {
+      orderId: fill.makerOrderId,
+      marketAddress,
+      side: this.toWsSide(fill.makerSide),
+      outcome: this.toWsOutcome(fill.outcome),
+      price: fill.price,
+      filledSize: fill.size,
+      remainingSize: 0,
+      status: 'filled',
+      timestamp: Date.now(),
+    });
+
+    // 8. Get wallets for on-chain (best-effort; doesn't gate broadcasts)
     const makerWallet = await this.getWalletForUser(fill.makerUserId);
     const takerWallet = await this.getWalletForUser(fill.takerUserId);
 
@@ -981,37 +1177,6 @@ export class MatchingService {
         }).catch(err => logger.error(`On-chain match failed: ${err.message}`));
       }
 
-      // Broadcast trade and fills (sync, fast)
-      broadcastTrade(market.pubkey, {
-        price: fill.price,
-        size: fill.size,
-        side: fill.takerSide,
-        outcome: fill.outcome,
-        timestamp: Date.now(),
-      });
-
-      broadcastUserFill(fill.takerUserId, {
-        tradeId: trade.id,
-        orderId: fill.takerOrderId,
-        marketId: order.marketId,
-        side: fill.takerSide,
-        outcome: fill.outcome,
-        price: fill.price,
-        size: fill.size,
-        fee: fill.takerFee,
-      });
-
-      broadcastUserFill(fill.makerUserId, {
-        tradeId: trade.id,
-        orderId: fill.makerOrderId,
-        marketId: order.marketId,
-        side: fill.makerSide,
-        outcome: fill.outcome,
-        price: fill.price,
-        size: fill.size,
-        fee: fill.makerFee,
-      });
-
       // Log trade
       logEvents.tradeExecuted({
         tradeId: trade.id,
@@ -1036,8 +1201,10 @@ export class MatchingService {
   /**
    * Aggregate and execute all fills for a taker order on-chain.
    * This is the primary entry point for efficient on-chain settlement.
+   * 
+   * @param isClosingTrade - If true, force use of execute_close instruction (user selling existing holdings)
    */
-  private async executeFillsOnChain(fills: Fill[], marketId: string): Promise<void> {
+  private async executeFillsOnChain(fills: Fill[], marketId: string, isClosingTrade: boolean = false): Promise<void> {
     const market = await marketService.getById(marketId);
     if (!market) return;
 
@@ -1057,7 +1224,7 @@ export class MatchingService {
           continue;
         }
 
-        await this.executeMatchOrCloseOnChain(fill, marketPubkey, makerWallet, takerWallet);
+        await this.executeMatchOrCloseOnChain(fill, marketId, marketPubkey, makerWallet, takerWallet, isClosingTrade);
       } catch (err: any) {
         logger.error(`Failed to execute fill on-chain: ${err.message}`);
       }
@@ -1066,19 +1233,49 @@ export class MatchingService {
 
   /**
    * Helper to execute either a match or a close on-chain based on trade type.
+   * 
+   * @param forceClose - If true, skip position check and use execute_close directly
+   *                     (used for processSellOrder where position is already updated in DB)
    */
   private async executeMatchOrCloseOnChain(
     fill: Fill,
+    marketId: string,
     marketPubkey: string,
     makerWallet: string,
-    takerWallet: string
+    takerWallet: string,
+    forceClose: boolean = false
   ): Promise<void> {
     // Detect if this is a closing trade (taker is selling existing shares)
     const isClosingTrade = fill.takerSide === 'ASK';
     
-    if (isClosingTrade) {
-      // Check if seller has existing shares
-      const sellerPosition = await positionService.getPosition(fill.takerUserId, marketPubkey);
+    // For sell orders (forceClose=true), ALWAYS use execute_close
+    // This transfers USDC from buyer to seller, not the other way around!
+    if (forceClose && isClosingTrade) {
+      logger.info(`Executing CLOSE (sell) on-chain: seller=${takerWallet.slice(0,8)}, buyer=${makerWallet.slice(0,8)}, ${fill.size} @ ${fill.price}`);
+      const closeParams: CloseParams = {
+        marketPubkey: marketPubkey,
+        buyerWallet: makerWallet,  // Maker is buying (MM)
+        sellerWallet: takerWallet, // Taker is selling (user)
+        outcome: fill.outcome,
+        price: fill.price,
+        matchSize: fill.size,
+      };
+      
+      transactionService.executeClose(closeParams).then(result => {
+        if (!result.success) {
+          logger.warn(`On-chain close failed: ${result.error}`);
+        } else {
+          logger.info(`On-chain close success: ${result.signature}`);
+        }
+      }).catch(err => {
+        logger.error(`Failed to execute on-chain close: ${err.message}`);
+      });
+      return;
+    }
+    
+    if (isClosingTrade && !forceClose) {
+      // Check if seller has existing shares (use marketId for DB lookup, not marketPubkey)
+      const sellerPosition = await positionService.getPosition(fill.takerUserId, marketId);
       const sellerShares = fill.outcome === 'YES'
         ? parseFloat(sellerPosition?.yesShares || '0')
         : parseFloat(sellerPosition?.noShares || '0');
@@ -1309,8 +1506,8 @@ export class MatchingService {
       .insert(trades)
       .values({
         marketId,
-        makerOrderId: fill.makerOrderId,
-        takerOrderId: fill.takerOrderId,
+        makerOrderId: this.tradeOrderIdForDb(fill.makerUserId, fill.makerOrderId),
+        takerOrderId: this.tradeOrderIdForDb(fill.takerUserId, fill.takerOrderId),
         makerUserId: fill.makerUserId,
         takerUserId: fill.takerUserId,
         // Taker's perspective
@@ -1335,8 +1532,12 @@ export class MatchingService {
       .returning();
     
     // Update order records in database
-    await orderService.updateAfterFill(fill.makerOrderId, fill.size);
-    await orderService.updateAfterFill(fill.takerOrderId, fill.size);
+    if (!(config.disableMmOrderPersistence && this.isMarketMaker(fill.makerUserId))) {
+      await orderService.updateAfterFill(fill.makerOrderId, fill.size);
+    }
+    if (!(config.disableMmOrderPersistence && this.isMarketMaker(fill.takerUserId))) {
+      await orderService.updateAfterFill(fill.takerOrderId, fill.size);
+    }
     
     // Update positions (off-chain tracking)
     // For OPENING trades: Both parties acquire shares (taker gets takerOutcome, maker gets opposite)
@@ -1471,27 +1672,29 @@ export class MatchingService {
     
     if (makerOrder) {
       broadcastUserFill(fill.makerUserId, {
-        tradeId: trade.id,
         orderId: fill.makerOrderId,
-        marketId: market?.id || '',
-        side: makerOrder.side || '',
-        outcome: fill.outcome,
+        marketAddress: market?.pubkey || '',
+        side: this.toWsSide(makerOrder.side || ''),
+        outcome: this.toWsOutcome(fill.outcome),
         price: fill.price,
-        size: fill.size,
-        fee: fill.makerFee,
+        filledSize: fill.size,
+        remainingSize: 0,
+        status: 'filled',
+        timestamp: Date.now(),
       });
     }
     
     if (takerOrder) {
       broadcastUserFill(fill.takerUserId, {
-        tradeId: trade.id,
         orderId: fill.takerOrderId,
-        marketId: market?.id || '',
-        side: takerOrder.side || '',
-        outcome: fill.outcome,
+        marketAddress: market?.pubkey || '',
+        side: this.toWsSide(takerOrder.side || ''),
+        outcome: this.toWsOutcome(fill.outcome),
         price: fill.price,
-        size: fill.size,
-        fee: fill.takerFee,
+        filledSize: fill.size,
+        remainingSize: 0,
+        status: 'filled',
+        timestamp: Date.now(),
       });
     }
     

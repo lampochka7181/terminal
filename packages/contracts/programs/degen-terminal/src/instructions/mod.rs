@@ -1,5 +1,6 @@
 pub mod initialize_global;
 pub mod initialize_market;
+pub mod activate_market;
 pub mod place_order;
 pub mod cancel_order;
 pub mod cancel_order_by_relayer;
@@ -13,6 +14,7 @@ pub mod update_config;
 
 pub use initialize_global::*;
 pub use initialize_market::*;
+pub use activate_market::*;
 pub use place_order::*;
 pub use cancel_order::*;
 pub use cancel_order_by_relayer::*;

@@ -102,6 +102,26 @@ export interface Settlement {
   txSignature: string;
 }
 
+// Unified transaction type for history view
+export interface UserTransaction {
+  id: string;
+  type: 'trade' | 'settlement';
+  transactionType: 'open' | 'close';
+  marketAddress: string;
+  market: string;
+  asset: string;
+  expiryAt: number;
+  outcome: string;
+  side: 'buy' | 'sell' | 'settlement';
+  price: number;
+  size: number;
+  notional: number;
+  fee: number;
+  pnl?: number;
+  txSignature: string;
+  timestamp: number;
+}
+
 export interface AuthNonceResponse {
   nonce: string;
 }
@@ -305,6 +325,26 @@ export async function getPrices(): Promise<PriceFeed> {
   return apiFetch<PriceFeed>('/markets/prices');
 }
 
+export interface Candle {
+  time: number; // unix seconds
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+}
+
+export async function getCandles(params: {
+  asset: Asset;
+  intervalSec?: number;
+  lookbackSec?: number;
+}): Promise<{ asset: Asset; intervalSec: number; candles: Candle[] }> {
+  const searchParams = new URLSearchParams();
+  searchParams.set('asset', params.asset);
+  if (params.intervalSec != null) searchParams.set('intervalSec', String(params.intervalSec));
+  if (params.lookbackSec != null) searchParams.set('lookbackSec', String(params.lookbackSec));
+  return apiFetch<{ asset: Asset; intervalSec: number; candles: Candle[] }>(`/markets/candles?${searchParams.toString()}`);
+}
+
 export async function getStats(): Promise<PlatformStats> {
   return apiFetch<PlatformStats>('/markets/stats');
 }
@@ -463,9 +503,9 @@ export interface GetUserTradesParams {
   to?: number;
 }
 
-export async function getUserTrades(
+export async function getUserTransactions(
   params?: GetUserTradesParams
-): Promise<{ trades: Trade[]; total: number; limit: number; offset: number }> {
+): Promise<{ transactions: UserTransaction[]; total: number; limit: number; offset: number; hasMore: boolean }> {
   const searchParams = new URLSearchParams();
   if (params?.limit) searchParams.set('limit', params.limit.toString());
   if (params?.offset) searchParams.set('offset', params.offset.toString());
@@ -474,10 +514,11 @@ export async function getUserTrades(
 
   const query = searchParams.toString();
   return apiFetch<{
-    trades: Trade[];
+    transactions: UserTransaction[];
     total: number;
     limit: number;
     offset: number;
+    hasMore: boolean;
   }>(`/user/trades${query ? `?${query}` : ''}`);
 }
 
@@ -533,6 +574,7 @@ export const api = {
   getOrderbook,
   getMarketTrades,
   getPrices,
+  getCandles,
   getStats,
   getFees,
   // Trading
@@ -546,7 +588,7 @@ export const api = {
   getUserPositions,
   getUserPositionForMarket,
   getUserOrders,
-  getUserTrades,
+  getUserTransactions,
   getUserSettlements,
 };
 

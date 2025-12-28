@@ -3,7 +3,7 @@ import { db, markets, trades, type Market, type NewMarket } from '../db/index.js
 import { logger } from '../lib/logger.js';
 import { redis, RedisKeys } from '../db/redis.js';
 
-export type MarketStatus = 'OPEN' | 'CLOSED' | 'RESOLVED' | 'SETTLED';
+export type MarketStatus = 'PENDING' | 'OPEN' | 'CLOSED' | 'RESOLVED' | 'SETTLED';
 export type Asset = 'BTC' | 'ETH' | 'SOL';
 export type Timeframe = '5m' | '15m' | '1h' | '4h';
 
@@ -253,6 +253,60 @@ export class MarketService {
       .where(eq(markets.id, id));
     
     await this.clearMarketsCache();
+  }
+
+  /**
+   * Get markets that need activation (strikePrice = '0' means pending)
+   * A market's start time is calculated as: expiryAt - duration (based on timeframe)
+   * 
+   * NOTE: We use strikePrice = '0' to indicate pending instead of a PENDING status
+   * to avoid PostgreSQL enum caching issues with Supabase connection pooler.
+   */
+  async getPendingMarketsToActivate(): Promise<Market[]> {
+    const now = new Date();
+    
+    // Markets with strikePrice = '0' are pending activation
+    const result = await db
+      .select()
+      .from(markets)
+      .where(
+        and(
+          eq(markets.status, 'OPEN'),
+          eq(markets.strikePrice, '0')
+        )
+      );
+    
+    // Filter to markets whose start time has arrived
+    // Start time = expiry - duration (e.g., for 5m market expiring at 12:05, start is 12:00)
+    const timeframeDurations: Record<string, number> = {
+      '5m': 5 * 60 * 1000,
+      '15m': 15 * 60 * 1000,
+      '1h': 60 * 60 * 1000,
+      '4h': 4 * 60 * 60 * 1000,
+      '24h': 24 * 60 * 60 * 1000,
+    };
+    
+    return result.filter(m => {
+      const duration = timeframeDurations[m.timeframe] || 5 * 60 * 1000;
+      const startTime = new Date(m.expiryAt.getTime() - duration);
+      return startTime <= now;
+    });
+  }
+
+  /**
+   * Activate a PENDING market: set real strike price and status to OPEN
+   */
+  async activateMarket(id: string, strikePrice: string): Promise<void> {
+    await db
+      .update(markets)
+      .set({
+        status: 'OPEN',
+        strikePrice,
+      })
+      .where(eq(markets.id, id));
+    
+    await this.clearMarketsCache();
+    logger.info(`Activated market ${id} with strike price ${strikePrice}`);
   }
 
   /**

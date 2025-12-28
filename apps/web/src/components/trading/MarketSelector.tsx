@@ -7,16 +7,15 @@ import { Countdown } from './Countdown';
 import { cn } from '@/lib/utils';
 
 const ASSETS = ['BTC', 'ETH', 'SOL'] as const;
-const TIMEFRAMES = ['5m', '15m', '1h', '4h'] as const;
+const TIMEFRAMES = ['5m', '1h', '24h'] as const;
 
 // Calculate next expiry time based on timeframe
 function getNextExpiry(timeframe: string): number {
   const now = Date.now();
   const intervals: Record<string, number> = {
     '5m': 5 * 60 * 1000,
-    '15m': 15 * 60 * 1000,
     '1h': 60 * 60 * 1000,
-    '4h': 4 * 60 * 60 * 1000,
+    '24h': 24 * 60 * 60 * 1000,
   };
   
   const interval = intervals[timeframe] || intervals['5m'];

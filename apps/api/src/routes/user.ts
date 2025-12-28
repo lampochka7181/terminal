@@ -1,11 +1,13 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
+import { or, eq, desc } from 'drizzle-orm';
 import { requireAuth, getCurrentUserId, getCurrentWallet } from '../lib/auth.js';
 import { positionService } from '../services/position.service.js';
 import { orderService } from '../services/order.service.js';
 import { userService } from '../services/user.service.js';
 import { marketService } from '../services/market.service.js';
 import { anchorClient } from '../lib/anchor-client.js';
+import { db, trades, settlements, markets } from '../db/index.js';
 
 // Validation schemas
 const positionsQuerySchema = z.object({
@@ -104,9 +106,12 @@ export async function userRoutes(app: FastifyInstance) {
     
     const positions = await positionService.getUserPositions(userId, status);
 
+    // Truncate to 6 decimals to match on-chain precision
+    const truncate6 = (n: number) => Math.floor(n * 1_000_000) / 1_000_000;
+    
     return positions.map((p) => {
-      const yesShares = parseFloat(p.yesShares || '0');
-      const noShares = parseFloat(p.noShares || '0');
+      const yesShares = truncate6(parseFloat(p.yesShares || '0'));
+      const noShares = truncate6(parseFloat(p.noShares || '0'));
       const avgEntry = yesShares > 0 
         ? parseFloat(p.avgEntryYes || '0')
         : parseFloat(p.avgEntryNo || '0');
@@ -173,8 +178,11 @@ export async function userRoutes(app: FastifyInstance) {
       };
     }
 
-    const yesShares = parseFloat(position.yesShares || '0');
-    const noShares = parseFloat(position.noShares || '0');
+    // Truncate to 6 decimals to match on-chain precision
+    const truncate6 = (n: number) => Math.floor(n * 1_000_000) / 1_000_000;
+    
+    const yesShares = truncate6(parseFloat(position.yesShares || '0'));
+    const noShares = truncate6(parseFloat(position.noShares || '0'));
     const currentYesPrice = market.yesPrice ? parseFloat(market.yesPrice) : 0.5;
     const currentNoPrice = market.noPrice ? parseFloat(market.noPrice) : 0.5;
     const avgEntryYes = parseFloat(position.avgEntryYes || '0');
@@ -262,7 +270,11 @@ export async function userRoutes(app: FastifyInstance) {
 
   /**
    * GET /user/trades
-   * Get user's trade history
+   * Get user's trade history (all transactions: opens, closes, settlements)
+   * 
+   * Returns transactions from:
+   * 1. Trades table - where user is maker or taker (opening/closing positions)
+   * 2. Settlements table - when market expires and positions are settled
    */
   app.get('/trades', async (request: FastifyRequest, reply: FastifyReply) => {
     const userId = getCurrentUserId(request);
@@ -279,14 +291,161 @@ export async function userRoutes(app: FastifyInstance) {
       });
     }
 
-    // TODO: Implement trade history fetching from trades table
-    // This requires joining with orders to determine which side the user was on
+    const { limit, offset } = query.data;
+    
+    // 1. Get trades where user is maker OR taker
+    const userTrades = await db
+      .select({
+        id: trades.id,
+        marketId: trades.marketId,
+        makerUserId: trades.makerUserId,
+        takerUserId: trades.takerUserId,
+        takerSide: trades.takerSide,
+        takerOutcome: trades.takerOutcome,
+        takerPrice: trades.takerPrice,
+        takerNotional: trades.takerNotional,
+        takerFee: trades.takerFee,
+        makerOutcome: trades.makerOutcome,
+        makerPrice: trades.makerPrice,
+        makerNotional: trades.makerNotional,
+        makerFee: trades.makerFee,
+        size: trades.size,
+        txSignature: trades.txSignature,
+        executedAt: trades.executedAt,
+        // Market info
+        marketPubkey: markets.pubkey,
+        marketAsset: markets.asset,
+        marketTimeframe: markets.timeframe,
+        marketExpiryAt: markets.expiryAt,
+      })
+      .from(trades)
+      .leftJoin(markets, eq(trades.marketId, markets.id))
+      .where(
+        or(
+          eq(trades.makerUserId, userId),
+          eq(trades.takerUserId, userId)
+        )
+      )
+      .orderBy(desc(trades.executedAt))
+      .limit(limit + 1) // +1 to check if there are more
+      .offset(offset);
+    
+    // 2. Get settlements for this user
+    const userSettlements = await db
+      .select({
+        id: settlements.id,
+        marketId: settlements.marketId,
+        outcome: settlements.outcome,
+        winningShares: settlements.winningShares,
+        payoutAmount: settlements.payoutAmount,
+        profit: settlements.profit,
+        txSignature: settlements.txSignature,
+        createdAt: settlements.createdAt,
+        // Market info
+        marketPubkey: markets.pubkey,
+        marketAsset: markets.asset,
+        marketTimeframe: markets.timeframe,
+        marketExpiryAt: markets.expiryAt,
+      })
+      .from(settlements)
+      .leftJoin(markets, eq(settlements.marketId, markets.id))
+      .where(eq(settlements.userId, userId))
+      .orderBy(desc(settlements.createdAt))
+      .limit(limit)
+      .offset(offset);
+    
+    // Transform trades into unified format
+    const tradeTransactions = userTrades.slice(0, limit).map((t) => {
+      const isMaker = t.makerUserId === userId;
+      const isTaker = t.takerUserId === userId;
+      
+      // Determine user's perspective
+      const userOutcome = isTaker ? t.takerOutcome : t.makerOutcome;
+      const userPrice = isTaker ? parseFloat(t.takerPrice || '0') : parseFloat(t.makerPrice || '0');
+      const userNotional = isTaker ? parseFloat(t.takerNotional || '0') : parseFloat(t.makerNotional || '0');
+      const userFee = isTaker ? parseFloat(t.takerFee || '0') : parseFloat(t.makerFee || '0');
+      const size = parseFloat(t.size || '0');
+      
+      // Determine if this is an opening or closing trade
+      // BID = buying contracts (opening position)
+      // ASK = selling contracts (closing position)
+      const takerSide = t.takerSide;
+      const isOpening = isTaker 
+        ? takerSide === 'BID' // Taker buying = opening
+        : takerSide === 'ASK'; // Maker on other side of taker's sell = opening
+      
+      const transactionType = isOpening ? 'open' : 'close';
+      
+      // Note: We don't calculate PnL for trades because we don't have cost basis
+      // PnL is only shown for settlements where we have the actual profit stored
+      
+      return {
+        id: t.id,
+        type: 'trade' as const,
+        transactionType,
+        marketAddress: t.marketPubkey || '',
+        market: t.marketAsset && t.marketTimeframe 
+          ? `${t.marketAsset}-${t.marketTimeframe}` 
+          : '',
+        asset: t.marketAsset || '',
+        expiryAt: t.marketExpiryAt?.getTime() || 0,
+        outcome: userOutcome?.toLowerCase() || '',
+        side: isTaker ? (takerSide === 'BID' ? 'buy' : 'sell') : (takerSide === 'BID' ? 'sell' : 'buy'),
+        price: userPrice,
+        size: size,
+        notional: userNotional,
+        fee: userFee,
+        // PnL is not available for trades - would need cost basis from original purchase
+        pnl: undefined,
+        txSignature: t.txSignature || '',
+        timestamp: t.executedAt?.getTime() || 0,
+      };
+    });
+    
+    // Transform settlements into unified format (filter out 0-share settlements)
+    const settlementTransactions = userSettlements
+      .filter((s) => parseFloat(s.winningShares || '0') > 0)
+      .map((s) => {
+      const payout = parseFloat(s.payoutAmount || '0');
+      const profit = parseFloat(s.profit || '0');
+      const shares = parseFloat(s.winningShares || '0');
+      const isWin = payout > 0;
+      
+      return {
+        id: s.id,
+        type: 'settlement' as const,
+        transactionType: 'close' as const,
+        marketAddress: s.marketPubkey || '',
+        market: s.marketAsset && s.marketTimeframe 
+          ? `${s.marketAsset}-${s.marketTimeframe}` 
+          : '',
+        asset: s.marketAsset || '',
+        expiryAt: s.marketExpiryAt?.getTime() || 0,
+        outcome: s.outcome?.toLowerCase() || '',
+        side: 'settlement' as const,
+        price: isWin ? 1.0 : 0.0, // Settlement price is $1 for win, $0 for loss
+        size: shares,
+        notional: payout,
+        fee: 0,
+        pnl: profit,
+        txSignature: s.txSignature || '',
+        timestamp: s.createdAt?.getTime() || 0,
+      };
+    });
+    
+    // Combine and sort by timestamp descending
+    const allTransactions = [...tradeTransactions, ...settlementTransactions]
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, limit);
+    
+    const hasMore = userTrades.length > limit;
     
     return {
-      trades: [],
-      total: 0,
-      limit: query.data.limit,
-      offset: query.data.offset,
+      transactions: allTransactions,
+      total: allTransactions.length,
+      limit,
+      offset,
+      hasMore,
     };
   });
 

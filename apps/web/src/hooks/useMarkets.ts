@@ -4,11 +4,15 @@
  * 
  * Backend PRE-CREATES markets, so the next market is always ready
  * before the current one expires. No aggressive polling needed!
+ * 
+ * Now also listens for market_activated WebSocket events for instant
+ * strike price updates without polling delay.
  */
 
 import { useEffect, useCallback, useRef, useMemo } from 'react';
 import { useMarketStore } from '@/stores/marketStore';
 import { api, type GetMarketsParams, ApiError } from '@/lib/api';
+import { getWebSocket } from '@/lib/websocket';
 import type { MarketSummary, Asset, Timeframe } from '@degen/types';
 
 // Polling interval to keep data fresh (10 seconds)
@@ -66,6 +70,50 @@ export function useMarkets(params?: GetMarketsParams) {
     }, POLLING_INTERVAL);
     
     return () => clearInterval(interval);
+  }, [fetchMarkets]);
+  
+  // Listen for market_activated WebSocket events for instant strike price updates
+  useEffect(() => {
+    const ws = getWebSocket();
+    ws.connect().catch(() => {});
+    
+    const unsubscribe = ws.onMessage((message: any) => {
+      if (message.type !== 'market_activated') return;
+      
+      const data = message.data;
+      if (!data) return;
+      
+      console.log('[useMarkets] Market activated:', data.asset, data.timeframe, 'strike:', data.strikePrice);
+      
+      // Update the markets list with the new strike price
+      const { markets, setMarkets } = useMarketStore.getState();
+      const address = data.address || message.market;
+      
+      const updatedMarkets = markets.map((m) => {
+        if (m.address === address || m.id === data.marketId) {
+          return {
+            ...m,
+            strike: data.strikePrice,
+          };
+        }
+        return m;
+      });
+      
+      // If we found and updated a market, apply it
+      const wasUpdated = updatedMarkets.some((m, i) => m.strike !== markets[i]?.strike);
+      if (wasUpdated) {
+        setMarkets(updatedMarkets);
+        console.log('[useMarkets] Updated market with strike price:', data.strikePrice);
+      } else {
+        // Market not in list yet, do a fresh fetch to get it
+        console.log('[useMarkets] Market not found in list, fetching fresh data...');
+        fetchMarkets(false);
+      }
+    });
+    
+    return () => {
+      unsubscribe();
+    };
   }, [fetchMarkets]);
   
   // Refetch when a market expires (instant refresh to get the pre-created next market)

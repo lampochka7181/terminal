@@ -67,6 +67,9 @@ export const RedisKeys = {
   
   // Price cache
   price: (asset: string) => `price:${asset}`,
+
+  // Rolling tick history for charting (zset score=timestampMs, member="price:rand")
+  ticks: (asset: string) => `ticks:${asset}`,
   
   // Session/nonce cache (for auth)
   nonce: (address: string) => `nonce:${address}`,

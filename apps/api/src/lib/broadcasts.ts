@@ -1,4 +1,3 @@
-import { WebSocket } from 'ws';
 import { logger } from './logger.js';
 
 /**
@@ -8,13 +7,21 @@ import { logger } from './logger.js';
  * WebSocket handlers register their connections here.
  */
 
+// Minimal WebSocket shape we need (avoid importing 'ws' just for types/constants)
+type WebSocketLike = {
+  readyState: number;
+  send: (data: string) => void;
+};
+
+const WS_OPEN = 1; // WebSocket.OPEN
+
 // Client connection storage (managed by websocket.ts)
-let clients: Map<WebSocket, { subscriptions: Set<string>; wallet?: string; userId?: string }> = new Map();
+let clients: Map<WebSocketLike, { subscriptions: Set<string>; wallet?: string; userId?: string }> = new Map();
 
 /**
  * Register the clients map from websocket handler
  */
-export function registerClients(clientsMap: Map<WebSocket, { subscriptions: Set<string>; wallet?: string; userId?: string }>) {
+export function registerClients(clientsMap: Map<WebSocketLike, { subscriptions: Set<string>; wallet?: string; userId?: string }>) {
   clients = clientsMap;
 }
 
@@ -25,7 +32,7 @@ function broadcast(channel: string, data: any): void {
   let sent = 0;
   
   for (const [ws, client] of clients) {
-    if (ws.readyState === WebSocket.OPEN && client.subscriptions.has(channel)) {
+    if (ws.readyState === WS_OPEN && client.subscriptions.has(channel)) {
       try {
         ws.send(JSON.stringify(data));
         sent++;
@@ -53,7 +60,7 @@ function broadcastToUser(userId: string, event: string, data: any): void {
   });
 
   for (const [ws, client] of clients) {
-    if (ws.readyState === WebSocket.OPEN && client.userId === userId) {
+    if (ws.readyState === WS_OPEN && client.userId === userId) {
       try {
         ws.send(message);
       } catch (err) {
@@ -99,6 +106,7 @@ export function broadcastTrade(
     outcome: string;
     side: string;
     timestamp: number;
+    takerWallet?: string;
   }
 ): void {
   broadcast(`trades:${marketId}`, {
@@ -149,14 +157,15 @@ export function broadcastMarketResolved(
 export function broadcastUserFill(
   userId: string,
   fill: {
-    tradeId?: string;
     orderId: string;
-    marketId: string;
-    side: string;
-    outcome: string;
+    marketAddress: string;
+    side: 'bid' | 'ask';
+    outcome: 'yes' | 'no';
     price: number;
-    size: number;
-    fee: number;
+    filledSize: number;
+    remainingSize: number;
+    status: 'partial' | 'filled';
+    timestamp: number;
   }
 ): void {
   broadcastToUser(userId, 'fill', fill);
@@ -172,4 +181,62 @@ export function broadcastUserSettlement(
   }
 ): void {
   broadcastToUser(userId, 'settlement', settlement);
+}
+
+/**
+ * Broadcast market activation (strike price set, trading now enabled)
+ * This allows frontends to immediately update without waiting for polling
+ */
+export function broadcastMarketActivated(
+  marketAddress: string,
+  data: {
+    marketId: string;
+    asset: string;
+    timeframe: string;
+    strikePrice: number;
+    expiryAt: number;
+  }
+): void {
+  broadcast(`market:${marketAddress}`, {
+    type: 'market_activated',
+    channel: 'market',
+    market: marketAddress,
+    data: {
+      ...data,
+      timestamp: Date.now(),
+    },
+  });
+  
+  // Also broadcast to a global 'markets' channel for clients that aren't subscribed to specific markets yet
+  broadcastGlobal({
+    type: 'market_activated',
+    channel: 'markets',
+    data: {
+      address: marketAddress,
+      ...data,
+      timestamp: Date.now(),
+    },
+  });
+}
+
+/**
+ * Broadcast to all connected clients (global channel)
+ */
+function broadcastGlobal(data: any): void {
+  let sent = 0;
+  
+  for (const [ws] of clients) {
+    if (ws.readyState === WS_OPEN) {
+      try {
+        ws.send(JSON.stringify(data));
+        sent++;
+      } catch (err) {
+        logger.error(`Failed to send global broadcast:`, err);
+      }
+    }
+  }
+  
+  if (sent > 0) {
+    logger.debug(`Global broadcast to ${sent} clients: ${data.type}`);
+  }
 }

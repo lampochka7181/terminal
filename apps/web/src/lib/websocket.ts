@@ -71,6 +71,21 @@ export interface MarketResolvedUpdate {
   };
 }
 
+export interface MarketActivatedUpdate {
+  channel: 'market' | 'markets';
+  type: 'market_activated';
+  market?: string;
+  data: {
+    address?: string;
+    marketId: string;
+    asset: 'BTC' | 'ETH' | 'SOL';
+    timeframe: string;
+    strikePrice: number;
+    expiryAt: number;
+    timestamp: number;
+  };
+}
+
 export interface UserFillUpdate {
   channel: 'user';
   event: 'fill';
@@ -106,6 +121,7 @@ type WSUpdate =
   | TradeUpdate
   | PriceUpdate
   | MarketResolvedUpdate
+  | MarketActivatedUpdate
   | UserFillUpdate
   | UserSettlementUpdate;
 
@@ -312,6 +328,11 @@ export class WebSocketService {
         normalizedMessage = {
           ...message,
           channel: 'market',
+        };
+      } else if (message.type === 'market_activated') {
+        normalizedMessage = {
+          ...message,
+          channel: message.channel || 'markets',
         };
       } else if (message.type === 'fill') {
         normalizedMessage = {

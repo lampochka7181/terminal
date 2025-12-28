@@ -30,10 +30,11 @@ pub enum OrderType {
 /// Market status
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MarketStatus {
-    Open = 0,       // Trading active
-    Closed = 1,     // Trading stopped, awaiting resolution
-    Resolved = 2,   // Outcome determined
-    Settled = 3,    // All positions paid out
+    Pending = 0,    // Pre-created, awaiting activation (strike price not set)
+    Open = 1,       // Trading active
+    Closed = 2,     // Trading stopped, awaiting resolution
+    Resolved = 3,   // Outcome determined
+    Settled = 4,    // All positions paid out
 }
 
 /// Order status
@@ -54,7 +55,7 @@ impl Default for OrderStatus {
 
 impl Default for MarketStatus {
     fn default() -> Self {
-        MarketStatus::Open
+        MarketStatus::Pending
     }
 }
 
@@ -178,7 +179,7 @@ pub struct Market {
     pub authority: Pubkey,
     /// Asset symbol (BTC, ETH, SOL)
     pub asset: [u8; MAX_ASSET_LEN],
-    /// Timeframe (5m, 15m, 1h, 4h)
+    /// Timeframe (5m, 15m, 1h, 4h, 24h)
     pub timeframe: [u8; MAX_TIMEFRAME_LEN],
     /// Strike price (8 decimals to match oracle precision)
     pub strike_price: u64,

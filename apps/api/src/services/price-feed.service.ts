@@ -35,6 +35,7 @@ const ASSET_PRODUCTS: Record<string, string> = {
 // Reconnection settings
 const RECONNECT_DELAY_MS = 5000;
 const MAX_RECONNECT_ATTEMPTS = 10;
+const TICK_RETENTION_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 class PriceFeedService {
   private ws: WebSocket | null = null;
@@ -84,11 +85,11 @@ class PriceFeedService {
       logger.info('✅ Connected to Coinbase WebSocket');
       this.reconnectAttempts = 0;
       
-      // Subscribe to ticker channel for all products
+      // Subscribe to per-trade matches for maximum granularity
       const subscribeMsg = {
         type: 'subscribe',
         product_ids: Object.values(ASSET_PRODUCTS),
-        channels: ['ticker'],
+        channels: ['matches'],
       };
       
       this.ws!.send(JSON.stringify(subscribeMsg));
@@ -122,8 +123,8 @@ class PriceFeedService {
         return;
       }
       
-      // Handle ticker messages
-      if (msg.type === 'ticker') {
+      // Handle trade match messages (tick-by-tick)
+      if (msg.type === 'match') {
         const productId = msg.product_id; // e.g., 'BTC-USD'
         const price = parseFloat(msg.price);
         const timestamp = new Date(msg.time).getTime();
@@ -146,6 +147,9 @@ class PriceFeedService {
         
         // Update Redis cache
         await this.cachePrice(priceData);
+
+        // Store tick history for charting
+        await this.storeTick(priceData);
         
         // Broadcast to WebSocket clients (throttled)
         this.broadcastPrice(priceData);
@@ -164,6 +168,23 @@ class PriceFeedService {
       await redis.set(key, JSON.stringify(data), 'EX', 60); // Expire after 60s
     } catch (err) {
       logger.error(`Failed to cache price for ${data.asset}:`, err);
+    }
+  }
+
+  /**
+   * Store rolling tick history for charting in Redis.
+   * Uses a ZSET: score=timestampMs, member="price:rand" (unique member).
+   */
+  private async storeTick(data: PriceData): Promise<void> {
+    try {
+      const key = RedisKeys.ticks(data.asset);
+      const member = `${data.price}:${Math.random().toString(36).slice(2)}`;
+      await redis.zadd(key, String(data.timestamp), member);
+      // Keep last N hours by score
+      const cutoff = Date.now() - TICK_RETENTION_MS;
+      await redis.zremrangebyscore(key, 0, cutoff);
+    } catch (err) {
+      // Non-fatal: chart history is best-effort
     }
   }
 

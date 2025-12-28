@@ -1,5 +1,6 @@
 import { logger, keeperLogger, logEvents } from '../lib/logger.js';
 import { marketCreatorJob } from './market-creator.js';
+import { marketActivatorJob } from './market-activator.js';
 import { marketResolverJob } from './market-resolver.js';
 import { positionSettlerJob } from './position-settler.js';
 import { orderExpirerJob } from './order-expirer.js';
@@ -10,7 +11,8 @@ import { db, pool } from '../db/index.js'; // To check pool load directly
  * Keeper Jobs Manager
  * 
  * Schedules and manages all background jobs:
- * - Market Creator: Creates new markets at intervals (5m, 15m, 1h, 4h)
+ * - Market Creator: Pre-creates markets with PENDING status (DB only, no on-chain)
+ * - Market Activator: Activates PENDING markets when they go live (sets strike price, creates on-chain)
  * - Market Resolver: Resolves expired markets using oracle prices
  * - Position Settler: Pays out winners after market resolution
  * - Order Expirer: Cancels orders before market close and expired GTT orders
@@ -27,8 +29,14 @@ interface JobConfig {
 const jobs: JobConfig[] = [
   {
     name: 'Market Creator',
-    intervalMs: 30 * 1000, // Every 30 seconds (pre-creates upcoming markets)
+    intervalMs: 30 * 1000, // Every 30 seconds (pre-creates PENDING markets in DB)
     job: marketCreatorJob,
+    enabled: true,
+  },
+  {
+    name: 'Market Activator',
+    intervalMs: 5 * 1000, // Every 5 seconds (activates markets when they go live)
+    job: marketActivatorJob,
     enabled: true,
   },
   {
