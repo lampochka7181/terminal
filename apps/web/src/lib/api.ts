@@ -54,6 +54,7 @@ export interface Position {
   currentPrice: number;
   unrealizedPnL: number;
   status: 'open' | 'settled';
+  createdAt?: number;
 }
 
 export interface MarketPosition {
