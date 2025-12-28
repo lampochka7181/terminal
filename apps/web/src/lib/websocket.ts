@@ -72,7 +72,7 @@ export interface MarketResolvedUpdate {
 }
 
 export interface MarketActivatedUpdate {
-  channel: 'market' | 'markets';
+  channel: 'market';
   type: 'market_activated';
   market?: string;
   data: {
@@ -332,7 +332,7 @@ export class WebSocketService {
       } else if (message.type === 'market_activated') {
         normalizedMessage = {
           ...message,
-          channel: message.channel || 'markets',
+          channel: message.channel || 'market',
         };
       } else if (message.type === 'fill') {
         normalizedMessage = {
