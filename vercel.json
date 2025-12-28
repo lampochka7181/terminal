@@ -1,5 +1,5 @@
 {
-  "buildCommand": "pnpm --filter=@degen/web build",
+  "buildCommand": "pnpm --filter=@degen/types build && pnpm --filter=@degen/web build",
   "installCommand": "pnpm install --no-frozen-lockfile",
   "framework": "nextjs",
   "outputDirectory": "apps/web/.next"
