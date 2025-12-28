@@ -42,6 +42,9 @@ importers:
       '@fastify/websocket':
         specifier: ^10.0.1
         version: 10.0.1(bufferutil@4.0.9)(utf-8-validate@5.0.10)
+      '@solana/spl-token':
+        specifier: ^0.4.0
+        version: 0.4.14(@solana/web3.js@1.98.4(bufferutil@4.0.9)(typescript@5.9.3)(utf-8-validate@5.0.10))(bufferutil@4.0.9)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)(utf-8-validate@5.0.10)
       '@solana/web3.js':
         specifier: ^1.91.0
         version: 1.98.4(bufferutil@4.0.9)(typescript@5.9.3)(utf-8-validate@5.0.10)
@@ -127,6 +130,9 @@ importers:
       '@tanstack/react-query':
         specifier: ^5.28.0
         version: 5.90.11(react@18.3.1)
+      bs58:
+        specifier: ^5.0.0
+        version: 5.0.0
       clsx:
         specifier: ^2.1.0
         version: 2.1.1
@@ -155,6 +161,9 @@ importers:
         specifier: ^4.5.0
         version: 4.5.7(@types/react@18.3.27)(react@18.3.1)
     devDependencies:
+      '@types/bs58':
+        specifier: ^4.0.4
+        version: 4.0.4
       '@types/node':
         specifier: ^20.11.0
         version: 20.19.25
@@ -2242,6 +2251,9 @@ packages:
 
   '@types/bn.js@5.2.0':
     resolution: {integrity: sha512-DLbJ1BPqxvQhIGbeu8VbUC1DiAiahHtAYvA0ZEAa4P31F7IaArc8z3C3BRQdWX4mtLQuABG4yzp76ZrS02Ui1Q==}
+
+  '@types/bs58@4.0.4':
+    resolution: {integrity: sha512-0IEpMFXXQi2zXaXl9GJ3sRwQo0uEkD+yFOv+FnAU5lkPtcu6h61xb7jc2CFPEZ5BUOaiP13ThuGc9HD4R8lR5g==}
 
   '@types/chai@4.3.20':
     resolution: {integrity: sha512-/pC9HAB5I/xMlc5FP77qjCnI16ChlJfW0tGa0IUcFn38VJrTV6DeZ60NU5KZBtaOZqjdpwTWohz5HU1RrhiYxQ==}
@@ -9297,6 +9309,11 @@ snapshots:
   '@types/bn.js@5.2.0':
     dependencies:
       '@types/node': 20.19.25
+
+  '@types/bs58@4.0.4':
+    dependencies:
+      '@types/node': 20.19.25
+      base-x: 3.0.11
 
   '@types/chai@4.3.20': {}
 
