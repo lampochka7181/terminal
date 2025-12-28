@@ -1,17 +1,10 @@
 'use client';
 
-import { useEffect } from 'react';
 import { cn } from '@/lib/utils';
-import { useOrderbookStore, startOrderbookSimulation, stopOrderbookSimulation } from '@/stores/orderbookStore';
+import { useOrderbookStore } from '@/stores/orderbookStore';
 
 export function RecentTrades() {
   const { trades } = useOrderbookStore();
-
-  // Ensure simulation is running
-  useEffect(() => {
-    startOrderbookSimulation();
-    return () => stopOrderbookSimulation();
-  }, []);
 
   return (
     <div className="bg-surface rounded-lg border border-border p-4 h-full flex flex-col">
