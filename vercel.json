@@ -1,0 +1,7 @@
+{
+  "buildCommand": "pnpm build --filter=@degen/web",
+  "installCommand": "pnpm install",
+  "framework": "nextjs",
+  "outputDirectory": "apps/web/.next"
+}
+
