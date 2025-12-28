@@ -3,19 +3,21 @@
  * Fetches recent trades and subscribes to real-time updates
  */
 
-import { useEffect, useCallback, useRef } from 'react';
+import { useEffect, useCallback, useRef, useState } from 'react';
 import { useOrderbookStore, type Trade } from '@/stores/orderbookStore';
 import { api, ApiError } from '@/lib/api';
 import { getWebSocket, type TradeUpdate } from '@/lib/websocket';
 
 export function useTrades(marketAddress: string | null, limit = 50) {
-  const { trades, addTrade, clearTrades, setTradesLoading, setTradesError, tradesLoading, tradesError } = useOrderbookStore();
+  const { trades, addTrade, reset } = useOrderbookStore();
+  const [tradesLoading, setTradesLoading] = useState(false);
+  const [tradesError, setTradesError] = useState<string | null>(null);
   const subscribed = useRef(false);
 
   // Fetch initial trades
   const fetchTrades = useCallback(async () => {
     if (!marketAddress) {
-      clearTrades();
+      reset();
       return;
     }
 
@@ -26,13 +28,14 @@ export function useTrades(marketAddress: string | null, limit = 50) {
       const data = await api.getMarketTrades(marketAddress, { limit });
       
       // Clear and add fetched trades
-      clearTrades();
+      reset();
       data.trades.forEach((trade) => {
         addTrade({
           id: trade.id,
           price: trade.price,
           size: trade.size,
           side: trade.side,
+          outcome: 'YES',
           timestamp: trade.executedAt,
         });
       });
@@ -43,7 +46,7 @@ export function useTrades(marketAddress: string | null, limit = 50) {
     } finally {
       setTradesLoading(false);
     }
-  }, [marketAddress, limit, addTrade, clearTrades, setTradesLoading, setTradesError]);
+  }, [marketAddress, limit, addTrade, reset]);
 
   // Subscribe to WebSocket updates
   useEffect(() => {
@@ -66,6 +69,7 @@ export function useTrades(marketAddress: string | null, limit = 50) {
         price: data?.price || 0,
         size: data?.size || 0,
         side: data?.side || 'buy',
+        outcome: data?.outcome || 'YES',
         timestamp: data?.timestamp || Date.now(),
       });
     });
