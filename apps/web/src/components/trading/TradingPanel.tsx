@@ -59,7 +59,7 @@ export function TradingPanel() {
   // Parse orderbook asks into levels for walking
   const askLevels: OrderbookLevel[] = useMemo(() => {
     const asks = book.asks || [];
-    return asks.map(([price, size]: [number, number]) => ({ price, size }))
+    return asks.map((level) => ({ price: level.price, size: level.size }))
       .sort((a, b) => a.price - b.price); // Sort by price ascending (best first)
   }, [book.asks]);
 
