@@ -448,11 +448,11 @@ export class WebSocketService {
 
   unsubscribePrices(): void {
     // Remove all price subscriptions
-    for (const key of this.subscriptions.keys()) {
+    Array.from(this.subscriptions.keys()).forEach(key => {
       if (key.startsWith('prices:')) {
         this.subscriptions.delete(key);
       }
-    }
+    });
     this.send({
       op: 'unsubscribe',
       channel: 'prices',
