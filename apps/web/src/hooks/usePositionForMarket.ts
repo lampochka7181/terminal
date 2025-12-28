@@ -1,12 +1,12 @@
 import { useQuery } from '@tanstack/react-query';
 import { getUserPositionForMarket, type MarketPosition } from '@/lib/api';
-import { useUserStore } from '@/stores/userStore';
+import { useAuthStore } from '@/stores/authStore';
 
 /**
  * Hook to get the current user's position for a specific market
  */
 export function usePositionForMarket(marketAddress: string | undefined) {
-  const { isAuthenticated } = useUserStore();
+  const { isAuthenticated } = useAuthStore();
   
   return useQuery<MarketPosition | null>({
     queryKey: ['position', marketAddress],
