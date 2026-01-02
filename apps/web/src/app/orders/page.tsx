@@ -73,7 +73,9 @@ export default function OrdersPage() {
       if (statusFilter === 'filled') {
         filtered = filtered.filter(t => t.transactionType === 'close' || t.type === 'settlement');
       } else if (statusFilter === 'cancelled') {
-        filtered = filtered.filter(t => t.status === 'cancelled');
+        // Transactions are completed trades - cancelled orders don't become transactions
+        // Show empty for this filter on history tab
+        filtered = [];
       }
     }
     
