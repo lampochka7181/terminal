@@ -121,14 +121,19 @@ export function sizeFromOnChain(size: bigint | number): number {
  * Validate price is within bounds and on tick
  */
 export function validatePrice(price: number): { valid: boolean; error?: string } {
-  if (price < 0.01) {
+  // Round to 2 decimal places to handle floating point issues
+  const roundedPrice = Math.round(price * 100) / 100;
+  
+  if (roundedPrice < 0.01) {
     return { valid: false, error: 'Price must be at least $0.01' };
   }
-  if (price > 0.99) {
+  if (roundedPrice > 0.99) {
     return { valid: false, error: 'Price must be at most $0.99' };
   }
-  // Check tick size (must be on $0.01 increments)
-  if (Math.round(price * 100) !== price * 100) {
+  // Price is valid if it's within 0.001 of a valid tick
+  // This handles floating point precision issues
+  const diff = Math.abs(price - roundedPrice);
+  if (diff > 0.001) {
     return { valid: false, error: 'Price must be in $0.01 increments' };
   }
   return { valid: true };

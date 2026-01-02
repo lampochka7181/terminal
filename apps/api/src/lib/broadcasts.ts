@@ -127,6 +127,7 @@ export function broadcastPriceUpdate(
   timestamp: number
 ): void {
   broadcast(`prices:${asset}`, {
+    channel: 'prices',
     type: 'price_update',
     data: {
       asset,

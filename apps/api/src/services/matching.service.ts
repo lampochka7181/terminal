@@ -9,7 +9,12 @@ import { db, trades, type NewTrade } from '../db/index.js';
 import { logger, tradeLogger, orderLogger, logEvents } from '../lib/logger.js';
 import { broadcastOrderbookUpdate, broadcastTrade, broadcastUserFill } from '../lib/broadcasts.js';
 import { config } from '../config.js';
-import { mmBot } from '../bot/mm-bot.js';
+import { mmBotV2 } from '../bot/mm-bot-v2.js';
+
+// Get MM bot user ID
+function getMMUserId(): string | null {
+  return mmBotV2.getStatus().userId;
+}
 
 /**
  * Matching Engine Service
@@ -139,11 +144,11 @@ export interface LimitMatchResult {
 
 export class MatchingService {
   /**
-   * Helper to check if a user is the Market Maker bot
+   * Helper to check if a user is the Market Maker bot (supports both v1 and v2)
    */
   private isMarketMaker(userId: string): boolean {
-    const mmStatus = mmBot.getStatus();
-    return userId === mmStatus.userId;
+    const mmUserId = getMMUserId();
+    return userId === mmUserId;
   }
 
   /**
@@ -418,7 +423,7 @@ export class MatchingService {
       if (!bestOrder) {
         // Devnet/testing: force-fill against MM if the book is empty so market orders always fill.
         if (config.devAlwaysFillMarketOrders) {
-          const mmUserId = mmBot.getStatus().userId;
+          const mmUserId = getMMUserId();
           if (!mmUserId) {
             logger.warn('DEV_ALWAYS_FILL_MARKET_ORDERS enabled but MM user is not initialized');
             break;
@@ -639,7 +644,7 @@ export class MatchingService {
       if (!bestBid) {
         // Devnet/testing: force-fill sell orders against MM if the book is empty
         if (config.devAlwaysFillMarketOrders) {
-          const mmUserId = mmBot.getStatus().userId;
+          const mmUserId = getMMUserId();
           if (!mmUserId) {
             logger.warn('DEV_ALWAYS_FILL_MARKET_ORDERS enabled but MM user is not initialized');
             break;
@@ -691,7 +696,7 @@ export class MatchingService {
       if (bestBid.price < order.minPrice) {
         // Devnet/testing: still fill at the user's min price if MM is available
         if (config.devAlwaysFillMarketOrders) {
-          const mmUserId = mmBot.getStatus().userId;
+          const mmUserId = getMMUserId();
           if (mmUserId) {
             const fillSize = remainingSize;
             const price = order.minPrice;
@@ -1416,6 +1421,7 @@ export class MatchingService {
     sequenceId: number;
   }> {
     const orderType = order.orderType || 'LIMIT';
+    logger.debug(`[processOrder] ${order.side} ${order.outcome} ${order.remainingSize} @ ${order.price} (type: ${orderType})`);
     
     // For FOK orders, check if we CAN fill the entire order first (without modifying state)
     if (orderType === 'FOK') {
@@ -1462,10 +1468,11 @@ export class MatchingService {
       sequenceId = result.sequenceId;
       addedToBook = true;
       
-      // Broadcast orderbook update
+      // Broadcast orderbook update (use pubkey for channel, frontend subscribes by address)
       const snapshot = await orderbookService.getSnapshot(order.marketId, order.outcome);
+      const marketForBroadcast = await marketService.getById(order.marketId);
       broadcastOrderbookUpdate(
-        order.marketId,
+        marketForBroadcast?.pubkey || order.marketId,
         snapshot.bids.map(l => [l.price, l.size] as [number, number]),
         snapshot.asks.map(l => [l.price, l.size] as [number, number]),
         sequenceId
@@ -1754,13 +1761,14 @@ export class MatchingService {
     // Update database
     await orderService.cancel(orderId, 'USER');
     
-    // Broadcast orderbook update
+    // Broadcast orderbook update (use pubkey for channel, frontend subscribes by address)
     const snapshot = await orderbookService.getSnapshot(
       order.marketId!,
       order.outcome as 'YES' | 'NO'
     );
+    const marketForCancel = await marketService.getById(order.marketId!);
     broadcastOrderbookUpdate(
-      order.marketId!,
+      marketForCancel?.pubkey || order.marketId!,
       snapshot.bids.map(l => [l.price, l.size] as [number, number]),
       snapshot.asks.map(l => [l.price, l.size] as [number, number]),
       sequenceId

@@ -18,6 +18,8 @@ import { Chart } from '@/components/trading/Chart';
 import { Positions } from '@/components/trading/Positions';
 import { useMarketStore } from '@/stores/marketStore';
 import { WalletButton } from '@/components/WalletButton';
+import { useOrderbookStore } from '@/stores/orderbookStore';
+import { useOrderbook } from '@/hooks/useOrderbook';
 
 const TIMEFRAMES: Timeframe[] = ['5m', '1h', '24h'];
 
@@ -52,6 +54,19 @@ export function MobileView({ asset, onSwitchView }: MobileViewProps) {
     return markets.find(m => m.timeframe === selectedTimeframe);
   }, [markets, selectedTimeframe]);
   
+  // Subscribe to orderbook WebSocket updates (runs regardless of orderbook panel visibility)
+  // This ensures the store has live data even when DualMiniOrderbook is hidden
+  useOrderbook(activeMarket?.address || null);
+  
+  // Get real-time orderbook prices directly from store for maximum sync with orderbook display
+  const yesAsks = useOrderbookStore(state => state.yes.asks);
+  const yesBestAskFromStore = yesAsks[0]?.price;
+  const yesPrice = (yesBestAskFromStore && yesBestAskFromStore > 0.01 && yesBestAskFromStore < 0.99) 
+    ? yesBestAskFromStore 
+    : (activeMarket?.yesPrice ?? 0.50);
+  // For YES-focused orderbook: BELOW = 1 - ABOVE (always sum to $1.00)
+  const noPrice = 1 - yesPrice;
+  
   // Handle market expiry - just refetch, the next market is already pre-created
   const handleMarketExpired = useCallback((marketId: string, timeframe: string) => {
     console.log(`[MobileView] Market ${marketId} (${timeframe}) expired, switching to next market...`);
@@ -83,15 +98,15 @@ export function MobileView({ asset, onSwitchView }: MobileViewProps) {
   };
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen bg-background bg-gradient-mesh">
       <Header />
 
-      <main className="max-w-lg mx-auto p-4 space-y-6">
+      <main className="max-w-lg mx-auto p-4 space-y-6 pb-24">
         {/* Back button and Asset Info */}
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between animate-fade-in">
            <button 
              onClick={() => router.back()}
-             className="flex items-center gap-2 text-text-muted hover:text-text-primary transition-colors text-sm font-medium"
+             className="flex items-center gap-2 text-text-muted hover:text-text-primary transition-colors text-sm font-medium btn-press"
            >
              <ArrowLeft className="w-4 h-4" />
              Back
@@ -99,17 +114,17 @@ export function MobileView({ asset, onSwitchView }: MobileViewProps) {
            <div className="flex items-center gap-3">
              <button
                onClick={onSwitchView}
-               className="flex items-center gap-1.5 px-2 py-1 text-xs text-text-muted hover:text-accent bg-surface-light rounded-lg transition-colors"
+               className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-text-muted hover:text-accent bg-surface-light rounded-lg transition-colors btn-press"
                title="Switch to Desktop View"
              >
                <Monitor className="w-3.5 h-3.5" />
                <span>Desktop</span>
              </button>
              <div className="flex items-center gap-2">
-               <div className="w-6 h-6 rounded-full bg-surface-light flex items-center justify-center font-bold text-accent text-xs">
+               <div className="w-7 h-7 rounded-lg bg-surface-light flex items-center justify-center font-display font-bold text-accent text-sm">
                  {asset.charAt(0)}
                </div>
-               <span className="font-bold">{asset}</span>
+               <span className="font-display font-bold">{asset}</span>
              </div>
            </div>
         </div>
@@ -120,18 +135,18 @@ export function MobileView({ asset, onSwitchView }: MobileViewProps) {
         </div>
 
         {/* Active Market Card */}
-        <div className="flex flex-col space-y-4">
+        <div className="flex flex-col space-y-4 animate-fade-in stagger-1">
           {marketsLoading && markets.length === 0 ? (
-            <div className="bg-surface rounded-xl border border-border p-12 text-center text-text-muted">
-              <RefreshCw className="w-6 h-6 mx-auto animate-spin mb-2" />
+            <div className="glass-card rounded-2xl border border-border/50 p-12 text-center text-text-muted">
+              <RefreshCw className="w-6 h-6 mx-auto animate-spin mb-2 text-accent" />
               Loading markets...
             </div>
           ) : !activeMarket ? (
-            <div className="bg-surface rounded-xl border border-border p-12 text-center text-text-muted">
+            <div className="glass-card rounded-2xl border border-border/50 p-12 text-center text-text-muted">
               <p>No active {selectedTimeframe} market for {asset}</p>
               <button 
                 onClick={() => refetch()}
-                className="mt-2 text-accent hover:text-accent-dim font-bold"
+                className="mt-2 text-accent hover:text-accent-dim font-bold btn-press"
               >
                 Refresh
               </button>
@@ -166,18 +181,23 @@ export function MobileView({ asset, onSwitchView }: MobileViewProps) {
             <div className="h-px flex-1 bg-border" />
           </div>
           <div className="min-h-[300px]">
-            <Positions onSell={(marketAddress, outcome, shares, avgEntry, price, timeframe, expiry) => {
-              setSelectedTrade({
-                timeframe,
-                outcome,
-                price,
-                marketAddress,
-                marketExpiry: expiry,
-                mode: 'sell',
-                shares,
-                avgEntry,
-              });
-            }} />
+            <Positions 
+              onSell={(marketAddress, outcome, shares, avgEntry, price, timeframe, expiry) => {
+                setSelectedTrade({
+                  timeframe,
+                  outcome,
+                  price,
+                  marketAddress,
+                  marketExpiry: expiry,
+                  mode: 'sell',
+                  shares,
+                  avgEntry,
+                });
+              }}
+              currentMarketAddress={activeMarket?.address}
+              currentYesPrice={yesPrice}
+              currentNoPrice={noPrice}
+            />
           </div>
         </div>
       </main>
@@ -234,15 +254,23 @@ function TimeframeCard({
   const hasExpiredRef = useRef(false);
   const [showOrderbook, setShowOrderbook] = useState(false);
   
+  // Get REAL-TIME orderbook prices (WebSocket subscribed for live updates)
+  // Only need yesBestAsk since BELOW = 1 - ABOVE in YES-focused orderbook
+  const { yesBestAsk } = useOrderbook(market.address);
+  
   // Update time every second
   useEffect(() => {
     const interval = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(interval);
   }, []);
   
-  // Default to 0.50 if no price data (50% probability)
-  const yesPrice = market.yesPrice ?? 0.50;
-  const noPrice = market.noPrice ?? 0.50;
+  // Use real-time orderbook prices, fallback to market data
+  // Note: Check for valid range (0.01-0.99 is valid for binary markets)
+  const yesPrice = (yesBestAsk && yesBestAsk > 0.01 && yesBestAsk < 0.99) 
+    ? yesBestAsk 
+    : (market.yesPrice ?? 0.50);
+  // For YES-focused orderbook: BELOW = 1 - ABOVE (always sum to $1.00)
+  const noPrice = 1 - yesPrice;
   
   // Check if market has expired
   const isExpired = market.expiry ? market.expiry <= now : false;
@@ -480,8 +508,6 @@ function TradeModal({
   
   // MARKET order state
   const [dollarAmount, setDollarAmount] = useState('50');
-  const [priceProtection, setPriceProtection] = useState('0.10');
-  const [showAdvanced, setShowAdvanced] = useState(false);
   
   // LIMIT order state
   const [limitSize, setLimitSize] = useState('100');
@@ -507,8 +533,8 @@ function TradeModal({
   
   // Calculate MARKET order estimates
   const dollarAmountNum = parseFloat(dollarAmount) || 0;
-  const priceProtectionNum = parseFloat(priceProtection) || 0.10;
-  const maxPrice = Math.min(0.99, price + priceProtectionNum);
+  // Market orders walk the book until filled - no price limit
+  const maxPrice = 0.99;
   const estimatedContracts = dollarAmountNum > 0 ? Math.floor(dollarAmountNum / price) : 0;
   const estimatedPayout = estimatedContracts * 1.0;
   const estimatedProfit = estimatedPayout - dollarAmountNum;
@@ -583,7 +609,9 @@ function TradeModal({
       side: isSellMode ? 'ask' : 'bid',
       outcome: outcome.toLowerCase() as 'yes' | 'no',
       orderType: isSellMode ? 'market' : orderType.toLowerCase() as 'limit' | 'market',
-      price: isSellMode ? price : (orderType === 'MARKET' ? price : limitPriceNum),
+      // For MARKET sells, use minPrice: 0.01 to guarantee fill against bids
+      // Similar to how market buys use maxPrice: 0.99
+      price: isSellMode ? 0.01 : (orderType === 'MARKET' ? price : limitPriceNum),
       size: isSellMode ? sellSizeNum : (orderType === 'MARKET' ? estimatedContracts : limitSizeNum),
       expiryTimestamp,
       dollarAmount: (!isSellMode && orderType === 'MARKET') ? dollarAmountNum : undefined,
@@ -823,41 +851,6 @@ function TradeModal({
                     </button>
                   ))}
                 </div>
-              </div>
-
-              {/* Price Protection */}
-              <div>
-                <button 
-                  onClick={() => setShowAdvanced(!showAdvanced)}
-                  className="flex items-center gap-1 text-xs text-text-muted hover:text-text-primary mb-2"
-                >
-                  <Settings className="w-3 h-3" />
-                  {showAdvanced ? 'Hide' : 'Show'} Price Protection
-                </button>
-                
-                {showAdvanced && (
-                  <div className="bg-surface-light rounded-lg p-3">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-sm text-text-muted">Max Slippage</span>
-                      <span className="text-sm font-mono">${priceProtection}</span>
-                    </div>
-                    <input
-                      type="range"
-                      value={parseFloat(priceProtection) * 100}
-                      onChange={(e) => setPriceProtection((parseInt(e.target.value) / 100).toFixed(2))}
-                      min="1"
-                      max="25"
-                      className="w-full accent-accent"
-                    />
-                    <div className="flex justify-between text-xs text-text-muted mt-1">
-                      <span>$0.01</span>
-                      <span>$0.25</span>
-                    </div>
-                    <div className="mt-2 text-xs text-text-muted">
-                      Current: ${price.toFixed(2)} → Max: ${maxPrice.toFixed(2)}
-                    </div>
-                  </div>
-                )}
               </div>
 
               {/* MARKET Summary */}

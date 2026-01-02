@@ -357,13 +357,23 @@ export class WebSocketService {
         if (data?.sequenceId !== undefined) {
           const lastSeq = this.lastSequenceIds.get(normalizedMessage.market);
           
-          if (lastSeq !== undefined && data.sequenceId > lastSeq + 1) {
-            console.warn(`[WS] Sequence gap detected for ${normalizedMessage.market}: ${lastSeq} -> ${data.sequenceId}`);
+          // Only detect significant gaps (>50 messages missed)
+          // Normal gaps of ~12-15 are expected per MM update cycle:
+          // - Each cycle cancels ~6 orders and places ~6 new ones
+          // - Each operation increments the shared sequence counter
+          // - Client only receives the final broadcast after all operations
+          const gap = data.sequenceId - (lastSeq || 0);
+          if (lastSeq !== undefined && lastSeq > 0 && gap > 50) {
+            console.warn(`[WS] Large sequence gap for ${normalizedMessage.market}: ${lastSeq} -> ${data.sequenceId} (gap: ${gap})`);
             // Request snapshot to fill gap
             this.requestSnapshot(normalizedMessage.market, lastSeq);
           }
           
-          this.lastSequenceIds.set(normalizedMessage.market, data.sequenceId);
+          // Always track the latest sequence (use max to handle out-of-order delivery)
+          const currentMax = this.lastSequenceIds.get(normalizedMessage.market) || 0;
+          if (data.sequenceId > currentMax) {
+            this.lastSequenceIds.set(normalizedMessage.market, data.sequenceId);
+          }
         }
       }
 

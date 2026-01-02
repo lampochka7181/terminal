@@ -1,16 +1,27 @@
 import type { Metadata } from 'next';
-import { Inter, JetBrains_Mono } from 'next/font/google';
+import { Space_Grotesk, IBM_Plex_Mono, Outfit } from 'next/font/google';
 import './globals.css';
 import { Providers } from './providers';
 
-const inter = Inter({ 
+// Primary heading font - geometric and bold
+const spaceGrotesk = Space_Grotesk({ 
   subsets: ['latin'],
-  variable: '--font-inter',
+  variable: '--font-display',
+  weight: ['400', '500', '600', '700'],
 });
 
-const jetbrainsMono = JetBrains_Mono({ 
+// Body font - clean and modern
+const outfit = Outfit({
+  subsets: ['latin'],
+  variable: '--font-sans',
+  weight: ['300', '400', '500', '600', '700'],
+});
+
+// Monospace font - for prices and numbers
+const ibmPlexMono = IBM_Plex_Mono({ 
   subsets: ['latin'],
   variable: '--font-mono',
+  weight: ['400', '500', '600', '700'],
 });
 
 export const metadata: Metadata = {
@@ -24,8 +35,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable}`}>
-      <body className="bg-background text-text-primary antialiased">
+    <html lang="en" className={`${spaceGrotesk.variable} ${outfit.variable} ${ibmPlexMono.variable}`}>
+      <body className="bg-background text-text-primary antialiased font-sans">
         <Providers>
           {children}
         </Providers>
@@ -33,6 +44,3 @@ export default function RootLayout({
     </html>
   );
 }
-
-
-

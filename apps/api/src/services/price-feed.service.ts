@@ -188,9 +188,9 @@ class PriceFeedService {
     }
   }
 
-  // Throttle broadcasts (max 1 per 100ms per asset)
+  // Throttle broadcasts (max 1 per 50ms per asset for faster updates)
   private lastBroadcast: Map<string, number> = new Map();
-  private readonly BROADCAST_THROTTLE_MS = 100;
+  private readonly BROADCAST_THROTTLE_MS = 50;
 
   /**
    * Broadcast price update to WebSocket clients

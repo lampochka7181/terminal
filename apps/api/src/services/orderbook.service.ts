@@ -113,10 +113,17 @@ export class OrderbookService {
     
     if (memberToRemove) {
       await redis.zrem(key, memberToRemove);
+    } else {
+      // Order not found in sorted set - only delete hash if it exists
+      // This prevents orphaned sorted set entries
+      logger.debug(`Order ${order.id} not found in sorted set ${key} - skipping`);
     }
     
-    // Remove order hash
-    await redis.del(orderKey);
+    // Only remove order hash if we also removed from sorted set
+    // This prevents leaving orphaned sorted set entries
+    if (memberToRemove) {
+      await redis.del(orderKey);
+    }
     
     // Increment sequence ID
     const sequenceId = await this.incrementSequence(order.marketId);
@@ -167,36 +174,58 @@ export class OrderbookService {
 
   /**
    * Get the best bid (highest buy price)
+   * Auto-cleans orphaned entries (sorted set entries without hash data)
    */
   async getBestBid(marketId: string, outcome: 'YES' | 'NO'): Promise<OrderbookOrder | null> {
     const key = RedisKeys.orderbook(marketId, outcome, 'BID');
     
-    // Get first element (highest bid due to negative scoring)
-    const results = await redis.zrange(key, 0, 0, 'WITHSCORES');
-    
-    if (results.length < 2) return null;
-    
-    const [member, scoreStr] = results;
-    const [orderId] = member.split(':');
-    
-    return this.getOrderFromHash(orderId);
+    // Keep trying until we find a valid order or exhaust the book
+    while (true) {
+      const results = await redis.zrange(key, 0, 0, 'WITHSCORES');
+      
+      if (results.length < 2) return null;
+      
+      const [member] = results;
+      const [orderId] = member.split(':');
+      
+      const order = await this.getOrderFromHash(orderId);
+      
+      if (order) {
+        return order;
+      }
+      
+      // Orphaned entry - remove it and try next
+      logger.warn(`Removing orphaned orderbook entry: ${orderId}`);
+      await redis.zrem(key, member);
+    }
   }
 
   /**
    * Get the best ask (lowest sell price)
+   * Auto-cleans orphaned entries (sorted set entries without hash data)
    */
   async getBestAsk(marketId: string, outcome: 'YES' | 'NO'): Promise<OrderbookOrder | null> {
     const key = RedisKeys.orderbook(marketId, outcome, 'ASK');
     
-    // Get first element (lowest ask)
-    const results = await redis.zrange(key, 0, 0, 'WITHSCORES');
-    
-    if (results.length < 2) return null;
-    
-    const [member] = results;
-    const [orderId] = member.split(':');
-    
-    return this.getOrderFromHash(orderId);
+    // Keep trying until we find a valid order or exhaust the book
+    while (true) {
+      const results = await redis.zrange(key, 0, 0, 'WITHSCORES');
+      
+      if (results.length < 2) return null;
+      
+      const [member] = results;
+      const [orderId] = member.split(':');
+      
+      const order = await this.getOrderFromHash(orderId);
+      
+      if (order) {
+        return order;
+      }
+      
+      // Orphaned entry - remove it and try next
+      logger.warn(`Removing orphaned orderbook entry: ${orderId}`);
+      await redis.zrem(key, member);
+    }
   }
 
   /**

@@ -54,8 +54,13 @@ export const config = {
   jwtSecret: process.env.JWT_SECRET || 'dev-secret-change-in-production',
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '24h',
   
-  // CORS
-  corsOrigin: process.env.CORS_ORIGIN || 'http://localhost:3000',
+  // CORS - supports: "*", single origin, or comma-separated origins
+  corsOrigin: (() => {
+    const origin = process.env.CORS_ORIGIN || 'http://localhost:3000';
+    if (origin === '*' || origin === 'true') return true;
+    if (origin.includes(',')) return origin.split(',').map(o => o.trim());
+    return origin;
+  })(),
   
   // Solana
   solanaNetwork: process.env.SOLANA_NETWORK || 'devnet',
@@ -81,7 +86,9 @@ export const config = {
   disableMmOrderPersistence: process.env.DISABLE_MM_ORDER_PERSISTENCE === 'true',
 
   // Devnet/testing: if the book is empty, force-fill market orders against MM at a reasonable price.
-  devAlwaysFillMarketOrders: process.env.DEV_ALWAYS_FILL_MARKET_ORDERS === 'true',
+  // DEPRECATED: Now that MM bot is working properly, this should be disabled to use real orderbook matching.
+  // Only enable for testing when no MM is running.
+  devAlwaysFillMarketOrders: process.env.DEV_ALWAYS_FILL_MARKET_ORDERS === 'true' && process.env.MM_ENABLED !== 'true',
   
   // Fees
   makerFeeBps: 0,    // 0.00%

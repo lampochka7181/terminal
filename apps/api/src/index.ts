@@ -26,8 +26,8 @@ import { startKeeperJobs, stopKeeperJobs } from './jobs/index.js';
 // Price Feed
 import { priceFeedService } from './services/price-feed.service.js';
 
-// Market Maker Bot
-import { mmBot } from './bot/mm-bot.js';
+// Market Maker Bot V2
+import { mmBotV2 } from './bot/mm-bot-v2.js';
 
 // Anchor Client (for config endpoint)
 import { anchorClient } from './lib/anchor-client.js';
@@ -114,7 +114,7 @@ async function main() {
     origin: config.corsOrigin,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning'],
   });
 
   // JWT
@@ -165,7 +165,7 @@ async function main() {
     ]);
     
     const priceFeedHealth = priceFeedService.isHealthy();
-    const mmStatus = mmBot.getStatus();
+    const mmStatus = mmBotV2.getStatus();
 
     const status = dbHealth ? 'ok' : 'degraded';
 
@@ -182,6 +182,7 @@ async function main() {
       },
       marketMaker: {
         enabled: config.mmEnabled,
+        version: 'v2',
         running: mmStatus.running,
         markets: mmStatus.markets,
         orders: mmStatus.totalOrders,
@@ -276,32 +277,36 @@ async function main() {
 
   // MM Bot debug endpoint (for testing)
   app.get('/debug/mm', async () => {
-    const status = mmBot.getStatus();
+    const status = mmBotV2.getStatus();
     
     // Get quote info for each market
     const marketQuotes: Record<string, any> = {};
     for (const market of status.marketDetails) {
-      const quoteInfo = await mmBot.getQuoteInfo(market.id);
+      const quoteInfo = await mmBotV2.getQuoteInfo(market.id);
       if (quoteInfo) {
         marketQuotes[market.id] = {
           asset: market.asset,
           timeframe: market.timeframe,
           strike: market.strike,
           currentPrice: quoteInfo.currentPrice,
-          fairValue: quoteInfo.fairValue,
-          inventorySkew: quoteInfo.inventorySkew,
-          yesBids: quoteInfo.quotes.bids,
-          yesAsks: quoteInfo.quotes.asks,
+          fairValueYes: quoteInfo.fairValueYes,
+          fairValueNo: quoteInfo.fairValueNo,
+          spread: quoteInfo.spread,
+          skew: quoteInfo.skew,
+          quotes: quoteInfo.quotes,
           position: {
-            yes: market.yesPosition,
-            no: market.noPosition,
+            yes: quoteInfo.yesPosition,
+            no: quoteInfo.noPosition,
+            imbalance: quoteInfo.imbalance,
           },
-          secondsToExpiry: market.secondsToExpiry,
+          secondsToExpiry: quoteInfo.timeToExpirySeconds,
+          timeRemainingPct: quoteInfo.timeRemainingPct,
         };
       }
     }
     
     return {
+      version: 'v2',
       status: {
         running: status.running,
         initialized: status.initialized,
@@ -309,7 +314,10 @@ async function main() {
         userId: status.userId,
         totalMarkets: status.markets,
         totalOrders: status.totalOrders,
+        wsConnected: status.wsConnected,
+        totalImbalance: status.totalImbalance,
       },
+      config: status.config,
       markets: marketQuotes,
     };
   });
@@ -434,7 +442,7 @@ async function main() {
     logger.info(`Received ${signal}, shutting down gracefully...`);
     
     try {
-      await mmBot.stop();
+      await mmBotV2.stop();
       priceFeedService.stop();
       stopKeeperJobs();
       await app.close();
@@ -475,8 +483,8 @@ async function main() {
     
     // Start Market Maker Bot (if enabled)
     if (config.mmEnabled) {
-      await mmBot.start();
-      logger.info('🤖 MM Bot started');
+      await mmBotV2.start();
+      logger.info('🤖 MM Bot V2 started');
     } else {
       logger.info('🤖 MM Bot disabled (set MM_ENABLED=true to enable)');
     }

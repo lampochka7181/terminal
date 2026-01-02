@@ -1,24 +1,81 @@
-Alex notes
+## MM Bot V2 - Implementation Notes
 
-Market maker 
+**Status: ✅ IMPLEMENTED** (see `apps/api/src/bot/mm-bot-v2.ts`)
 
-1. spread should be configurable 
-2. size should be configurable 
-3. MM order book should be in relation to underlying asset( MM bid/asks should be in correlation to how far underlying asset is from strike price in either direction)
-for exanmple strike 95000, current price of underlying 98000 then above strike should be quoted for much higher than below strike 
+### Requirements Implemented:
 
-4. MM order book should also be in relation to how much time until market expiry or theta.
+1. ✅ **Spread configurable** - `MM_BASE_SPREAD`, `MM_MIN_SPREAD`, `MM_MAX_SPREAD`
+2. ✅ **Size configurable** - `MM_BASE_SIZE`, `MM_MAX_SIZE`, `MM_MIN_SIZE`, `MM_LEVELS`
+3. ✅ **Price relative to underlying** - Black-Scholes N(d2) fair value calculation
+4. ✅ **Time decay (theta)** - Quotes adjust based on time remaining, stops quoting losing side near expiry
+5. ✅ **Delta neutral** - Inventory skewing with configurable thresholds and aggressive rebalancing
+6. ✅ **WebSocket integration** - Real-time price updates via WebSocket
+7. ⏳ **Dashboard** - Debug endpoint at `/debug/mm`, GUI dashboard TBD
 
-it should be as percent of time left for current market. if 10% left until expiry for lets say 5M market and market price is way above current  strike price the order book should have very low or even 0 bids for below strike contracts. 
+### Environment Variables
 
-5. MM should always stay delta neutral or very close to delta neutral at end of market expiration 
+```bash
+# Enable MM bot v2 (default)
+MM_VERSION=v2              # Use 'v1' for legacy bot
+MM_ENABLED=true
 
-its ok for MM to have lean into yes or no contracts during first 20-30% of market trading session. If market maker has high exposure to one contract with market less than 60-70% left it should aggresively adjust its order book to become delta neutral. 
+# Spread Configuration
+MM_BASE_SPREAD=0.04        # Base spread (4 cents total)
+MM_MIN_SPREAD=0.02         # Minimum spread (never tighter)
+MM_MAX_SPREAD=0.20         # Maximum spread (widen in uncertainty)
 
+# Size Configuration
+MM_BASE_SIZE=100           # Base contracts per level
+MM_MAX_SIZE=1000           # Maximum size per level
+MM_MIN_SIZE=10             # Minimum size to quote
+MM_LEVELS=3                # Number of price levels on each side
+MM_LEVEL_SPACING=0.01      # Price increment between levels
 
-6. I thinking for MM it might be better to use websocket to stream orders instead of API 
+# Inventory / Delta Neutral Settings
+MM_MAX_POSITION=10000      # Maximum position per outcome
+MM_MAX_IMBALANCE=5000      # Maximum YES - NO imbalance
+MM_SKEW_FACTOR=0.02        # How aggressively to skew (max 2 cents)
+MM_REBALANCE_START_PCT=0.70      # Start aggressive rebalancing (70% time elapsed)
+MM_CRITICAL_REBALANCE_PCT=0.90   # Critical rebalancing (90% time elapsed)
 
-7. Maybe create a special dashboard on gui to see total exposures for each market on MM wallet 
+# Time Settings
+MM_QUOTE_UPDATE_MS=1000           # Update quotes every 1 second
+MM_CLOSE_BEFORE_EXPIRY_MS=30000   # Stop quoting 30s before expiry
+MM_STOP_QUOTING_LOSER_PCT=0.10    # Stop quoting losing side in last 10%
+
+# Volatility
+MM_DEFAULT_VOLATILITY=0.50        # 50% annualized volatility
+MM_VOLATILITY_OVERRIDES='{"BTC":0.40,"ETH":0.60}'  # Per-asset overrides (JSON)
+
+# Assets
+MM_ASSETS=BTC,ETH,SOL             # Which assets to market make
+
+# WebSocket
+MM_USE_WEBSOCKET=true             # Enable WebSocket for price updates
+MM_WS_RECONNECT_MS=5000           # Reconnect interval on disconnect
+```
+
+### Key Algorithms
+
+#### Fair Value (Black-Scholes d2)
+```
+P(YES wins) = N(d2)
+where d2 = ln(current_price / strike) / (σ × √T)
+```
+
+#### Inventory Skewing
+- Positive skew when holding too much YES → lowers all prices
+- Negative skew when holding too much NO → raises all prices
+- Skew multiplied by 2x after 70% time elapsed, 4x after 90%
+
+#### Dynamic Spread
+- Widens 50% when fair value > 0.85 or < 0.15
+- Widens 50% in last 20%, 100% in last 10%
+- Widens with inventory imbalance
+
+#### Time-Decay Quote Reduction
+- Stops quoting bids on losing side when < 10% time remains
+- Example: If YES = 0.10 with 5% time left, won't bid on YES
 
 _____________________________________
 
@@ -615,4 +672,45 @@ async def simple_mm():
         
         await asyncio.sleep(1)
 ```
+
+---
+
+## Orderbook Display: Option 3 Implemented ✅
+
+### Design Decision
+We implemented **Option 3: Single YES-Focused Book** as it provides the simplest UX for binary markets.
+
+### Current Implementation (`SingleOrderbook.tsx`)
+```
+          ORDER BOOK
+  Size    ABOVE    BELOW    Total
+  ─────────────────────────────────
+  100     $0.62    $0.38    100    ← Asks (sells)
+  100     $0.64    $0.36    200
+  ────────── SPREAD $0.04 ──────────
+  100     $0.58    $0.42    100    ← Bids (buys)
+  100     $0.56    $0.44    200
+```
+
+**Key Features:**
+- Shows YES (ABOVE) prices in green, NO (BELOW) prices in red
+- NO price is always calculated as `1 - YES price` (implied)
+- Clicking a price level sets it as limit price in the trade panel
+- Real-time updates via WebSocket with flash animations
+- Spread indicator between bids and asks
+
+### Why Option 3?
+| Option | Pros | Cons |
+|--------|------|------|
+| Full (4 lists) | Complete info | Redundant, overwhelming |
+| Bids Only | Shows demand | Hides liquidity |
+| **YES-Focused** ✅ | Simple, intuitive | Industry standard |
+
+### Key Insight: Sell YES ≈ Buy NO
+| User Action | Economically Equivalent To |
+|-------------|---------------------------|
+| Sell YES | Reduces YES exposure (or increases NO) |
+| Buy NO | Increases NO exposure |
+| Bid YES @ 0.60 | Willing to take YES risk at 60% implied prob |
+| Bid NO @ 0.40 | Willing to take NO risk at 40% implied prob |
 

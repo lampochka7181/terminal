@@ -3,9 +3,10 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useUser } from '@/hooks/useUser';
 import { cn } from '@/lib/utils';
-import { Clock, TrendingUp, TrendingDown, X, RefreshCw, ArrowRightLeft, ExternalLink, History } from 'lucide-react';
+import { Clock, TrendingUp, TrendingDown, X, RefreshCw, ArrowRightLeft, ExternalLink, History, DollarSign, Percent, Target } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useOrder } from '@/hooks/useOrder';
+import { useSettingsStore } from '@/stores/settingsStore';
 import type { Position as ApiPosition, Order as ApiOrder, Settlement, UserTransaction } from '@/lib/api';
 
 type Tab = 'active' | 'history';
@@ -29,10 +30,20 @@ interface UnifiedTrade {
   createdAt: number;
 }
 
-export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome: 'YES' | 'NO', shares: number, avgEntry: number, price: number, timeframe: any, expiry: number) => void }) {
+interface PositionsProps {
+  onSell?: (marketAddress: string, outcome: 'YES' | 'NO', shares: number, avgEntry: number, price: number, timeframe: any, expiry: number) => void;
+  // Real-time prices for the currently viewed market (from orderbook)
+  currentMarketAddress?: string;
+  currentYesPrice?: number;
+  currentNoPrice?: number;
+}
+
+export function Positions({ onSell, currentMarketAddress, currentYesPrice, currentNoPrice }: PositionsProps) {
   const [activeTab, setActiveTab] = useState<Tab>('active');
+  const [, setTick] = useState(0); // Force re-render for expiry filtering
   const { isAuthenticated } = useAuthStore();
   const { cancelOrder, isCancelling } = useOrder();
+  const { showPnLPercent } = useSettingsStore();
   
   const { 
     positions: apiPositions, 
@@ -44,6 +55,14 @@ export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome
     refetchAll
   } = useUser();
 
+  // Auto-refresh every 10 seconds to filter out newly expired positions
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setTick(t => t + 1); // Force re-render to re-evaluate expiry filters
+    }, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
   const handleCancel = async (orderId: string) => {
     if (confirm('Are you sure you want to cancel this order?')) {
       const success = await cancelOrder(orderId);
@@ -54,17 +73,31 @@ export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome
   };
 
   // Process positions into unified format
+  // Use real-time orderbook prices for the current market if available
+  // Filter out expired positions automatically
   const positions: UnifiedTrade[] = useMemo(() => {
+    const now = Date.now();
     return (apiPositions || [])
-      .filter((p: ApiPosition) => p.yesShares > 0 || p.noShares > 0)
+      .filter((p: ApiPosition) => {
+        // Must have shares
+        if (p.yesShares <= 0 && p.noShares <= 0) return false;
+        // Filter out expired positions (give 30 second buffer for settlement processing)
+        if (p.expiryAt && p.expiryAt < now - 30000) return false;
+        return true;
+      })
       .flatMap((p: ApiPosition) => {
         const results: UnifiedTrade[] = [];
         const asset = p.asset || p.market.split('-')[0] || 'BTC';
         const expiryAt = p.expiryAt || 0;
         
+        // Use real-time prices if this is the current market, otherwise use API data
+        const isCurrentMarket = currentMarketAddress && p.marketAddress === currentMarketAddress;
+        const yesPrice = isCurrentMarket && currentYesPrice !== undefined ? currentYesPrice : p.currentPrice;
+        const noPrice = isCurrentMarket && currentNoPrice !== undefined ? currentNoPrice : (1 - p.currentPrice);
+        
         if (p.yesShares > 0) {
-          const pnl = (p.currentPrice - p.avgEntryPrice) * p.yesShares;
-          const pnlPercent = p.avgEntryPrice > 0 ? ((p.currentPrice - p.avgEntryPrice) / p.avgEntryPrice) * 100 : 0;
+          const pnl = (yesPrice - p.avgEntryPrice) * p.yesShares;
+          const pnlPercent = p.avgEntryPrice > 0 ? ((yesPrice - p.avgEntryPrice) / p.avgEntryPrice) * 100 : 0;
           results.push({
             id: `pos-${p.marketAddress}-yes`,
             type: 'position',
@@ -77,7 +110,7 @@ export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome
             size: p.yesShares,
             filled: p.yesShares,
             price: p.avgEntryPrice,
-            currentPrice: p.currentPrice,
+            currentPrice: yesPrice,
             pnl,
             pnlPercent,
             status: p.status.toUpperCase(),
@@ -86,10 +119,9 @@ export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome
         }
         
         if (p.noShares > 0) {
-          const noCurrentPrice = 1 - p.currentPrice;
           const noAvgEntry = p.avgEntryPrice;
-          const pnl = (noCurrentPrice - noAvgEntry) * p.noShares;
-          const pnlPercent = noAvgEntry > 0 ? ((noCurrentPrice - noAvgEntry) / noAvgEntry) * 100 : 0;
+          const pnl = (noPrice - noAvgEntry) * p.noShares;
+          const pnlPercent = noAvgEntry > 0 ? ((noPrice - noAvgEntry) / noAvgEntry) * 100 : 0;
           results.push({
             id: `pos-${p.marketAddress}-no`,
             type: 'position',
@@ -102,7 +134,7 @@ export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome
             size: p.noShares,
             filled: p.noShares,
             price: noAvgEntry,
-            currentPrice: noCurrentPrice,
+            currentPrice: noPrice,
             pnl,
             pnlPercent,
             status: p.status.toUpperCase(),
@@ -112,12 +144,20 @@ export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome
         
         return results;
       });
-  }, [apiPositions]);
+  }, [apiPositions, currentMarketAddress, currentYesPrice, currentNoPrice]);
 
   // Process orders into unified format
+  // Filter out expired orders automatically
   const orders: UnifiedTrade[] = useMemo(() => {
+    const now = Date.now();
     return (apiOrders || [])
-      .filter((o: ApiOrder) => o.status === 'open' || o.status === 'partial' || o.status === 'filled')
+      .filter((o: ApiOrder) => {
+        // Must be active status
+        if (o.status !== 'open' && o.status !== 'partial' && o.status !== 'filled') return false;
+        // Filter out expired orders (give 30 second buffer)
+        if (o.expiryAt && o.expiryAt < now - 30000) return false;
+        return true;
+      })
       .map((o: ApiOrder) => ({
         id: `ord-${o.id}`,
         type: 'order',
@@ -217,6 +257,7 @@ export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome
             onSell={onSell} 
             onCancel={handleCancel}
             isCancelling={isCancelling}
+            showPnLPercent={showPnLPercent}
           />
         )}
         {activeTab === 'history' && (
@@ -228,19 +269,36 @@ export function Positions({ onSell }: { onSell?: (marketAddress: string, outcome
       </div>
 
       {activeTab === 'active' && positions.length > 0 && (
-        <div className="px-4 py-3 bg-surface-light/50 border-t border-border flex items-center justify-between text-sm">
-          <div className="flex items-center gap-4">
-            <span className="text-text-muted">Net Exposure: <span className="font-mono text-text-primary font-bold">${totalValue.toFixed(2)}</span></span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-text-muted">Total P&L:</span>
-            <span className={cn(
-              'font-mono font-black flex items-center gap-1',
-              totalPnl >= 0 ? 'text-long' : 'text-short'
+        <div className="px-4 py-3 bg-surface-light/50 border-t border-border">
+          <div className="flex items-center justify-between">
+            {/* Portfolio Summary */}
+            <div className="flex items-center gap-6">
+              <div className="flex flex-col">
+                <span className="text-[10px] uppercase tracking-wider text-text-muted font-bold">Positions</span>
+                <span className="font-mono font-bold text-text-primary">{positions.length}</span>
+              </div>
+              <div className="flex flex-col">
+                <span className="text-[10px] uppercase tracking-wider text-text-muted font-bold">Net Value</span>
+                <span className="font-mono font-bold text-text-primary">${totalValue.toFixed(2)}</span>
+              </div>
+            </div>
+            
+            {/* Total P&L - Prominent Display */}
+            <div className={cn(
+              'flex items-center gap-2 px-4 py-2 rounded-lg',
+              totalPnl >= 0 ? 'bg-long/10' : 'bg-short/10'
             )}>
-              {totalPnl >= 0 ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
-              {totalPnl >= 0 ? '+' : ''}${Math.abs(totalPnl).toFixed(2)}
-            </span>
+              <div className="flex flex-col items-end">
+                <span className="text-[10px] uppercase tracking-wider text-text-muted font-bold">Unrealized P&L</span>
+                <span className={cn(
+                  'font-mono text-lg font-black flex items-center gap-1',
+                  totalPnl >= 0 ? 'text-long' : 'text-short'
+                )}>
+                  {totalPnl >= 0 ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
+                  {totalPnl >= 0 ? '+' : ''}${Math.abs(totalPnl).toFixed(2)}
+                </span>
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -253,18 +311,29 @@ function UnifiedTable({
   isLoading, 
   onSell,
   onCancel,
-  isCancelling
+  isCancelling,
+  showPnLPercent = true
 }: { 
   trades: UnifiedTrade[]; 
   isLoading: boolean;
   onSell?: (marketAddress: string, outcome: 'YES' | 'NO', shares: number, avgEntry: number, price: number, timeframe: any, expiry: number) => void;
   onCancel: (id: string) => void;
   isCancelling: boolean;
+  showPnLPercent?: boolean;
 }) {
   if (isLoading && trades.length === 0) {
     return (
       <div className="divide-y divide-border">
-        {[1, 2, 3].map(i => <div key={i} className="h-16 bg-surface animate-pulse" />)}
+        {[1, 2, 3].map(i => (
+          <div key={i} className="h-20 px-4 py-3 flex items-center gap-4">
+            <div className="w-16 h-8 rounded skeleton" />
+            <div className="flex-1 space-y-2">
+              <div className="w-24 h-4 rounded skeleton" />
+              <div className="w-16 h-3 rounded skeleton" />
+            </div>
+            <div className="w-20 h-6 rounded skeleton" />
+          </div>
+        ))}
       </div>
     );
   }
@@ -272,8 +341,11 @@ function UnifiedTable({
   if (trades.length === 0) {
     return (
       <div className="text-center py-16 text-text-muted">
-        <TrendingUp className="w-8 h-8 mx-auto opacity-20 mb-2" />
-        <p>No active trades or positions</p>
+        <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-surface-light flex items-center justify-center">
+          <Target className="w-8 h-8 opacity-30" />
+        </div>
+        <p className="text-lg font-medium mb-1">No active positions</p>
+        <p className="text-sm">Start trading to see your positions here</p>
       </div>
     );
   }
@@ -283,12 +355,12 @@ function UnifiedTable({
       <table className="w-full text-left border-collapse table-fixed">
         <thead>
           <tr className="text-[9px] sm:text-[10px] text-text-muted uppercase tracking-widest border-b border-border bg-surface-light/10">
-            <th className="px-2 sm:px-4 py-3 font-bold w-[30%]">Market</th>
-            <th className="px-2 py-3 font-bold text-right w-[15%]">Size</th>
-            <th className="px-2 py-3 font-bold text-right w-[18%]">Avg Price</th>
-            <th className="px-2 py-3 font-bold text-right w-[15%]">Fill %</th>
-            <th className="px-2 py-3 font-bold text-right w-[15%]">PnL</th>
-            <th className="px-2 sm:px-4 py-3 font-bold text-right w-[7%]"></th>
+            <th className="px-2 sm:px-4 py-3 font-bold w-[28%]">Market</th>
+            <th className="px-2 py-3 font-bold text-right w-[14%]">Size</th>
+            <th className="px-2 py-3 font-bold text-right w-[16%]">Entry</th>
+            <th className="px-2 py-3 font-bold text-right w-[14%]">Now</th>
+            <th className="px-2 py-3 font-bold text-right w-[20%]">P&L</th>
+            <th className="px-2 sm:px-4 py-3 font-bold text-right w-[8%]"></th>
           </tr>
         </thead>
         <tbody className="divide-y divide-border/50">
@@ -299,6 +371,7 @@ function UnifiedTable({
               onSell={onSell} 
               onCancel={onCancel}
               isCancelling={isCancelling}
+              showPnLPercent={showPnLPercent}
             />
           ))}
         </tbody>
@@ -311,98 +384,141 @@ function TradeRow({
   trade, 
   onSell,
   onCancel,
-  isCancelling
+  isCancelling,
+  showPnLPercent = true
 }: { 
   trade: UnifiedTrade;
   onSell?: (marketAddress: string, outcome: 'YES' | 'NO', shares: number, avgEntry: number, price: number, timeframe: any, expiry: number) => void;
   onCancel: (id: string) => void;
   isCancelling: boolean;
+  showPnLPercent?: boolean;
 }) {
   const timeframe = trade.market.split('-')[1];
-  const fillPercent = (trade.filled / trade.size) * 100;
   const isOrder = trade.type === 'order';
+  
+  // Calculate potential payout for positions
+  const potentialPayout = !isOrder ? trade.size * 1.00 : 0;
+  const potentialProfit = !isOrder ? potentialPayout - (trade.size * trade.price) : 0;
 
   return (
     <tr className={cn(
-      "hover:bg-surface-light/30 transition-colors group",
+      "hover:bg-surface-light/30 transition-colors group animate-fade-in",
       isOrder && "bg-accent/5"
     )}>
+      {/* Market Info */}
       <td className="px-2 sm:px-4 py-3">
         <div className="flex flex-col min-w-0">
           <div className="flex items-center gap-1.5 overflow-hidden">
             <span className="font-bold text-xs sm:text-sm truncate">{trade.market}</span>
             <span className={cn(
-              'px-1 py-0.5 rounded text-[8px] sm:text-[9px] font-black uppercase flex-shrink-0',
+              'px-1.5 py-0.5 rounded text-[8px] sm:text-[9px] font-black uppercase flex-shrink-0',
               trade.outcome === 'YES' ? 'bg-long/20 text-long' : 'bg-short/20 text-short'
             )}>
-              {trade.outcome}
+              {trade.outcome === 'YES' ? 'ABOVE' : 'BELOW'}
             </span>
             {isOrder && (
-              <span className="px-1 py-0.5 rounded text-[8px] bg-accent/20 text-accent font-black uppercase">PENDING</span>
+              <span className="px-1.5 py-0.5 rounded text-[8px] bg-warning/20 text-warning font-black uppercase animate-pulse">PENDING</span>
             )}
           </div>
-          <div className="flex items-center gap-1 text-[9px] text-text-muted font-mono mt-0.5">
+          <div className="flex items-center gap-1 text-[9px] text-text-muted font-mono mt-1">
             <Clock className="w-2.5 h-2.5" />
             <ExpiryCountdown expiry={trade.expiryAt} />
           </div>
         </div>
       </td>
-      <td className="px-2 py-3 text-right font-mono text-xs sm:text-sm font-medium truncate">
-        {trade.size.toFixed(0)}
-      </td>
+      
+      {/* Size */}
       <td className="px-2 py-3 text-right">
         <div className="flex flex-col items-end">
-          <span className="text-text-primary font-bold text-xs sm:text-sm">${trade.price.toFixed(2)}</span>
-          {!isOrder && (
-            <span className="text-[9px] sm:text-[10px] text-text-muted">Now: ${trade.currentPrice.toFixed(2)}</span>
-          )}
-        </div>
-      </td>
-      <td className="px-2 py-3 text-right">
-        <div className="flex flex-col items-end">
-          <span className="font-mono text-xs font-bold text-text-primary">
-            {fillPercent.toFixed(0)}%
+          <span className="font-mono text-xs sm:text-sm font-bold text-text-primary">
+            {trade.size.toFixed(0)}
           </span>
-          <div className="w-12 h-1 bg-surface-light rounded-full overflow-hidden mt-1 border border-border/50">
-            <div 
-              className={cn(
-                "h-full transition-all duration-1000",
-                isOrder ? "bg-accent" : "bg-long"
-              )}
-              style={{ width: `${fillPercent}%` }} 
-            />
-          </div>
+          <span className="text-[9px] text-text-muted">
+            contracts
+          </span>
         </div>
       </td>
+      
+      {/* Entry Price */}
+      <td className="px-2 py-3 text-right">
+        <span className="font-mono text-xs sm:text-sm font-medium text-text-secondary">
+          ${trade.price.toFixed(2)}
+        </span>
+      </td>
+      
+      {/* Current Price (only for positions) */}
+      <td className="px-2 py-3 text-right">
+        {!isOrder ? (
+          <span className={cn(
+            "font-mono text-xs sm:text-sm font-bold",
+            trade.currentPrice > trade.price ? "text-long" : trade.currentPrice < trade.price ? "text-short" : "text-text-primary"
+          )}>
+            ${trade.currentPrice.toFixed(2)}
+          </span>
+        ) : (
+          <span className="text-text-muted text-xs">--</span>
+        )}
+      </td>
+      
+      {/* P&L Display - Enhanced */}
       <td className="px-2 py-3 text-right">
         {trade.pnl !== undefined ? (
           <div className="flex flex-col items-end">
+            {/* Main P&L Value */}
             <div className={cn(
-              'font-mono text-xs sm:text-sm font-black flex items-center gap-0.5',
-              trade.pnl >= 0 ? 'text-long' : 'text-short'
+              'flex items-center gap-1 px-2 py-1 rounded-md font-mono text-sm sm:text-base font-black transition-all',
+              trade.pnl >= 0 
+                ? 'text-long bg-long/10' 
+                : 'text-short bg-short/10'
             )}>
-              {trade.pnl >= 0 ? '+' : '-'}${Math.abs(trade.pnl).toFixed(2)}
+              {trade.pnl >= 0 ? (
+                <TrendingUp className="w-3.5 h-3.5 flex-shrink-0" />
+              ) : (
+                <TrendingDown className="w-3.5 h-3.5 flex-shrink-0" />
+              )}
+              <span>{trade.pnl >= 0 ? '+' : ''}{trade.pnl.toFixed(2)}</span>
             </div>
-            <div className={cn(
-              'text-[9px] sm:text-[10px] font-bold',
-              (trade.pnlPercent || 0) >= 0 ? 'text-long/70' : 'text-short/70'
-            )}>
-              {(trade.pnlPercent || 0) >= 0 ? '+' : ''}{trade.pnlPercent?.toFixed(1)}%
-            </div>
+            
+            {/* Percentage (if enabled) */}
+            {showPnLPercent && (
+              <div className={cn(
+                'text-[10px] sm:text-xs font-bold mt-0.5 flex items-center gap-0.5',
+                (trade.pnlPercent || 0) >= 0 ? 'text-long/80' : 'text-short/80'
+              )}>
+                <Percent className="w-2.5 h-2.5" />
+                {(trade.pnlPercent || 0) >= 0 ? '+' : ''}{trade.pnlPercent?.toFixed(1)}%
+              </div>
+            )}
+            
+            {/* Max potential (for YES positions - settles at $1) */}
+            {!isOrder && potentialProfit > 0 && (
+              <div className="text-[9px] text-text-muted mt-1 flex items-center gap-0.5">
+                <span>Max: +${potentialProfit.toFixed(2)}</span>
+              </div>
+            )}
           </div>
         ) : (
-          <span className="text-text-muted font-mono">--</span>
+          <div className="flex items-center justify-end gap-1 text-text-muted">
+            <span className="font-mono text-sm">--</span>
+          </div>
         )}
       </td>
+      
+      {/* Actions */}
       <td className="px-2 sm:px-4 py-3 text-right">
         {isOrder ? (
           <button 
             onClick={() => onCancel(trade.id.replace('ord-', ''))}
             disabled={isCancelling}
-            className="p-1.5 text-text-muted hover:text-short hover:bg-short/10 rounded-lg transition-all"
+            className={cn(
+              "p-2 rounded-lg transition-all btn-press",
+              isCancelling 
+                ? "opacity-50 cursor-wait" 
+                : "text-text-muted hover:text-short hover:bg-short/10"
+            )}
             title="Cancel Order"
           >
-            <X className="w-3.5 h-3.5" />
+            <X className="w-4 h-4" />
           </button>
         ) : (
           <button 
@@ -415,10 +531,10 @@ function TradeRow({
               timeframe,
               trade.expiryAt
             )}
-            className="p-1.5 text-text-muted hover:text-warning hover:bg-warning/10 rounded-lg transition-all"
-            title="Sell Position"
+            className="p-2 text-text-muted hover:text-warning hover:bg-warning/10 rounded-lg transition-all btn-press"
+            title="Close Position"
           >
-            <ArrowRightLeft className="w-3.5 h-3.5" />
+            <ArrowRightLeft className="w-4 h-4" />
           </button>
         )}
       </td>

@@ -57,8 +57,6 @@ export function TradeModal({
   
   // MARKET order state
   const [dollarAmount, setDollarAmount] = useState('50');
-  const [priceProtection, setPriceProtection] = useState('0.10');
-  const [showAdvanced, setShowAdvanced] = useState(false);
   
   // LIMIT order state
   const [limitSize, setLimitSize] = useState('100');
@@ -84,8 +82,8 @@ export function TradeModal({
   
   // Calculate MARKET order estimates
   const dollarAmountNum = parseFloat(dollarAmount) || 0;
-  const priceProtectionNum = parseFloat(priceProtection) || 0.10;
-  const maxPrice = Math.min(0.99, price + priceProtectionNum);
+  // Market orders walk the book until filled - no price limit
+  const maxPrice = 0.99;
   const estimatedContracts = dollarAmountNum > 0 ? Math.floor(dollarAmountNum / price) : 0;
   const estimatedPayout = estimatedContracts * 1.0;
   const estimatedProfit = estimatedPayout - dollarAmountNum;
@@ -160,7 +158,9 @@ export function TradeModal({
       side: isSellMode ? 'ask' : 'bid',
       outcome: outcome.toLowerCase() as 'yes' | 'no',
       orderType: isSellMode ? 'market' : orderType.toLowerCase() as 'limit' | 'market',
-      price: isSellMode ? price : (orderType === 'MARKET' ? price : limitPriceNum),
+      // For MARKET sells, use minPrice: 0.01 to guarantee fill against bids
+      // Similar to how market buys use maxPrice: 0.99
+      price: isSellMode ? 0.01 : (orderType === 'MARKET' ? price : limitPriceNum),
       size: isSellMode ? sellSizeNum : (orderType === 'MARKET' ? estimatedContracts : limitSizeNum),
       expiryTimestamp,
       dollarAmount: (!isSellMode && orderType === 'MARKET') ? dollarAmountNum : undefined,
@@ -400,41 +400,6 @@ export function TradeModal({
                     </button>
                   ))}
                 </div>
-              </div>
-
-              {/* Price Protection */}
-              <div>
-                <button 
-                  onClick={() => setShowAdvanced(!showAdvanced)}
-                  className="flex items-center gap-1 text-xs text-text-muted hover:text-text-primary mb-2"
-                >
-                  <Settings className="w-3 h-3" />
-                  {showAdvanced ? 'Hide' : 'Show'} Price Protection
-                </button>
-                
-                {showAdvanced && (
-                  <div className="bg-surface-light rounded-lg p-3">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-sm text-text-muted">Max Slippage</span>
-                      <span className="text-sm font-mono">${priceProtection}</span>
-                    </div>
-                    <input
-                      type="range"
-                      value={parseFloat(priceProtection) * 100}
-                      onChange={(e) => setPriceProtection((parseInt(e.target.value) / 100).toFixed(2))}
-                      min="1"
-                      max="25"
-                      className="w-full accent-accent"
-                    />
-                    <div className="flex justify-between text-xs text-text-muted mt-1">
-                      <span>$0.01</span>
-                      <span>$0.25</span>
-                    </div>
-                    <div className="mt-2 text-xs text-text-muted">
-                      Current: ${price.toFixed(2)} → Max: ${maxPrice.toFixed(2)}
-                    </div>
-                  </div>
-                )}
               </div>
 
               {/* MARKET Summary */}

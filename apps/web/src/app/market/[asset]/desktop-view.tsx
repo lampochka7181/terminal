@@ -9,6 +9,7 @@ import { useMarkets } from '@/hooks/useMarkets';
 import { useAuth } from '@/hooks/useAuth';
 import { useQuickOrder } from '@/hooks/useOrder';
 import { useDelegation } from '@/hooks/useDelegation';
+import { useSettingsStore } from '@/stores/settingsStore';
 import { cn } from '@/lib/utils';
 import { 
   ArrowLeft, 
@@ -20,15 +21,16 @@ import {
   AlertCircle, 
   Clock, 
   Smartphone,
-  TrendingUp,
-  TrendingDown,
   Zap
 } from 'lucide-react';
 import type { Asset, Timeframe } from '@degen/types';
 import { Chart } from '@/components/trading/Chart';
 import { Positions } from '@/components/trading/Positions';
+import { SingleOrderbook } from '@/components/trading/SingleOrderbook';
 import { useMarketStore } from '@/stores/marketStore';
 import { WalletButton } from '@/components/WalletButton';
+import { useOrderbookStore } from '@/stores/orderbookStore';
+import { useOrderbook } from '@/hooks/useOrderbook';
 
 const TIMEFRAMES: Timeframe[] = ['5m', '1h', '24h'];
 
@@ -43,6 +45,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   const { isAuthenticated, signIn, isAuthenticating } = useAuth();
   const { selectedTimeframe, setTimeframe, setAsset } = useMarketStore();
   const { isApproved: isDelegationApproved, isApproving, approve: approveDelegation, delegatedAmount } = useDelegation();
+  const { oneClickEnabled, oneClickAmount, confirmTrades, soundEnabled } = useSettingsStore();
 
   // Ensure store matches URL asset
   useEffect(() => {
@@ -63,6 +66,14 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   const activeMarket = useMemo(() => {
     return markets.find(m => m.timeframe === selectedTimeframe);
   }, [markets, selectedTimeframe]);
+  
+  // Subscribe to orderbook WebSocket updates - ensures store has live data
+  useOrderbook(activeMarket?.address ?? null);
+  
+  // Get REAL-TIME orderbook prices directly from the store for maximum sync
+  // This ensures price cards and orderbook component show identical data
+  const yesAsks = useOrderbookStore(state => state.yes.asks);
+  const yesBestAskFromStore = yesAsks[0]?.price;
   
   // Handle market expiry
   const handleMarketExpired = useCallback((marketId: string, timeframe: string) => {
@@ -91,9 +102,15 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   // Use the order hook
   const { placeOrder, isPlacing, error: orderError, clearError } = useQuickOrder();
 
-  // Calculate estimates
-  const yesPrice = activeMarket?.yesPrice ?? 0.50;
-  const noPrice = activeMarket?.noPrice ?? 0.50;
+  // Calculate estimates using REAL-TIME orderbook prices directly from store
+  // This ensures price cards show identical data to orderbook component
+  // Use best ask for buying price (what you'll pay), fallback to market data if empty
+  const yesPrice = (yesBestAskFromStore && yesBestAskFromStore > 0.01 && yesBestAskFromStore < 0.99) 
+    ? yesBestAskFromStore 
+    : (activeMarket?.yesPrice ?? 0.50);
+  // For YES-focused orderbook: BELOW price is always (1 - ABOVE price)
+  // This ensures prices always sum to $1.00 and stay in sync
+  const noPrice = 1 - yesPrice;
   const marketPrice = selectedOutcome === 'YES' ? yesPrice : noPrice;
   const limitPriceNum = parseFloat(limitPrice) || 0;
   const selectedPrice = orderType === 'limit' && limitPriceNum > 0 ? limitPriceNum : marketPrice;
@@ -120,6 +137,73 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   // Order state
   const [orderStatus, setOrderStatus] = useState<'idle' | 'placing' | 'success' | 'error'>('idle');
   const [orderResult, setOrderResult] = useState<{ message?: string } | null>(null);
+  
+  // One-click trading state
+  const [oneClickOutcome, setOneClickOutcome] = useState<'YES' | 'NO' | null>(null);
+
+  // One-click trading handler
+  const handleOneClickTrade = useCallback(async (outcome: 'YES' | 'NO', price: number) => {
+    if (!connected || !activeMarket || !isDelegationApproved || !oneClickEnabled) return;
+    
+    // Optional confirmation
+    if (confirmTrades && !window.confirm(`Quick trade: Buy $${oneClickAmount} of ${outcome === 'YES' ? 'ABOVE' : 'BELOW'} @ $${price.toFixed(2)}?`)) {
+      return;
+    }
+
+    setOneClickOutcome(outcome);
+    clearError();
+    setOrderStatus('placing');
+
+    const now = Math.floor(Date.now() / 1000);
+    const defaultExpiry = now + 3600;
+    const expiryTimestamp = activeMarket.expiry 
+      ? Math.min(Math.floor(activeMarket.expiry / 1000) - 60, defaultExpiry)
+      : defaultExpiry;
+
+    const estimatedContracts = Math.floor(oneClickAmount / price);
+    // Market orders walk the book until filled - no price limit
+    const maxPrice = 0.99;
+
+    const result = await placeOrder({
+      marketAddress: activeMarket.address,
+      side: 'bid',
+      outcome: outcome.toLowerCase() as 'yes' | 'no',
+      orderType: 'market',
+      price: price,
+      size: estimatedContracts,
+      expiryTimestamp,
+      dollarAmount: oneClickAmount,
+      maxPrice,
+    });
+
+    if (result && result.status !== 'cancelled' && (result.filledSize > 0 || result.status === 'open')) {
+      setOrderStatus('success');
+      setOrderResult({ message: `Bought ${result.filledSize || estimatedContracts} contracts` });
+      
+      // Play success sound if enabled
+      if (soundEnabled) {
+        try {
+          const audio = new Audio('/sounds/success.mp3');
+          audio.volume = 0.3;
+          audio.play().catch(() => {});
+        } catch {}
+      }
+      
+      setTimeout(() => {
+        setOrderStatus('idle');
+        setOrderResult(null);
+        setOneClickOutcome(null);
+      }, 2000);
+    } else {
+      setOrderStatus('error');
+      setOrderResult({ message: 'Order failed - try manual trade' });
+      setTimeout(() => {
+        setOrderStatus('idle');
+        setOrderResult(null);
+        setOneClickOutcome(null);
+      }, 3000);
+    }
+  }, [connected, activeMarket, isDelegationApproved, oneClickEnabled, oneClickAmount, confirmTrades, soundEnabled, placeOrder, clearError]);
 
   const handleQuickTrade = async () => {
     // Sell mode
@@ -137,7 +221,9 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
         side: 'ask',
         outcome: selectedOutcome.toLowerCase() as 'yes' | 'no',
         orderType: 'market',
-        price: sellPrice,
+        // For MARKET sells, use a low minPrice to guarantee fill (matches against bids)
+        // Similar to how market buys use maxPrice: 0.99 to guarantee fill
+        price: 0.01,
         size: sellSizeNum,
         expiryTimestamp,
       });
@@ -180,9 +266,9 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
       ? Math.min(Math.floor(activeMarket.expiry / 1000) - 60, defaultExpiry)
       : defaultExpiry;
 
-    const maxPrice = orderType === 'market' 
-      ? Math.min(0.99, marketPrice + 0.10)
-      : limitPriceNum;
+    // Market orders walk the book until filled - no price limit
+    // Limit orders use the user's specified price
+    const maxPrice = orderType === 'market' ? 0.99 : limitPriceNum;
 
     const result = await placeOrder({
       marketAddress: activeMarket.address,
@@ -215,8 +301,12 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
       setOrderStatus('error');
       setOrderResult({ message: 'Order cancelled - no sellers at this price' });
     } else {
+      // Order failed or returned null (validation error)
+      // Wait a tick for the error state to update from the hook
+      await new Promise(resolve => setTimeout(resolve, 50));
       setOrderStatus('error');
-      setOrderResult({ message: orderError || 'Order failed' });
+      // The orderError should now be set - if not, show generic message
+      setOrderResult({ message: 'Order failed - check validation errors above' });
     }
   };
   
@@ -238,8 +328,6 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
     ETH: 'Ethereum',
     SOL: 'Solana',
   };
-
-  const isAboveStrike = currentPrice && activeMarket ? currentPrice > activeMarket.strike : false;
 
   return (
     <div className="min-h-screen bg-background">
@@ -299,43 +387,23 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
           </div>
         ) : (
           <>
-            {/* Main Content Grid */}
-            <div className="grid grid-cols-12 gap-4 mb-6">
-              {/* LEFT: Chart (spans 8 columns) */}
-              <div className="col-span-12 lg:col-span-8">
+            {/* Main Content Grid - 3 column layout: Chart | Orderbook | Trading */}
+            <div className="grid grid-cols-12 gap-3 mb-6">
+              {/* LEFT: Chart (spans 6 columns - narrower) */}
+              <div className="col-span-12 lg:col-span-6">
                 <div className="bg-surface rounded-xl border border-border overflow-hidden h-[650px]">
-                  {/* Chart Header with Timeframe Selector */}
+                  {/* Chart Header with Compact Timeframe Selector & Countdown */}
                   <div className="flex items-center justify-between px-4 py-3 bg-surface-light/30 border-b border-border">
-                    <div className="flex items-center gap-4">
-                      <div>
-                        <span className="text-sm text-text-muted">Strike Price</span>
-                        <div className="font-mono text-xl text-warning font-bold">
-                          ${activeMarket.strike.toLocaleString()}
-                        </div>
-                      </div>
-                      <div className="h-10 w-px bg-border" />
-                      <div>
-                        <span className="text-sm text-text-muted">Current</span>
-                        <div className={cn(
-                          'font-mono text-xl font-bold flex items-center gap-1',
-                          isAboveStrike ? 'text-long' : 'text-short'
-                        )}>
-                          {isAboveStrike ? <TrendingUp className="w-5 h-5" /> : <TrendingDown className="w-5 h-5" />}
-                          ${currentPrice?.toLocaleString() || '--'}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Timeframe Selector */}
+                    {/* Compact Timeframe Selector */}
                     <div className="flex gap-1 p-1 bg-surface rounded-lg border border-border">
                       {TIMEFRAMES.map((tf) => (
                         <button
                           key={tf}
                           onClick={() => setTimeframe(tf)}
                           className={cn(
-                            "px-4 py-1.5 rounded-md text-sm font-bold transition-all",
+                            "px-4 py-2 rounded-md text-sm font-bold transition-all btn-press",
                             selectedTimeframe === tf 
-                              ? "bg-accent text-background shadow-sm" 
+                              ? "bg-accent text-background shadow-md shadow-accent/30" 
                               : "text-text-muted hover:text-text-primary hover:bg-surface-light"
                           )}
                         >
@@ -344,17 +412,33 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                       ))}
                     </div>
 
+                    {/* Compact Countdown Timer */}
                     <TimeCountdown market={activeMarket} onExpired={() => handleMarketExpired(activeMarket.id, activeMarket.timeframe)} />
                   </div>
 
                   {/* Chart */}
-                  <div className="h-[calc(100%-60px)]">
+                  <div className="h-[calc(100%-52px)]">
                     <Chart />
                   </div>
                 </div>
               </div>
 
-              {/* RIGHT: Trading Panel (spans 4 columns) - Same height as chart */}
+              {/* MIDDLE: Orderbook (spans 2 columns) */}
+              <div className="col-span-12 lg:col-span-2 h-[650px]">
+                {activeMarket && (
+                  <SingleOrderbook 
+                    marketAddress={activeMarket.address} 
+                    className="h-full"
+                    onPriceClick={(price, side) => {
+                      // Set limit price when clicking on orderbook
+                      setLimitPrice(price.toFixed(2));
+                      setOrderType('limit');
+                    }}
+                  />
+                )}
+              </div>
+
+              {/* RIGHT: Trading Panel (spans 4 columns) */}
               <div className="col-span-12 lg:col-span-4 h-[650px] flex flex-col">
                 {/* Compact Price Boxes - Horizontal Layout */}
                 <div className="grid grid-cols-2 gap-3 mb-3">
@@ -363,18 +447,50 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                     price={yesPrice}
                     outcome="YES"
                     isSelected={selectedOutcome === 'YES'}
-                    onSelect={() => setSelectedOutcome(selectedOutcome === 'YES' ? null : 'YES')}
+                    onSelect={() => {
+                      if (oneClickEnabled && isDelegationApproved && connected) {
+                        handleOneClickTrade('YES', yesPrice);
+                      } else {
+                        setSelectedOutcome(selectedOutcome === 'YES' ? null : 'YES');
+                      }
+                    }}
                     colorClass="long"
+                    oneClickEnabled={oneClickEnabled && isDelegationApproved && connected}
+                    oneClickAmount={oneClickAmount}
+                    isLoading={orderStatus === 'placing' && oneClickOutcome === 'YES'}
                   />
                   <CompactPriceBox
                     label="BELOW"
                     price={noPrice}
                     outcome="NO"
                     isSelected={selectedOutcome === 'NO'}
-                    onSelect={() => setSelectedOutcome(selectedOutcome === 'NO' ? null : 'NO')}
+                    onSelect={() => {
+                      if (oneClickEnabled && isDelegationApproved && connected) {
+                        handleOneClickTrade('NO', noPrice);
+                      } else {
+                        setSelectedOutcome(selectedOutcome === 'NO' ? null : 'NO');
+                      }
+                    }}
                     colorClass="short"
+                    oneClickEnabled={oneClickEnabled && isDelegationApproved && connected}
+                    oneClickAmount={oneClickAmount}
+                    isLoading={orderStatus === 'placing' && oneClickOutcome === 'NO'}
                   />
                 </div>
+                
+                {/* One-Click Status Toast */}
+                {orderStatus === 'success' && oneClickOutcome && (
+                  <div className="mb-3 p-3 bg-long/10 border border-long/30 rounded-lg flex items-center gap-2 text-long text-sm animate-fade-in">
+                    <CheckCircle className="w-4 h-4" />
+                    <span>{orderResult?.message}</span>
+                  </div>
+                )}
+                {orderStatus === 'error' && oneClickOutcome && (
+                  <div className="mb-3 p-3 bg-short/10 border border-short/30 rounded-lg flex items-center gap-2 text-short text-sm animate-shake">
+                    <XCircle className="w-4 h-4" />
+                    <span>{orderResult?.message}</span>
+                  </div>
+                )}
 
                 {/* Trade Panel - Fills remaining space */}
                 <div className="bg-surface rounded-xl border border-border flex-1 flex flex-col overflow-hidden">
@@ -672,6 +788,14 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                             </div>
                           )}
 
+                          {/* Hook validation errors (shown immediately from hook state) */}
+                          {orderError && orderStatus === 'idle' && (
+                            <div className="flex items-center gap-2 p-3 mb-3 bg-short/10 border border-short/30 rounded-lg text-short text-sm">
+                              <XCircle className="w-4 h-4" />
+                              <span>{orderError}</span>
+                            </div>
+                          )}
+
                           {/* Trade Button */}
                           {connected ? (
                             !isDelegationApproved ? (
@@ -749,11 +873,16 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                 <h2 className="font-bold text-lg">Positions / Portfolio</h2>
               </div>
               <div className="min-h-[250px]">
-                <Positions onSell={(marketAddress, outcome, shares, avgEntry, price) => {
-                  handleSellFromPositions(marketAddress, outcome, shares, avgEntry, price);
-                  // Scroll to trade panel
-                  window.scrollTo({ top: 0, behavior: 'smooth' });
-                }} />
+                <Positions 
+                  onSell={(marketAddress, outcome, shares, avgEntry, price) => {
+                    handleSellFromPositions(marketAddress, outcome, shares, avgEntry, price);
+                    // Scroll to trade panel
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                  }}
+                  currentMarketAddress={activeMarket?.address}
+                  currentYesPrice={yesPrice}
+                  currentNoPrice={noPrice}
+                />
               </div>
             </div>
           </>
@@ -772,6 +901,9 @@ function CompactPriceBox({
   isSelected,
   onSelect,
   colorClass,
+  oneClickEnabled = false,
+  oneClickAmount = 0,
+  isLoading = false,
 }: {
   label: string;
   price: number;
@@ -779,60 +911,87 @@ function CompactPriceBox({
   isSelected: boolean;
   onSelect: () => void;
   colorClass: 'long' | 'short';
+  oneClickEnabled?: boolean;
+  oneClickAmount?: number;
+  isLoading?: boolean;
 }) {
   return (
     <button
       onClick={onSelect}
+      disabled={isLoading}
       className={cn(
-        'relative p-4 rounded-xl border-2 transition-all text-center group overflow-hidden',
+        'relative p-4 rounded-xl border-2 transition-all text-center group overflow-hidden btn-press',
         'bg-surface hover:bg-surface-light',
         isSelected 
           ? colorClass === 'long' 
             ? 'border-long shadow-lg shadow-long/20' 
             : 'border-short shadow-lg shadow-short/20'
-          : 'border-border hover:border-opacity-50'
+          : 'border-border hover:border-opacity-50',
+        oneClickEnabled && !isLoading && 'ring-2 ring-warning/30 hover:ring-warning/50',
+        isLoading && 'opacity-75 cursor-wait'
       )}
     >
       {/* Background glow */}
       <div className={cn(
         'absolute inset-0 opacity-0 transition-opacity duration-300',
-        isSelected && 'opacity-100',
+        (isSelected || oneClickEnabled) && 'opacity-100',
         colorClass === 'long' ? 'bg-gradient-to-br from-long/10 to-transparent' : 'bg-gradient-to-br from-short/10 to-transparent'
       )} />
 
       <div className="relative">
-        {/* Price Display */}
-        <div className={cn(
-          'text-3xl font-bold font-mono mb-1 transition-transform',
-          colorClass === 'long' ? 'text-long' : 'text-short',
-          'group-hover:scale-105'
-        )}>
-          ${price.toFixed(2)}
-        </div>
-        
-        {/* Label Badge */}
-        <div className={cn(
-          'inline-block px-3 py-1 rounded-full text-xs font-bold',
-          colorClass === 'long' ? 'bg-long/20 text-long' : 'bg-short/20 text-short'
-        )}>
-          {label}
-        </div>
-
-        {/* Selected indicator */}
-        {isSelected && (
-          <div className={cn(
-            'absolute -top-1 -right-1 w-5 h-5 rounded-full flex items-center justify-center',
-            colorClass === 'long' ? 'bg-long' : 'bg-short'
-          )}>
-            <CheckCircle className="w-3 h-3 text-background" />
+        {/* Loading State */}
+        {isLoading ? (
+          <div className="flex flex-col items-center justify-center py-2">
+            <Loader2 className={cn(
+              'w-8 h-8 animate-spin mb-2',
+              colorClass === 'long' ? 'text-long' : 'text-short'
+            )} />
+            <span className="text-sm text-text-muted">Placing order...</span>
           </div>
+        ) : (
+          <>
+            {/* Price Display */}
+            <div className={cn(
+              'text-3xl font-bold font-mono mb-1 transition-transform',
+              colorClass === 'long' ? 'text-long' : 'text-short',
+              'group-hover:scale-105'
+            )}>
+              ${price.toFixed(2)}
+            </div>
+            
+            {/* Label Badge */}
+            <div className={cn(
+              'inline-block px-3 py-1 rounded-full text-xs font-bold',
+              colorClass === 'long' ? 'bg-long/20 text-long' : 'bg-short/20 text-short'
+            )}>
+              {label}
+            </div>
+
+            {/* One-Click Mode Indicator */}
+            {oneClickEnabled && (
+              <div className="mt-2 flex items-center justify-center gap-1 text-xs text-warning font-bold">
+                <Zap className="w-3 h-3" />
+                <span>Tap to buy ${oneClickAmount}</span>
+              </div>
+            )}
+
+            {/* Selected indicator */}
+            {isSelected && !oneClickEnabled && (
+              <div className={cn(
+                'absolute -top-1 -right-1 w-5 h-5 rounded-full flex items-center justify-center',
+                colorClass === 'long' ? 'bg-long' : 'bg-short'
+              )}>
+                <CheckCircle className="w-3 h-3 text-background" />
+              </div>
+            )}
+          </>
         )}
       </div>
     </button>
   );
 }
 
-// Time Countdown Component
+// Time Countdown Component - Large & Prominent
 function TimeCountdown({ 
   market, 
   onExpired 
@@ -891,35 +1050,44 @@ function TimeCountdown({
   if (!timeRemaining) return null;
 
   return (
-    <div className="flex items-center gap-3">
+    <div className="flex items-center gap-4">
+      {/* Large countdown display */}
       <div className={cn(
-        'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-mono',
+        'flex items-center gap-3 px-5 py-3 rounded-xl font-mono transition-all',
         timeRemaining.isExpired 
-          ? 'bg-warning/20 text-warning' 
+          ? 'bg-warning/20 text-warning border-2 border-warning/50' 
           : timeRemaining.urgent 
-            ? 'bg-short/20 text-short animate-pulse' 
-            : 'bg-surface-light text-text-primary'
+            ? 'bg-short/20 text-short border-2 border-short/50 animate-pulse' 
+            : 'bg-surface text-text-primary border-2 border-border'
       )}>
-        <Clock className="w-4 h-4" />
+        <Clock className={cn(
+          'transition-all',
+          timeRemaining.urgent ? 'w-7 h-7 animate-bounce' : 'w-6 h-6'
+        )} />
         {timeRemaining.isExpired ? (
-          <span className="flex items-center gap-1">
-            <RefreshCw className="w-3 h-3 animate-spin" />
+          <span className="flex items-center gap-2 text-xl font-bold">
+            <RefreshCw className="w-5 h-5 animate-spin" />
             Refreshing...
           </span>
         ) : (
-          <span>{timeRemaining.text}</span>
+          <span className={cn(
+            'font-bold tabular-nums tracking-wider',
+            timeRemaining.urgent ? 'text-3xl' : 'text-2xl'
+          )}>
+            {timeRemaining.text}
+          </span>
         )}
       </div>
       
-      {/* Progress bar */}
-      <div className="w-24 h-2 bg-surface-light rounded-full overflow-hidden border border-border">
+      {/* Large progress bar */}
+      <div className="w-40 h-3 bg-surface rounded-full overflow-hidden border-2 border-border">
         <div 
           className={cn(
             'h-full rounded-full transition-all duration-1000',
             timeRemaining.isExpired
               ? 'bg-warning'
               : timeRemaining.urgent 
-                ? 'bg-short' 
+                ? 'bg-short animate-pulse' 
                 : timeRemaining.percent > 50 
                   ? 'bg-long' 
                   : timeRemaining.percent > 25 
