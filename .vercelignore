@@ -1,0 +1,33 @@
+# Large directories
+apps/api/logs/
+packages/contracts/target/
+packages/contracts/test-ledger/
+
+# Dependencies (handled by Vercel, but explicit)
+node_modules/
+
+# Build artifacts
+.next/
+dist/
+build/
+.turbo/
+
+# Environment files
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Rust/Anchor
+**/*.rs.bk
+.anchor/
+
+# Assets (if not needed)
+assets/
+
+# Misc
+*.log
+coverage/
+

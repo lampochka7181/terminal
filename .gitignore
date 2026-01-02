@@ -52,3 +52,5 @@ target/
 
 # Solana
 test-ledger/
+.vercel
+.env*.local
