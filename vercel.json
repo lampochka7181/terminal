@@ -3,6 +3,6 @@
   "buildCommand": "pnpm --filter=@degen/types build && pnpm --filter=@degen/web build",
   "installCommand": "pnpm install --no-frozen-lockfile",
   "outputDirectory": "apps/web/.next",
-  "framework": null
+  "framework": "nextjs"
 }
 
