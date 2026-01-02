@@ -561,3 +561,4 @@ The Degen Terminal architecture **can** be adapted for Ethereum, but requires:
 
 The core business logic (matching, collateral, settlement) transfers cleanly. The main architectural change is moving from "trustless user orders" to "trust-minimized user intents" - a trade-off most Ethereum-based prediction markets have already made.
 
+
