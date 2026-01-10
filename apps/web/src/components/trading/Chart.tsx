@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
-import { createChart, IChartApi, ISeriesApi, CandlestickData, Time, IPriceLine } from 'lightweight-charts';
+import { createChart, IChartApi, ISeriesApi, CandlestickData, Time, IPriceLine, Coordinate } from 'lightweight-charts';
 import { useMarketStore, useSelectedMarket } from '@/stores/marketStore';
 import { useChartSettingsStore, CANDLE_INTERVALS, ColorScheme } from '@/stores/chartSettingsStore';
 import { cn } from '@/lib/utils';
@@ -688,7 +688,7 @@ export function Chart() {
             const secondsFromLastCandle = expiryTimeSec - lastCandleTime;
             
             // Calculate x position
-            x = lastCandleX + (secondsFromLastCandle * pixelsPerSecond);
+            x = (lastCandleX + (secondsFromLastCandle * pixelsPerSecond)) as Coordinate;
           }
         }
       }
@@ -707,7 +707,7 @@ export function Chart() {
             
             // Seconds from now to expiry
             const secondsToExpiry = expiryTimeSec - nowSec;
-            x = nowX + (secondsToExpiry * pixelsPerSecond);
+            x = (nowX + (secondsToExpiry * pixelsPerSecond)) as Coordinate;
           }
         }
       }
