@@ -46,6 +46,14 @@ export interface UserPosition {
   currentValue: number; // Current $ value
 }
 
+interface CandleData {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+}
+
 interface ChartV2Props {
   onPositionClick?: (position: UserPosition) => void;
   strikePrice?: number;
