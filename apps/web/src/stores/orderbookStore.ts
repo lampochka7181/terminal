@@ -1,6 +1,18 @@
 /**
- * Orderbook Store (v2)
- * Manages dual-outcome orderbook data (YES/NO) with tick-by-tick updates
+ * Orderbook Store (v3) - SINGLE ORDERBOOK MODEL
+ * 
+ * ARCHITECTURE:
+ * - Only YES orderbook is stored and updated from the backend
+ * - NO orderbook is DERIVED as the complement of YES orderbook
+ * - This ensures ABOVE + BELOW = $1.00 always (no arbitrage)
+ * 
+ * How it works:
+ * - YES BID @ $0.48 → NO ASK @ $0.52 (complement)
+ * - YES ASK @ $0.52 → NO BID @ $0.48 (complement)
+ * 
+ * When user buys NO @ $0.48:
+ * - They're matching against YES BID @ $0.52
+ * - Backend handles the transformation
  */
 
 import { create } from 'zustand';
@@ -51,11 +63,6 @@ interface OrderbookState {
   
   // Actions
   setOrderbook: (outcome: 'YES' | 'NO', bids: [number, number][], asks: [number, number][], sequenceId?: number) => void;
-  setBothOrderbooks: (
-    yesBids: [number, number][], yesAsks: [number, number][],
-    noBids: [number, number][], noAsks: [number, number][],
-    sequenceId?: number
-  ) => void;
   updateLevel: (outcome: 'YES' | 'NO', side: 'bid' | 'ask', price: number, size: number) => void;
   clearFlash: (outcome: 'YES' | 'NO', side: 'bid' | 'ask', price: number) => void;
   addTrade: (trade: Trade) => void;
@@ -148,52 +155,83 @@ function calculateMetrics(bids: OrderLevel[], asks: OrderLevel[]): Partial<Outco
   return { bestBid, bestAsk, midPrice, spread, spreadPercent };
 }
 
+/**
+ * SINGLE ORDERBOOK MODEL: Derive NO orderbook from YES as complement
+ * 
+ * - YES BID @ $0.48 → NO ASK @ $0.52 (price = 1 - YES_BID)
+ * - YES ASK @ $0.52 → NO BID @ $0.48 (price = 1 - YES_ASK)
+ * 
+ * This ensures that when user buys NO @ $0.52, they see the complement
+ * of the YES bid they'll match against.
+ */
+function deriveComplementLevels(
+  sourceLevels: OrderLevel[],
+  targetSide: 'bid' | 'ask'
+): OrderLevel[] {
+  const derived: OrderLevel[] = sourceLevels.map(level => ({
+    price: Math.round((1 - level.price) * 100) / 100,  // Complement price, rounded
+    size: level.size,
+    total: level.total,
+    flash: level.flash,
+    prevSize: level.prevSize,
+  }));
+  
+  // Sort: bids descending (highest first), asks ascending (lowest first)
+  if (targetSide === 'bid') {
+    derived.sort((a, b) => b.price - a.price);
+  } else {
+    derived.sort((a, b) => a.price - b.price);
+  }
+  
+  // Recalculate cumulative totals
+  let cumulative = 0;
+  derived.forEach(level => {
+    cumulative += level.size;
+    level.total = cumulative;
+  });
+  
+  return derived;
+}
+
 export const useOrderbookStore = create<OrderbookState>()(
   subscribeWithSelector((set, get) => ({
     ...initialState,
     
     setOrderbook: (outcome, bidsData, asksData, sequenceId) => {
       const state = get();
-      const currentBook = outcome === 'YES' ? state.yes : state.no;
       
-      const bids = processLevels(bidsData, 'bid', currentBook.bids);
-      const asks = processLevels(asksData, 'ask', currentBook.asks);
-      const metrics = calculateMetrics(bids, asks);
+      // SINGLE ORDERBOOK MODEL: Only YES updates are real
+      // NO updates are ignored - NO is derived from YES
+      if (outcome === 'NO') {
+        // Ignore NO updates - we derive NO from YES
+        return;
+      }
       
-      const newBook: OutcomeOrderbook = {
-        bids,
-        asks,
-        bestBid: metrics.bestBid!,
-        bestAsk: metrics.bestAsk!,
-        midPrice: metrics.midPrice!,
-        spread: metrics.spread!,
-        spreadPercent: metrics.spreadPercent!,
-      };
+      const currentBook = state.yes;
       
-      set({
-        [outcome.toLowerCase()]: newBook,
-        sequenceId: sequenceId ?? state.sequenceId + 1,
-        lastUpdate: Date.now(),
-        isLoading: false,
-        error: null,
-      });
-    },
-    
-    setBothOrderbooks: (yesBids, yesAsks, noBids, noAsks, sequenceId) => {
-      const state = get();
+      // PROTECTION: Preserve each side independently if new data is empty
+      // This prevents UI flickering when MM bot is refreshing orders
+      const useBidsData = bidsData.length > 0 ? bidsData : 
+        (currentBook.bids.length > 0 ? currentBook.bids.map(l => [l.price, l.size] as [number, number]) : []);
+      const useAsksData = asksData.length > 0 ? asksData :
+        (currentBook.asks.length > 0 ? currentBook.asks.map(l => [l.price, l.size] as [number, number]) : []);
       
-      const yesBidsProcessed = processLevels(yesBids, 'bid', state.yes.bids);
-      const yesAsksProcessed = processLevels(yesAsks, 'ask', state.yes.asks);
-      const yesMetrics = calculateMetrics(yesBidsProcessed, yesAsksProcessed);
+      // Process YES orderbook
+      const yesBids = processLevels(useBidsData, 'bid', currentBook.bids);
+      const yesAsks = processLevels(useAsksData, 'ask', currentBook.asks);
+      const yesMetrics = calculateMetrics(yesBids, yesAsks);
       
-      const noBidsProcessed = processLevels(noBids, 'bid', state.no.bids);
-      const noAsksProcessed = processLevels(noAsks, 'ask', state.no.asks);
-      const noMetrics = calculateMetrics(noBidsProcessed, noAsksProcessed);
+      // DERIVE NO orderbook from YES as complement:
+      // - YES BID @ $0.48 → NO ASK @ $0.52 (when user buys NO, they match YES bid)
+      // - YES ASK @ $0.52 → NO BID @ $0.48 (when user sells NO, they match YES ask)
+      const noAsks = deriveComplementLevels(yesBids, 'ask');  // YES bids become NO asks
+      const noBids = deriveComplementLevels(yesAsks, 'bid');  // YES asks become NO bids
+      const noMetrics = calculateMetrics(noBids, noAsks);
       
       set({
         yes: {
-          bids: yesBidsProcessed,
-          asks: yesAsksProcessed,
+          bids: yesBids,
+          asks: yesAsks,
           bestBid: yesMetrics.bestBid!,
           bestAsk: yesMetrics.bestAsk!,
           midPrice: yesMetrics.midPrice!,
@@ -201,8 +239,8 @@ export const useOrderbookStore = create<OrderbookState>()(
           spreadPercent: yesMetrics.spreadPercent!,
         },
         no: {
-          bids: noBidsProcessed,
-          asks: noAsksProcessed,
+          bids: noBids,
+          asks: noAsks,
           bestBid: noMetrics.bestBid!,
           bestAsk: noMetrics.bestAsk!,
           midPrice: noMetrics.midPrice!,
@@ -217,8 +255,14 @@ export const useOrderbookStore = create<OrderbookState>()(
     },
     
     updateLevel: (outcome, side, price, size) => {
+      // SINGLE ORDERBOOK MODEL: Only YES updates are real
+      // NO updates are ignored - we derive NO from YES
+      if (outcome === 'NO') {
+        return;
+      }
+      
       set((state) => {
-        const book = outcome === 'YES' ? state.yes : state.no;
+        const book = state.yes;
         const levels = side === 'bid' ? [...book.bids] : [...book.asks];
         
         const existingIndex = levels.findIndex(l => Math.abs(l.price - price) < 0.0001);
@@ -226,9 +270,7 @@ export const useOrderbookStore = create<OrderbookState>()(
         if (size <= 0) {
           // Remove level
           if (existingIndex !== -1) {
-            const removed = levels[existingIndex];
             levels.splice(existingIndex, 1);
-            // Mark nearby levels as potentially changed for UI update
           }
         } else if (existingIndex !== -1) {
           // Update existing level with flash
@@ -265,22 +307,34 @@ export const useOrderbookStore = create<OrderbookState>()(
         });
         
         const newLevels = levels.slice(0, 15);
-        const bids = side === 'bid' ? newLevels : book.bids;
-        const asks = side === 'ask' ? newLevels : book.asks;
-        const metrics = calculateMetrics(bids, asks);
+        const yesBids = side === 'bid' ? newLevels : book.bids;
+        const yesAsks = side === 'ask' ? newLevels : book.asks;
+        const yesMetrics = calculateMetrics(yesBids, yesAsks);
         
-        const newBook: OutcomeOrderbook = {
-          bids,
-          asks,
-          bestBid: metrics.bestBid!,
-          bestAsk: metrics.bestAsk!,
-          midPrice: metrics.midPrice!,
-          spread: metrics.spread!,
-          spreadPercent: metrics.spreadPercent!,
-        };
+        // Derive NO from updated YES
+        const noBids = deriveComplementLevels(yesAsks, 'bid');
+        const noAsks = deriveComplementLevels(yesBids, 'ask');
+        const noMetrics = calculateMetrics(noBids, noAsks);
         
         return {
-          [outcome.toLowerCase()]: newBook,
+          yes: {
+            bids: yesBids,
+            asks: yesAsks,
+            bestBid: yesMetrics.bestBid!,
+            bestAsk: yesMetrics.bestAsk!,
+            midPrice: yesMetrics.midPrice!,
+            spread: yesMetrics.spread!,
+            spreadPercent: yesMetrics.spreadPercent!,
+          },
+          no: {
+            bids: noBids,
+            asks: noAsks,
+            bestBid: noMetrics.bestBid!,
+            bestAsk: noMetrics.bestAsk!,
+            midPrice: noMetrics.midPrice!,
+            spread: noMetrics.spread!,
+            spreadPercent: noMetrics.spreadPercent!,
+          },
           sequenceId: state.sequenceId + 1,
           lastUpdate: Date.now(),
         };

@@ -59,8 +59,7 @@ function TradeRow({
 
   return (
     <div className={cn(
-      'grid grid-cols-3 gap-2 py-1 px-2 rounded text-sm transition-colors',
-      side === 'buy' ? 'animate-flash-green' : 'animate-flash-red'
+      'grid grid-cols-3 gap-2 py-1 px-2 rounded text-sm transition-colors'
     )}>
       <span className={cn(
         'font-mono',

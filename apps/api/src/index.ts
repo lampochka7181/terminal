@@ -17,6 +17,7 @@ import { authRoutes } from './routes/auth.js';
 import { marketRoutes } from './routes/markets.js';
 import { orderRoutes } from './routes/orders.js';
 import { userRoutes } from './routes/user.js';
+import { tradesRoutes } from './routes/trades.js';
 import { wsHandler } from './routes/websocket.js';
 import { apiLogger } from './lib/logger.js';
 
@@ -214,26 +215,38 @@ async function main() {
   }));
 
   // Orderbook debug endpoint (for testing)
+  // SINGLE ORDERBOOK MODEL: Only YES orderbook exists, NO is derived
   app.get('/debug/orderbook/:marketId', async (request, reply) => {
     const { marketId } = request.params as { marketId: string };
     const { orderbookService } = await import('./services/orderbook.service.js');
     
-    const [yesSnapshot, noSnapshot] = await Promise.all([
-      orderbookService.getSnapshot(marketId, 'YES'),
-      orderbookService.getSnapshot(marketId, 'NO'),
-    ]);
+    const yesSnapshot = await orderbookService.getSnapshot(marketId, 'YES');
+    
+    // Derive NO from YES (for debug display)
+    const noBids = yesSnapshot.asks.map(l => ({ 
+      price: Math.round((1 - l.price) * 100) / 100, 
+      size: l.size, 
+      orderCount: l.orderCount 
+    })).sort((a, b) => b.price - a.price);
+    const noAsks = yesSnapshot.bids.map(l => ({ 
+      price: Math.round((1 - l.price) * 100) / 100, 
+      size: l.size, 
+      orderCount: l.orderCount 
+    })).sort((a, b) => a.price - b.price);
     
     return {
       marketId,
+      model: 'SINGLE_ORDERBOOK',
       YES: {
         bids: yesSnapshot.bids,
         asks: yesSnapshot.asks,
         sequenceId: yesSnapshot.sequenceId,
       },
       NO: {
-        bids: noSnapshot.bids,
-        asks: noSnapshot.asks,
-        sequenceId: noSnapshot.sequenceId,
+        note: 'Derived from YES (complement)',
+        bids: noBids,
+        asks: noAsks,
+        sequenceId: yesSnapshot.sequenceId,
       },
     };
   });
@@ -331,6 +344,7 @@ async function main() {
   await app.register(marketRoutes, { prefix: '/markets' });
   await app.register(orderRoutes, { prefix: '/orders' });
   await app.register(userRoutes, { prefix: '/user' });
+  await app.register(tradesRoutes, { prefix: '/trades' });
 
   // Public config endpoint (relayer address for delegation)
   app.get('/config', async () => {

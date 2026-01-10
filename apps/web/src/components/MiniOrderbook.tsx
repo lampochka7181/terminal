@@ -194,25 +194,12 @@ const OrderRow = memo(function OrderRow({
   type: 'bid' | 'ask';
   color: string;
 }) {
-  const [flash, setFlash] = useState(false);
-  const prevSizeRef = useRef(size);
-  
-  useEffect(() => {
-    if (prevSizeRef.current !== size) {
-      setFlash(true);
-      const timer = setTimeout(() => setFlash(false), 300);
-      prevSizeRef.current = size;
-      return () => clearTimeout(timer);
-    }
-  }, [size]);
-  
   const percent = ((size || 0) / maxSize) * 100;
   const isBid = type === 'bid';
 
   return (
     <div className={cn(
-      'relative flex justify-between items-center h-4 text-[9px] font-mono px-0.5',
-      flash && (size > prevSizeRef.current ? 'animate-flash-green' : 'animate-flash-red')
+      'relative flex justify-between items-center h-4 text-[9px] font-mono px-0.5'
     )}>
       <div 
         className={cn(
@@ -244,12 +231,13 @@ export function DualMiniOrderbook({
   className?: string;
 }) {
   const subscribed = useRef(false);
-  const { yes, no, setBothOrderbooks, setOrderbook, updateLevel } = useOrderbookStore();
+  const { yes, no, setOrderbook, updateLevel } = useOrderbookStore();
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     if (!marketAddress) return;
 
+    // SINGLE ORDERBOOK MODEL: Only fetch YES, NO is derived by store
     const fetchData = async () => {
       try {
         setLoading(true);
@@ -257,10 +245,8 @@ export function DualMiniOrderbook({
         
         const yesBids = (response.yes?.bids || response.bids || []) as [number, number][];
         const yesAsks = (response.yes?.asks || response.asks || []) as [number, number][];
-        const noBids = (response.no?.bids || []) as [number, number][];
-        const noAsks = (response.no?.asks || []) as [number, number][];
         
-        setBothOrderbooks(yesBids, yesAsks, noBids, noAsks, response.sequenceId);
+        setOrderbook('YES', yesBids, yesAsks, response.sequenceId);
       } catch (err) {
         console.error('[DualMiniOrderbook] Error:', err);
       } finally {
@@ -277,16 +263,19 @@ export function DualMiniOrderbook({
       const data = message.data;
       if (!data) return;
       
+      // SINGLE ORDERBOOK MODEL: Only process YES updates, ignore NO
       const outcome = (data.outcome as 'YES' | 'NO') || 'YES';
+      if (outcome === 'NO') return; // Ignore NO updates - derived from YES
+      
       const bids = (data.bids || []) as [number, number][];
       const asks = (data.asks || []) as [number, number][];
       
       // Snapshot or delta
       if (message.snapshot || bids.length > 3 || asks.length > 3) {
-        setOrderbook(outcome, bids, asks, data.sequenceId);
+        setOrderbook('YES', bids, asks, data.sequenceId);
       } else {
-        bids.forEach(([price, size]) => updateLevel(outcome, 'bid', price, size));
-        asks.forEach(([price, size]) => updateLevel(outcome, 'ask', price, size));
+        bids.forEach(([price, size]) => updateLevel('YES', 'bid', price, size));
+        asks.forEach(([price, size]) => updateLevel('YES', 'ask', price, size));
       }
     });
 
@@ -314,7 +303,7 @@ export function DualMiniOrderbook({
         subscribed.current = false;
       }
     };
-  }, [marketAddress, setBothOrderbooks, setOrderbook, updateLevel]);
+  }, [marketAddress, setOrderbook, updateLevel]);
 
   const maxSize = Math.max(
     ...yes.bids.map(b => b.size || 0),
@@ -468,36 +457,12 @@ const CompactRow = memo(function CompactRow({
   bgColor,
   textColor,
 }: CompactRowProps) {
-  const [flash, setFlash] = useState<'up' | 'down' | null>(null);
-  const prevSizeRef = useRef(size);
-  
-  // Handle flash from props or size change
-  useEffect(() => {
-    if (propFlash) {
-      setFlash(propFlash);
-      const timer = setTimeout(() => setFlash(null), 300);
-      return () => clearTimeout(timer);
-    }
-  }, [propFlash]);
-  
-  useEffect(() => {
-    if (prevSizeRef.current !== size && !propFlash) {
-      setFlash(size > prevSizeRef.current ? 'up' : 'down');
-      const timer = setTimeout(() => setFlash(null), 300);
-      prevSizeRef.current = size;
-      return () => clearTimeout(timer);
-    }
-    prevSizeRef.current = size;
-  }, [size, propFlash]);
-  
   const pct = (size / maxSize) * 100;
   const isBid = side === 'bid';
 
   return (
     <div className={cn(
-      'relative flex justify-between items-center h-4 text-[9px] font-mono px-2',
-      flash === 'up' && 'animate-flash-green',
-      flash === 'down' && 'animate-flash-red'
+      'relative flex justify-between items-center h-4 text-[9px] font-mono px-2'
     )}>
       <div 
         className={cn(

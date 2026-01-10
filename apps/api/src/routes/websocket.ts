@@ -52,6 +52,9 @@ function updateBroadcastClient(socket: WebSocket, client: ClientState) {
       subs.add(`orderbook:${sub.market}`);
     } else if (sub.channel === 'trades' && sub.market) {
       subs.add(`trades:${sub.market}`);
+    } else if (sub.channel === 'trades:global') {
+      // Global trade blotter - no market needed
+      subs.add('trades:global');
     } else if (sub.channel === 'prices' && sub.assets) {
       for (const asset of sub.assets) {
         subs.add(`prices:${asset}`);
@@ -75,8 +78,10 @@ function startHeartbeatChecker() {
     const now = Date.now();
     
     for (const [socket, client] of clients) {
-      if (now - client.lastPing > PING_TIMEOUT) {
-        logger.info('Client timed out, closing connection');
+      const timeSinceLastPing = now - client.lastPing;
+      
+      if (timeSinceLastPing > PING_TIMEOUT) {
+        logger.info(`Client timed out after ${timeSinceLastPing}ms (timeout=${PING_TIMEOUT}ms), subscriptions: ${client.subscriptions.length}`);
         socket.close(1000, 'Ping timeout');
         clients.delete(socket);
       }
@@ -180,10 +185,13 @@ async function handleMessage(
 }
 
 function handlePing(socket: WebSocket, client: ClientState) {
-  client.lastPing = Date.now();
+  const now = Date.now();
+  const timeSinceLastPing = now - client.lastPing;
+  logger.debug(`[WS] Ping received (last ping ${timeSinceLastPing}ms ago)`);
+  client.lastPing = now;
   socket.send(JSON.stringify({
     op: 'pong',
-    serverTime: Date.now(),
+    serverTime: now,
   }));
 }
 
@@ -195,7 +203,7 @@ async function handleSubscribe(
   const { channel, market, assets } = message;
 
   // Validate channel
-  const validChannels = ['orderbook', 'trades', 'prices', 'market'];
+  const validChannels = ['orderbook', 'trades', 'trades:global', 'prices', 'market'];
   if (!validChannels.includes(channel)) {
     socket.send(JSON.stringify({
       error: {
@@ -220,6 +228,9 @@ async function handleSubscribe(
   // Add subscription
   client.subscriptions.push({ channel, market, assets });
   updateBroadcastClient(socket, client);
+  
+  // DEBUG: Log subscription details
+  logger.info(`[WS] Client subscribed: channel=${channel}, market=${market || 'N/A'}, assets=${assets?.join(',') || 'N/A'}`);
 
   socket.send(JSON.stringify({
     op: 'subscribed',
@@ -333,23 +344,43 @@ async function sendOrderbookSnapshot(
   isFullSnapshot: boolean = false
 ) {
   try {
-    // Get orderbook from Redis
-    const [bidData, askData, sequenceId] = await Promise.all([
-      redis.zrevrange(RedisKeys.orderbook(marketId, 'YES', 'BID'), 0, -1, 'WITHSCORES'),
+    // Get orderbook from Redis for BOTH YES and NO outcomes
+    // NOTE: Bids use NEGATIVE scores (-price * 1M), so zrange returns highest prices first
+    const [yesBidData, yesAskData, noBidData, noAskData, sequenceId] = await Promise.all([
+      redis.zrange(RedisKeys.orderbook(marketId, 'YES', 'BID'), 0, -1, 'WITHSCORES'),  // zrange for negative scores!
       redis.zrange(RedisKeys.orderbook(marketId, 'YES', 'ASK'), 0, -1, 'WITHSCORES'),
+      redis.zrange(RedisKeys.orderbook(marketId, 'NO', 'BID'), 0, -1, 'WITHSCORES'),   // zrange for negative scores!
+      redis.zrange(RedisKeys.orderbook(marketId, 'NO', 'ASK'), 0, -1, 'WITHSCORES'),
       redis.get(RedisKeys.sequence(marketId)),
     ]);
 
-    const bids = parseOrderbookData(bidData);
-    const asks = parseOrderbookData(askData);
+    const yesBids = parseOrderbookData(yesBidData);
+    const yesAsks = parseOrderbookData(yesAskData);
+    const noBids = parseOrderbookData(noBidData);
+    const noAsks = parseOrderbookData(noAskData);
 
+    // Send YES orderbook snapshot
     socket.send(JSON.stringify({
       channel: 'orderbook',
       market: marketId,
       snapshot: isFullSnapshot,
       data: {
-        bids,
-        asks,
+        outcome: 'YES',
+        bids: yesBids,
+        asks: yesAsks,
+        sequenceId: parseInt(sequenceId || '0'),
+      },
+    }));
+    
+    // Send NO orderbook snapshot
+    socket.send(JSON.stringify({
+      channel: 'orderbook',
+      market: marketId,
+      snapshot: isFullSnapshot,
+      data: {
+        outcome: 'NO',
+        bids: noBids,
+        asks: noAsks,
         sequenceId: parseInt(sequenceId || '0'),
       },
     }));
@@ -381,12 +412,19 @@ async function sendPriceSnapshot(socket: WebSocket, assets: string[]) {
 function parseOrderbookData(data: string[]): [number, number][] {
   const result: [number, number][] = [];
 
+  // Data comes as [member, score, member, score, ...]
+  // member = "orderId:size:timestamp", score = price * 1000000 (negative for bids)
   for (let i = 0; i < data.length; i += 2) {
-    const size = parseFloat(data[i]);
-    const price = parseFloat(data[i + 1]);
+    const member = data[i];
+    const scoreStr = data[i + 1];
+    
+    // Extract size from member (format: orderId:size:timestamp)
+    const parts = member.split(':');
+    const size = parts.length >= 2 ? parseFloat(parts[1]) : NaN;
+    const price = Math.abs(parseFloat(scoreStr)) / 1000000;  // Use Math.abs for negative bid scores
 
-    if (!isNaN(price) && !isNaN(size)) {
-      result.push([price / 1000000, size]); // Convert from 6 decimals
+    if (!isNaN(price) && !isNaN(size) && size > 0) {
+      result.push([price, size]);
     }
   }
 

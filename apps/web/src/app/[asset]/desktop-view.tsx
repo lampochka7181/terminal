@@ -147,6 +147,17 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   const [orderStatus, setOrderStatus] = useState<'idle' | 'placing' | 'success' | 'error'>('idle');
   const [orderResult, setOrderResult] = useState<{ message?: string } | null>(null);
   
+  // Toast notification state
+  const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  
+  // Auto-dismiss toast
+  useEffect(() => {
+    if (toast) {
+      const timer = setTimeout(() => setToast(null), 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [toast]);
+  
   // One-click trading state
   const [oneClickOutcome, setOneClickOutcome] = useState<'YES' | 'NO' | null>(null);
 
@@ -208,6 +219,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
     } else {
       setOrderStatus('error');
       setOrderResult({ message: 'Order failed - try manual trade' });
+      setToast({ type: 'error', message: 'Order failed - try manual trade' });
       setTimeout(() => {
         setOrderStatus('idle');
         setOrderResult(null);
@@ -254,12 +266,15 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
       } else if (result && result.status === 'cancelled') {
         setOrderStatus('error');
         setOrderResult({ message: 'Order cancelled - no buyers at this price' });
+        setToast({ type: 'error', message: 'Order cancelled - no buyers at this price' });
       } else if (result && result.filledSize === 0) {
         setOrderStatus('error');
         setOrderResult({ message: 'No fills - try adjusting price or wait for buyers' });
+        setToast({ type: 'error', message: 'No fills - try adjusting price or wait for buyers' });
       } else {
         setOrderStatus('error');
         setOrderResult({ message: orderError || 'Order failed' });
+        setToast({ type: 'error', message: orderError || 'Order failed' });
       }
       return;
     }
@@ -314,13 +329,16 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
     } else if (result && result.status === 'cancelled') {
       setOrderStatus('error');
       setOrderResult({ message: 'Order cancelled - no sellers at this price' });
+      setToast({ type: 'error', message: 'Order cancelled - no sellers at this price' });
     } else {
       // Order failed or returned null (validation error)
       // Wait a tick for the error state to update from the hook
       await new Promise(resolve => setTimeout(resolve, 50));
       setOrderStatus('error');
       // The orderError should now be set - if not, show generic message
-      setOrderResult({ message: 'Order failed - check validation errors above' });
+      const errorMsg = orderError || 'Order failed';
+      setOrderResult({ message: errorMsg });
+      setToast({ type: 'error', message: errorMsg });
     }
   };
   
@@ -347,53 +365,77 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
     <div className="min-h-screen bg-background">
       <Header />
 
-      <main className="w-full py-1">
-        {/* Top Bar: Back, Asset Info, Switch View */}
-        <div className="flex items-center justify-between mb-2">
-          <div className="flex items-center gap-4">
+      {/* Toast Notification */}
+      {toast && (
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 animate-fade-in">
+          <div className={cn(
+            'flex items-center gap-2 px-4 py-3 rounded-lg shadow-lg border backdrop-blur-sm',
+            toast.type === 'error' 
+              ? 'bg-short/90 border-short text-white' 
+              : 'bg-long/90 border-long text-white'
+          )}>
+            {toast.type === 'error' ? (
+              <XCircle className="w-5 h-5 flex-shrink-0" />
+            ) : (
+              <CheckCircle className="w-5 h-5 flex-shrink-0" />
+            )}
+            <span className="font-medium text-sm">{toast.message}</span>
+            <button 
+              onClick={() => setToast(null)}
+              className="ml-2 p-1 hover:bg-white/20 rounded transition-colors"
+            >
+              <XCircle className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      <main className="w-full px-3 py-1">
+        {/* Compact Top Bar */}
+        <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center gap-3">
             <button 
               onClick={() => router.back()}
-              className="flex items-center gap-2 text-text-muted hover:text-text-primary transition-colors text-sm font-medium"
+              className="flex items-center gap-1.5 text-text-muted hover:text-text-primary transition-colors text-xs font-medium"
             >
-              <ArrowLeft className="w-4 h-4" />
+              <ArrowLeft className="w-3.5 h-3.5" />
               Back
             </button>
-            <div className="h-6 w-px bg-border" />
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-full bg-surface-light flex items-center justify-center font-bold text-accent text-lg border border-border">
+            <div className="h-4 w-px bg-border" />
+            <div className="flex items-center gap-2">
+              <div className="w-7 h-7 rounded-full bg-surface-light flex items-center justify-center font-bold text-accent text-sm border border-border">
                 {asset.charAt(0)}
               </div>
               <div>
-                <h1 className="text-xl font-bold">{asset}</h1>
-                <p className="text-sm text-text-muted">{assetNames[asset] || asset}</p>
+                <h1 className="text-sm font-bold leading-tight">{asset} <span className="text-text-muted font-normal text-xs">{assetNames[asset] || ''}</span></h1>
               </div>
             </div>
           </div>
 
           <button
             onClick={onSwitchView}
-            className="flex items-center gap-2 px-3 py-2 text-sm text-text-muted hover:text-accent bg-surface border border-border rounded-lg transition-colors"
+            className="flex items-center gap-1.5 px-2 py-1 text-xs text-text-muted hover:text-accent bg-surface border border-border rounded-md transition-colors"
             title="Switch to Mobile View"
           >
-            <Smartphone className="w-4 h-4" />
+            <Smartphone className="w-3.5 h-3.5" />
             <span>Mobile</span>
           </button>
         </div>
 
         {marketsLoading && markets.length === 0 ? (
-          <div className="flex items-center justify-center h-[600px] bg-surface rounded-xl border border-border">
+          <div className="flex items-center justify-center h-[calc(100vh-100px)] bg-surface rounded-lg border border-border">
             <div className="text-center text-text-muted">
-              <RefreshCw className="w-8 h-8 mx-auto animate-spin mb-3" />
-              <p>Loading markets...</p>
+              <RefreshCw className="w-6 h-6 mx-auto animate-spin mb-2" />
+              <p className="text-sm">Loading markets...</p>
             </div>
           </div>
         ) : !activeMarket ? (
-          <div className="flex items-center justify-center h-[600px] bg-surface rounded-xl border border-border">
+          <div className="flex items-center justify-center h-[calc(100vh-100px)] bg-surface rounded-lg border border-border">
             <div className="text-center text-text-muted">
-              <p className="text-lg mb-2">No active {selectedTimeframe} market for {asset}</p>
+              <p className="text-sm mb-2">No active {selectedTimeframe} market for {asset}</p>
               <button 
                 onClick={() => refetch()}
-                className="text-accent hover:text-accent-dim font-bold"
+                className="text-accent hover:text-accent-dim font-bold text-sm"
               >
                 Refresh
               </button>
@@ -401,23 +443,23 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
           </div>
         ) : (
           <>
-            {/* Main Content Grid - 3 column layout: Chart | Orderbook | Trading */}
-            <div className="grid grid-cols-12 gap-1 mb-2">
-              {/* LEFT: Chart (spans 8 columns - wider) */}
-              <div className="col-span-12 lg:col-span-8">
-                <div className="bg-surface rounded-xl border border-border overflow-hidden h-[650px]">
+            {/* Main Content Grid - 2 column layout: Chart | Combined Trading Panel */}
+            <div className="grid grid-cols-12 gap-2 mb-2">
+              {/* LEFT: Chart (spans 9 columns) */}
+              <div className="col-span-12 lg:col-span-9 overflow-hidden">
+                <div className="bg-surface rounded-lg border border-border overflow-hidden h-[calc(100vh-420px)] min-h-[200px] relative">
                   {/* Chart Header with Compact Timeframe Selector & Countdown */}
-                  <div className="flex items-center justify-between px-2 py-2 bg-surface-light/30 border-b border-border">
+                  <div className="flex items-center justify-between px-3 py-2 bg-surface-light/30 border-b border-border">
                     {/* Compact Timeframe Selector */}
-                    <div className="flex gap-1 p-1 bg-surface rounded-lg border border-border">
+                    <div className="flex gap-0.5 p-0.5 bg-surface rounded-lg border border-border">
                       {TIMEFRAMES.map((tf) => (
                         <button
                           key={tf}
                           onClick={() => setTimeframe(tf)}
                           className={cn(
-                            "px-4 py-2 rounded-md text-sm font-bold transition-all btn-press",
+                            "px-3 py-1.5 rounded-md text-xs font-bold transition-all btn-press",
                             selectedTimeframe === tf 
-                              ? "bg-accent text-background shadow-md shadow-accent/30" 
+                              ? "bg-accent text-background shadow-sm shadow-accent/30" 
                               : "text-text-muted hover:text-text-primary hover:bg-surface-light"
                           )}
                         >
@@ -431,8 +473,10 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                   </div>
 
                   {/* Chart */}
-                  <div className="h-[calc(100%-52px)]">
+                  <div className="h-[calc(100%-44px)]">
                     <ChartV2 
+                      strikePrice={activeMarket?.strike}
+                      centerOnStrike={true}
                       onPositionClick={(position) => {
                         // Set up sell mode with the clicked position
                         setSelectedOutcome(position.outcome.toUpperCase() as 'YES' | 'NO');
@@ -452,26 +496,28 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                 </div>
               </div>
 
-              {/* MIDDLE: Orderbook (spans 2 columns) */}
-              <div className="col-span-12 lg:col-span-2 h-[650px]">
-                {activeMarket && (
-                  <SingleOrderbook 
-                    marketAddress={activeMarket.address} 
-                    className="h-full"
-                    onPriceClick={(price, side) => {
-                      // Set limit price when clicking on orderbook
-                      setLimitPrice(price.toFixed(2));
-                      setOrderType('limit');
-                    }}
-                  />
-                )}
-              </div>
+              {/* RIGHT: Combined Trading Panel (spans 3 columns) - ONE unified container */}
+              <div className="col-span-12 lg:col-span-3 h-[calc(100vh-420px)] min-h-[200px] bg-surface rounded-lg border border-border flex flex-col overflow-hidden">
+                {/* TOP HALF: Orderbook fills space above the strike line */}
+                <div className="flex-1 border-b border-border overflow-hidden">
+                  {activeMarket && (
+                    <SingleOrderbook 
+                      marketAddress={activeMarket.address} 
+                      className="!rounded-none !border-0 h-full"
+                      compact={true}
+                      onPriceClick={(price, side) => {
+                        // Set limit price when clicking on orderbook
+                        setLimitPrice(price.toFixed(2));
+                        setOrderType('limit');
+                      }}
+                    />
+                  )}
+                </div>
 
-              {/* RIGHT: Trading Panel (spans 2 columns - narrower) */}
-              <div className="col-span-12 lg:col-span-2 h-[650px] flex flex-col">
-                {/* Compact Price Boxes - Horizontal Layout */}
-                <div className="grid grid-cols-2 gap-2 mb-2">
-                  <CompactPriceBox
+                {/* MIDDLE: Price Selectors - Divider aligns with chart strike price */}
+                <div className="flex-shrink-0">
+                  {/* ABOVE selector */}
+                  <PriceSelectorBox
                     label="ABOVE"
                     price={yesPrice}
                     outcome="YES"
@@ -490,7 +536,12 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                     isLoading={orderStatus === 'placing' && oneClickOutcome === 'YES'}
                     isActivating={isActivating}
                   />
-                  <CompactPriceBox
+                  
+                  {/* Simple divider between ABOVE/BELOW */}
+                  <div className="h-px bg-border" />
+                  
+                  {/* BELOW selector */}
+                  <PriceSelectorBox
                     label="BELOW"
                     price={noPrice}
                     outcome="NO"
@@ -513,25 +564,19 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                 
                 {/* One-Click Status Toast */}
                 {orderStatus === 'success' && oneClickOutcome && (
-                  <div className="mb-3 p-3 bg-long/10 border border-long/30 rounded-lg flex items-center gap-2 text-long text-sm animate-fade-in">
-                    <CheckCircle className="w-4 h-4" />
-                    <span>{orderResult?.message}</span>
-                  </div>
-                )}
-                {orderStatus === 'error' && oneClickOutcome && (
-                  <div className="mb-3 p-3 bg-short/10 border border-short/30 rounded-lg flex items-center gap-2 text-short text-sm animate-shake">
-                    <XCircle className="w-4 h-4" />
+                  <div className="p-2 bg-long/10 border-y border-long/30 flex items-center gap-1.5 text-long text-xs animate-fade-in">
+                    <CheckCircle className="w-3.5 h-3.5" />
                     <span>{orderResult?.message}</span>
                   </div>
                 )}
 
-                {/* Trade Panel - Fills remaining space */}
-                <div className="bg-surface rounded-xl border border-border flex-1 flex flex-col overflow-hidden">
+                {/* BOTTOM HALF: Trade Panel - fills space below strike line */}
+                <div className="flex-1 flex flex-col overflow-hidden min-h-0 border-t border-border">
                   {selectedOutcome ? (
                     <div className="p-3 flex flex-col h-full">
                       {/* Header with Buy/Sell toggle */}
-                      <div className="flex items-center justify-between mb-3">
-                        <h3 className="font-bold flex items-center gap-2">
+                      <div className="flex items-center justify-between mb-2">
+                        <h3 className="text-base font-bold flex items-center gap-2">
                           <Zap className={cn(
                             'w-4 h-4',
                             tradeMode === 'sell' ? 'text-warning' : selectedOutcome === 'YES' ? 'text-long' : 'text-short'
@@ -539,12 +584,6 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                           {tradeMode === 'sell' ? 'Sell' : 'Trade'}
                         </h3>
                         <div className="flex items-center gap-2">
-                          <span className={cn(
-                            'px-2 py-1 rounded text-xs font-bold',
-                            selectedOutcome === 'YES' ? 'bg-long/20 text-long' : 'bg-short/20 text-short'
-                          )}>
-                            {selectedOutcome === 'YES' ? 'ABOVE' : 'BELOW'}
-                          </span>
                           {tradeMode === 'sell' && (
                             <button
                               onClick={() => {
@@ -552,11 +591,17 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                                 setSellData(null);
                                 setSellSize('');
                               }}
-                              className="text-xs text-text-muted hover:text-accent transition-colors"
+                              className="px-2 py-0.5 rounded text-xs font-bold bg-surface-light text-text-muted hover:text-text-primary hover:bg-surface transition-colors"
                             >
-                              ✕ Cancel
+                              Cancel
                             </button>
                           )}
+                          <span className={cn(
+                            'px-2 py-0.5 rounded text-xs font-bold',
+                            selectedOutcome === 'YES' ? 'bg-long/20 text-long' : 'bg-short/20 text-short'
+                          )}>
+                            {selectedOutcome === 'YES' ? 'ABOVE' : 'BELOW'}
+                          </span>
                         </div>
                       </div>
 
@@ -564,10 +609,11 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                       {tradeMode === 'sell' && sellData ? (
                         <>
                           {/* Sell Size Input */}
-                          <div className="mb-3">
-                            <label className="block text-xs text-text-muted mb-1.5">
-                              Shares to Sell (max {maxSellSize.toFixed(0)})
-                            </label>
+                          <div className="mb-2">
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="text-xs text-text-muted">Shares</label>
+                              <span className="text-xs text-text-muted">max {maxSellSize.toFixed(0)}</span>
+                            </div>
                             <input
                               type="number"
                               value={sellSize}
@@ -575,15 +621,15 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                               min="0"
                               max={maxSellSize}
                               step="1"
-                              className="w-full bg-surface-light border border-border rounded-lg px-4 py-2.5 font-mono text-center focus:border-warning focus:ring-1 focus:ring-warning"
+                              className="w-full bg-surface-light border border-border rounded-lg px-3 py-2.5 font-mono text-lg text-right focus:border-warning focus:ring-1 focus:ring-warning"
                             />
-                            <div className="flex gap-1.5 mt-1.5">
+                            <div className="flex gap-1 mt-1.5">
                               {[0.25, 0.5, 0.75, 1].map((pct) => (
                                 <button
                                   key={pct}
                                   onClick={() => setSellSize(Math.floor(maxSellSize * pct).toString())}
                                   className={cn(
-                                    'flex-1 py-1.5 text-xs rounded-md transition-colors font-medium',
+                                    'flex-1 py-1.5 text-xs rounded-lg transition-colors font-bold',
                                     sellSizeNum === Math.floor(maxSellSize * pct)
                                       ? 'bg-warning/20 text-warning'
                                       : 'bg-surface-light text-text-muted hover:text-text-primary'
@@ -596,52 +642,33 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                           </div>
 
                           {/* Sell Summary */}
-                          <div className="bg-surface-light rounded-lg p-3 mb-3 flex-1">
-                            <div className="space-y-2">
-                              <div className="flex justify-between text-sm">
-                                <span className="text-text-muted">Shares to Sell</span>
+                          <div className="bg-surface-light rounded-lg p-2.5 mb-2 text-sm">
+                            <div className="space-y-1">
+                              <div className="flex justify-between">
+                                <span className="text-text-muted">Shares</span>
                                 <span className="font-mono font-bold">{sellSizeNum.toFixed(0)}</span>
                               </div>
-                              <div className="flex justify-between text-sm">
-                                <span className="text-text-muted">Market Price</span>
+                              <div className="flex justify-between">
+                                <span className="text-text-muted">Price</span>
                                 <span className="font-mono">${sellPrice.toFixed(2)}</span>
                               </div>
-                              <div className="flex justify-between text-sm">
-                                <span className="text-text-muted">Est. Proceeds</span>
+                              <div className="flex justify-between">
+                                <span className="text-text-muted">Proceeds</span>
                                 <span className="font-mono">${sellProceeds.toFixed(2)}</span>
                               </div>
-                              <div className="border-t border-border pt-2 mt-2">
-                                <div className="flex justify-between text-sm">
-                                  <span className="text-text-muted">Avg Entry</span>
-                                  <span className="font-mono">${sellData.avgEntry.toFixed(2)}</span>
+                              <div className="border-t border-border pt-1 mt-1">
+                                <div className="flex justify-between">
+                                  <span className="text-text-muted font-medium">P&L</span>
+                                  <span className={cn(
+                                    'font-mono font-bold text-base',
+                                    sellProfit >= 0 ? 'text-long' : 'text-short'
+                                  )}>
+                                    {sellProfit >= 0 ? '+' : ''}${sellProfit.toFixed(2)}
+                                  </span>
                                 </div>
-                              </div>
-                              <div className="flex justify-between">
-                                <span className="text-text-muted font-medium">Est. P&L</span>
-                                <span className={cn(
-                                  'font-mono font-bold text-lg',
-                                  sellProfit >= 0 ? 'text-long' : 'text-short'
-                                )}>
-                                  {sellProfit >= 0 ? '+' : ''}${sellProfit.toFixed(2)}
-                                </span>
                               </div>
                             </div>
                           </div>
-
-                          {/* Order Status */}
-                          {orderStatus === 'success' && orderResult && (
-                            <div className="flex items-center gap-2 p-3 mb-3 bg-long/10 border border-long/30 rounded-lg text-long text-sm">
-                              <CheckCircle className="w-4 h-4" />
-                              <span>{orderResult.message}</span>
-                            </div>
-                          )}
-                          
-                          {orderStatus === 'error' && orderResult && (
-                            <div className="flex items-center gap-2 p-3 mb-3 bg-short/10 border border-short/30 rounded-lg text-short text-sm">
-                              <XCircle className="w-4 h-4" />
-                              <span>{orderResult.message}</span>
-                            </div>
-                          )}
 
                           {/* Sell Button */}
                           {connected ? (
@@ -649,8 +676,8 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                               onClick={handleQuickTrade}
                               disabled={isPlacing || orderStatus === 'success' || sellSizeNum <= 0 || sellSizeNum > maxSellSize}
                               className={cn(
-                                'w-full py-3 rounded-lg font-bold transition-all flex items-center justify-center gap-2',
-                                'bg-warning text-background hover:shadow-lg hover:shadow-warning/30',
+                                'w-full py-2.5 rounded-lg font-bold text-base transition-all flex items-center justify-center gap-2',
+                                'bg-warning text-background hover:shadow-md hover:shadow-warning/30',
                                 (isPlacing || orderStatus === 'success' || sellSizeNum <= 0 || sellSizeNum > maxSellSize) && 'opacity-50 cursor-not-allowed'
                               )}
                             >
@@ -665,18 +692,18 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                                   <span>Sold!</span>
                                 </>
                               ) : (
-                                `Sell ${sellSizeNum.toFixed(0)} → $${sellProceeds.toFixed(2)}`
+                                `Sell → $${sellProceeds.toFixed(2)}`
                               )}
                             </button>
                           ) : (
-                            <WalletButton className="!w-full !justify-center !bg-accent !text-background hover:!bg-accent-dim !rounded-lg !font-bold !h-14 !text-lg" />
+                            <WalletButton className="!w-full !justify-center !bg-accent !text-background hover:!bg-accent-dim !rounded-lg !font-bold !h-11 !text-base" />
                           )}
                         </>
                       ) : (
                         /* BUY MODE UI */
                         <>
                           {/* Order Type Toggle */}
-                          <div className="flex gap-1 p-1 bg-surface-light rounded-lg mb-3">
+                          <div className="flex gap-1 p-1 bg-surface-light rounded-lg mb-2">
                             <button
                               onClick={() => setOrderType('market')}
                               className={cn(
@@ -706,10 +733,9 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
 
                           {/* Limit Price Input (only for limit orders) */}
                           {orderType === 'limit' && (
-                            <div className="mb-3">
-                              <label className="block text-xs text-text-muted mb-1.5">Limit Price</label>
+                            <div className="mb-2">
                               <div className="relative">
-                                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted">$</span>
+                                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted text-sm">$</span>
                                 <input
                                   type="number"
                                   value={limitPrice}
@@ -718,10 +744,10 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                                   max="0.99"
                                   step="0.01"
                                   placeholder="0.50"
-                                  className="w-full bg-surface-light border border-border rounded-lg pl-8 pr-4 py-2.5 font-mono text-right focus:border-accent focus:ring-1 focus:ring-accent"
+                                  className="w-full bg-surface-light border border-border rounded-lg pl-8 pr-3 py-2.5 font-mono text-lg text-right focus:border-accent focus:ring-1 focus:ring-accent"
                                 />
                               </div>
-                              <div className="flex gap-1.5 mt-1.5">
+                              <div className="flex gap-1 mt-1.5">
                                 {[
                                   { label: '-5¢', delta: -0.05 },
                                   { label: '-1¢', delta: -0.01 },
@@ -739,7 +765,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                                         setLimitPrice(newPrice.toFixed(2));
                                       }
                                     }}
-                                    className="flex-1 py-1.5 text-xs rounded-md bg-surface text-text-muted hover:text-text-primary hover:bg-surface-light transition-colors"
+                                    className="flex-1 py-1.5 text-xs rounded-md bg-surface text-text-muted hover:text-text-primary hover:bg-surface-light transition-colors font-medium"
                                   >
                                     {label}
                                   </button>
@@ -748,27 +774,25 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                             </div>
                           )}
 
-                          {/* Amount Input */}
-                          <div className="mb-3">
-                            <label className="block text-xs text-text-muted mb-1.5">Amount to Spend</label>
+                          {/* Amount Input - No label */}
+                          <div className="mb-2">
                             <div className="relative">
-                              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted">$</span>
+                              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted text-sm">$</span>
                               <input
                                 type="number"
                                 value={dollarAmount}
                                 onChange={(e) => setDollarAmount(e.target.value)}
                                 min="1"
-                                className="w-full bg-surface-light border border-border rounded-lg pl-8 pr-14 py-2.5 font-mono text-right focus:border-accent focus:ring-1 focus:ring-accent"
+                                className="w-full bg-surface-light border border-border rounded-lg pl-8 pr-3 py-2.5 font-mono text-lg text-right focus:border-accent focus:ring-1 focus:ring-accent"
                               />
-                              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted text-xs">USDC</span>
                             </div>
-                            <div className="flex gap-1.5 mt-1.5">
-                              {[25, 50, 100, 250, 500].map((preset) => (
+                            <div className="flex gap-1 mt-1.5">
+                              {[25, 50, 100, 250].map((preset) => (
                                 <button
                                   key={preset}
                                   onClick={() => setDollarAmount(preset.toString())}
                                   className={cn(
-                                    'flex-1 py-1.5 text-xs rounded-md transition-colors font-medium',
+                                    'flex-1 py-1.5 text-xs rounded-lg transition-colors font-bold',
                                     parseFloat(dollarAmount) === preset
                                       ? 'bg-accent/20 text-accent'
                                       : 'bg-surface-light text-text-muted hover:text-text-primary'
@@ -780,54 +804,29 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                             </div>
                           </div>
 
-                          {/* Summary - Takes available space */}
-                          <div className="bg-surface-light rounded-lg p-3 mb-3 flex-1">
-                            <div className="space-y-2">
-                              <div className="flex justify-between text-sm">
-                                <span className="text-text-muted">
-                                  {orderType === 'limit' ? 'Limit Price' : 'Market Price'}
-                                </span>
+                          {/* Summary - Compact */}
+                          <div className="bg-surface-light rounded-lg p-2.5 mb-2 text-sm">
+                            <div className="space-y-1">
+                              <div className="flex justify-between">
+                                <span className="text-text-muted">Price</span>
                                 <span className="font-mono font-bold">${selectedPrice.toFixed(2)}</span>
                               </div>
-                              <div className="flex justify-between text-sm">
-                                <span className="text-text-muted">Est. Contracts</span>
+                              <div className="flex justify-between">
+                                <span className="text-text-muted">Contracts</span>
                                 <span className="font-mono font-bold">{estimatedContracts.toLocaleString()}</span>
                               </div>
-                              <div className="flex justify-between text-sm">
-                                <span className="text-text-muted">Max Payout</span>
+                              <div className="flex justify-between">
+                                <span className="text-text-muted">Payout</span>
                                 <span className="font-mono">${estimatedPayout.toFixed(2)}</span>
                               </div>
-                              <div className="border-t border-border pt-2 mt-2">
+                              <div className="border-t border-border pt-1 mt-1">
                                 <div className="flex justify-between">
-                                  <span className="text-text-muted font-medium">Est. Profit</span>
-                                  <span className="font-mono font-bold text-lg text-long">+${estimatedProfit.toFixed(2)}</span>
+                                  <span className="text-text-muted font-medium">Profit</span>
+                                  <span className="font-mono font-bold text-long text-base">+${estimatedProfit.toFixed(2)}</span>
                                 </div>
                               </div>
                             </div>
                           </div>
-
-                          {/* Order Status */}
-                          {orderStatus === 'success' && orderResult && (
-                            <div className="flex items-center gap-2 p-3 mb-3 bg-long/10 border border-long/30 rounded-lg text-long text-sm">
-                              <CheckCircle className="w-4 h-4" />
-                              <span>{orderResult.message}</span>
-                            </div>
-                          )}
-                          
-                          {orderStatus === 'error' && orderResult && (
-                            <div className="flex items-center gap-2 p-3 mb-3 bg-short/10 border border-short/30 rounded-lg text-short text-sm">
-                              <XCircle className="w-4 h-4" />
-                              <span>{orderResult.message}</span>
-                            </div>
-                          )}
-
-                          {/* Hook validation errors (shown immediately from hook state) */}
-                          {orderError && orderStatus === 'idle' && (
-                            <div className="flex items-center gap-2 p-3 mb-3 bg-short/10 border border-short/30 rounded-lg text-short text-sm">
-                              <XCircle className="w-4 h-4" />
-                              <span>{orderError}</span>
-                            </div>
-                          )}
 
                           {/* Trade Button */}
                           {connected ? (
@@ -835,17 +834,17 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                               <button
                                 onClick={() => approveDelegation()}
                                 disabled={isApproving}
-                                className="w-full py-4 rounded-lg font-bold bg-accent text-background hover:shadow-lg hover:shadow-accent/30 transition-all flex items-center justify-center gap-2 text-lg"
+                                className="w-full py-2.5 rounded-lg font-bold text-base bg-accent text-background hover:shadow-md hover:shadow-accent/30 transition-all flex items-center justify-center gap-2"
                               >
                                 {isApproving ? (
                                   <>
-                                    <Loader2 className="w-5 h-5 animate-spin" />
+                                    <Loader2 className="w-4 h-4 animate-spin" />
                                     <span>Enabling...</span>
                                   </>
                                 ) : (
                                   <>
-                                    <Settings className="w-5 h-5" />
-                                    <span>Delegate USDC to Trade</span>
+                                    <Settings className="w-4 h-4" />
+                                    <span>Delegate USDC</span>
                                   </>
                                 )}
                               </button>
@@ -854,10 +853,10 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                                 onClick={handleQuickTrade}
                                 disabled={isPlacing || orderStatus === 'success' || estimatedContracts <= 0 || (orderType === 'limit' && (limitPriceNum <= 0 || limitPriceNum >= 1))}
                                 className={cn(
-                                  'w-full py-3 rounded-lg font-bold transition-all flex items-center justify-center gap-2',
+                                  'w-full py-2.5 rounded-lg font-bold text-base transition-all flex items-center justify-center gap-2',
                                   selectedOutcome === 'YES'
-                                    ? 'bg-long text-background hover:shadow-lg hover:shadow-long/30'
-                                    : 'bg-short text-background hover:shadow-lg hover:shadow-short/30',
+                                    ? 'bg-long text-background hover:shadow-md hover:shadow-long/30'
+                                    : 'bg-short text-background hover:shadow-md hover:shadow-short/30',
                                   (isPlacing || orderStatus === 'success' || estimatedContracts <= 0 || (orderType === 'limit' && (limitPriceNum <= 0 || limitPriceNum >= 1))) && 'opacity-50 cursor-not-allowed'
                                 )}
                               >
@@ -872,26 +871,26 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                                     <span>Done!</span>
                                   </>
                                 ) : orderType === 'limit' ? (
-                                  `Place Limit @ $${limitPriceNum.toFixed(2)}`
+                                  `Limit @ $${limitPriceNum.toFixed(2)}`
                                 ) : (
-                                  `Buy ${estimatedContracts} ${selectedOutcome === 'YES' ? 'ABOVE' : 'BELOW'}`
+                                  `Buy ${estimatedContracts}`
                                 )}
                               </button>
                             )
                           ) : (
-                            <WalletButton className="!w-full !justify-center !bg-accent !text-background hover:!bg-accent-dim !rounded-lg !font-bold !h-14 !text-lg" />
+                            <WalletButton className="!w-full !justify-center !bg-accent !text-background hover:!bg-accent-dim !rounded-lg !font-bold !h-11 !text-base" />
                           )}
                         </>
                       )}
                     </div>
                   ) : (
                     /* Empty state - prompt to select */
-                    <div className="flex-1 flex flex-col items-center justify-center p-6 text-center">
-                      <div className="w-16 h-16 rounded-full bg-surface-light flex items-center justify-center mb-4">
-                        <Zap className="w-8 h-8 text-text-muted" />
+                    <div className="flex-1 flex flex-col items-center justify-center p-4 text-center">
+                      <div className="w-14 h-14 rounded-full bg-surface-light flex items-center justify-center mb-3">
+                        <Zap className="w-7 h-7 text-text-muted" />
                       </div>
-                      <h3 className="font-bold text-lg mb-2">Select a Position</h3>
-                      <p className="text-text-muted text-sm max-w-[200px]">
+                      <h3 className="font-bold text-base mb-2">Select a Position</h3>
+                      <p className="text-text-muted text-sm">
                         Click <span className="text-long font-bold">ABOVE</span> or <span className="text-short font-bold">BELOW</span> to start trading
                       </p>
                     </div>
@@ -900,27 +899,31 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
               </div>
             </div>
 
-            {/* BOTTOM: Positions/Portfolio */}
-            <div className="bg-surface rounded-xl border border-border overflow-hidden">
-              <div className="px-2 py-2 bg-surface-light/30 border-b border-border">
-                <h2 className="font-bold text-lg">Positions / Portfolio</h2>
+            {/* BOTTOM ROW: Trade Blotter (left) + Positions (right) - SWAPPED & TALLER */}
+            <div className="grid grid-cols-12 gap-2">
+              {/* Trade Blotter - Left side */}
+              <div className="col-span-12 lg:col-span-6 h-[280px]">
+                <GlobalTradeBlotter maxTrades={25} compact />
               </div>
-              <div className="min-h-[250px]">
-                <Positions 
-                  onSell={(marketAddress, outcome, shares, avgEntry, price) => {
-                    handleSellFromPositions(marketAddress, outcome, shares, avgEntry, price);
-                    // Scroll to trade panel
-                    window.scrollTo({ top: 0, behavior: 'smooth' });
-                  }}
-                  currentMarketAddress={activeMarket?.address}
-                  currentYesPrice={yesPrice}
-                  currentNoPrice={noPrice}
-                />
+
+              {/* Positions - Right side */}
+              <div className="col-span-12 lg:col-span-6 bg-surface rounded-lg border border-border overflow-hidden h-[280px] flex flex-col">
+                <div className="px-3 py-1.5 bg-surface-light/30 border-b border-border flex-shrink-0">
+                  <h2 className="font-bold text-xs">Positions</h2>
+                </div>
+                <div className="flex-1 overflow-auto">
+                  <Positions 
+                    onSell={(marketAddress, outcome, shares, avgEntry, price) => {
+                      handleSellFromPositions(marketAddress, outcome, shares, avgEntry, price);
+                    }}
+                    currentMarketAddress={activeMarket?.address}
+                    currentYesPrice={yesPrice}
+                    currentNoPrice={noPrice}
+                    compact
+                  />
+                </div>
               </div>
             </div>
-
-            {/* Global Trade Blotter */}
-            <GlobalTradeBlotter className="mt-4" maxTrades={50} />
           </>
         )}
       </main>
@@ -929,7 +932,108 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   );
 }
 
-// Compact Price Box Component - Horizontal layout
+// Compact Price Box Component - Larger and more prominent
+// Price Selector Box - Full-width row layout for stacked display
+function PriceSelectorBox({
+  label,
+  price,
+  outcome,
+  isSelected,
+  onSelect,
+  colorClass,
+  oneClickEnabled = false,
+  oneClickAmount = 0,
+  isLoading = false,
+  isActivating = false,
+}: {
+  label: string;
+  price: number;
+  outcome: 'YES' | 'NO';
+  isSelected: boolean;
+  onSelect: () => void;
+  colorClass: 'long' | 'short';
+  oneClickEnabled?: boolean;
+  oneClickAmount?: number;
+  isLoading?: boolean;
+  isActivating?: boolean;
+}) {
+  const isDisabled = isLoading || isActivating;
+  
+  return (
+    <button
+      onClick={onSelect}
+      disabled={isDisabled}
+      className={cn(
+        'relative w-full px-4 py-3 transition-all overflow-hidden btn-press',
+        'flex items-center justify-between',
+        isActivating && 'opacity-60 cursor-not-allowed',
+        !isActivating && 'hover:bg-surface-light active:scale-[0.99]',
+        isSelected && !isActivating
+          ? colorClass === 'long' 
+            ? 'bg-long/15' 
+            : 'bg-short/15'
+          : 'bg-surface',
+        oneClickEnabled && !isDisabled && 'ring-inset ring-1 ring-warning/30',
+        isLoading && 'opacity-75 cursor-wait'
+      )}
+    >
+      {/* Loading indicator */}
+      {isLoading && (
+        <div className="absolute inset-0 flex items-center justify-center bg-surface/80 z-10">
+          <Loader2 className={cn(
+            'w-5 h-5 animate-spin',
+            colorClass === 'long' ? 'text-long' : 'text-short'
+          )} />
+        </div>
+      )}
+      
+      {/* Left: Price */}
+      <div className="flex items-center gap-2">
+        {isActivating ? (
+          <div className="flex items-center gap-1">
+            <Loader2 className="w-4 h-4 animate-spin text-text-muted" />
+            <span className="text-lg text-text-muted font-mono">--</span>
+          </div>
+        ) : (
+          <span className={cn(
+            'text-2xl font-black font-mono',
+            colorClass === 'long' ? 'text-long' : 'text-short'
+          )}>
+            ${price.toFixed(2)}
+          </span>
+        )}
+        
+        {/* Selected indicator */}
+        {isSelected && !isActivating && (
+          <CheckCircle className={cn(
+            'w-5 h-5',
+            colorClass === 'long' ? 'text-long' : 'text-short'
+          )} />
+        )}
+      </div>
+
+      {/* Right: Label */}
+      <div className="flex items-center gap-2">
+        {oneClickEnabled && !isActivating && (
+          <span className="text-[10px] text-warning font-medium px-1.5 py-0.5 bg-warning/10 rounded">
+            ⚡ ${oneClickAmount}
+          </span>
+        )}
+        <span className={cn(
+          'text-sm font-bold uppercase tracking-wide',
+          colorClass === 'long' ? 'text-long' : 'text-short'
+        )}>
+          {label}
+        </span>
+        <div className={cn(
+          'w-2.5 h-2.5 rounded-full',
+          colorClass === 'long' ? 'bg-long' : 'bg-short'
+        )} />
+      </div>
+    </button>
+  );
+}
+
 function CompactPriceBox({
   label,
   price,
@@ -960,88 +1064,70 @@ function CompactPriceBox({
       onClick={onSelect}
       disabled={isDisabled}
       className={cn(
-        'relative p-3 rounded-xl border-2 transition-all text-center group overflow-hidden btn-press',
-        'bg-surface',
+        'relative px-4 py-3 rounded-lg border transition-all group overflow-hidden btn-press',
+        'bg-surface flex items-center justify-between gap-3',
         isActivating && 'opacity-60 cursor-not-allowed',
-        !isActivating && 'hover:bg-surface-light',
+        !isActivating && 'hover:bg-surface-light active:scale-[0.98]',
         isSelected && !isActivating
           ? colorClass === 'long' 
-            ? 'border-long shadow-lg shadow-long/20' 
-            : 'border-short shadow-lg shadow-short/20'
+            ? 'border-long shadow-lg shadow-long/20 bg-long/5' 
+            : 'border-short shadow-lg shadow-short/20 bg-short/5'
           : isActivating 
             ? 'border-accent/30'
             : 'border-border hover:border-opacity-50',
-        oneClickEnabled && !isDisabled && 'ring-2 ring-warning/30 hover:ring-warning/50',
+        oneClickEnabled && !isDisabled && 'ring-1 ring-warning/30 hover:ring-warning/50',
         isLoading && 'opacity-75 cursor-wait'
       )}
     >
-      {/* Background glow */}
-      <div className={cn(
-        'absolute inset-0 opacity-0 transition-opacity duration-300',
-        (isSelected || oneClickEnabled) && !isActivating && 'opacity-100',
-        colorClass === 'long' ? 'bg-gradient-to-br from-long/10 to-transparent' : 'bg-gradient-to-br from-short/10 to-transparent'
-      )} />
-
-      <div className="relative">
+      <div className="flex items-center gap-2">
         {/* Loading State */}
         {isLoading ? (
-          <div className="flex flex-col items-center justify-center py-2">
-            <Loader2 className={cn(
-              'w-8 h-8 animate-spin mb-2',
-              colorClass === 'long' ? 'text-long' : 'text-short'
-            )} />
-            <span className="text-sm text-text-muted">Placing order...</span>
-          </div>
+          <Loader2 className={cn(
+            'w-4 h-4 animate-spin',
+            colorClass === 'long' ? 'text-long' : 'text-short'
+          )} />
         ) : isActivating ? (
-          /* Activating State */
-          <div className="flex flex-col items-center justify-center py-2">
-            <div className="text-3xl font-bold font-mono mb-1 text-text-muted">
-              --
-            </div>
-            <div className="inline-block px-3 py-1 rounded-full text-xs font-bold bg-surface-light text-text-muted">
-              {label}
-            </div>
-            <div className="mt-2 text-xs text-text-muted">
-              Waiting for strike...
-            </div>
-          </div>
+          <Loader2 className="w-4 h-4 animate-spin text-text-muted" />
         ) : (
-          <>
-            {/* Price Display */}
-                            <div className={cn(
-                              'text-2xl font-bold font-mono mb-1 transition-transform',
-                              colorClass === 'long' ? 'text-long' : 'text-short',
-                              'group-hover:scale-105'
-                            )}>
-                              ${price.toFixed(2)}
-                            </div>
-            
-            {/* Label Badge */}
-            <div className={cn(
-              'inline-block px-3 py-1 rounded-full text-xs font-bold',
-              colorClass === 'long' ? 'bg-long/20 text-long' : 'bg-short/20 text-short'
-            )}>
-              {label}
-            </div>
+          <div className={cn(
+            'w-2.5 h-2.5 rounded-full',
+            colorClass === 'long' ? 'bg-long' : 'bg-short'
+          )} />
+        )}
+        
+        {/* Label */}
+        <span className={cn(
+          'text-sm font-bold',
+          colorClass === 'long' ? 'text-long' : 'text-short'
+        )}>
+          {label}
+        </span>
+      </div>
 
-            {/* One-Click Mode Indicator */}
-            {oneClickEnabled && (
-              <div className="mt-2 flex items-center justify-center gap-1 text-xs text-warning font-bold">
-                <Zap className="w-3 h-3" />
-                <span>Tap to buy ${oneClickAmount}</span>
-              </div>
-            )}
-
-            {/* Selected indicator */}
-            {isSelected && !oneClickEnabled && (
-              <div className={cn(
-                'absolute -top-1 -right-1 w-5 h-5 rounded-full flex items-center justify-center',
-                colorClass === 'long' ? 'bg-long' : 'bg-short'
-              )}>
-                <CheckCircle className="w-3 h-3 text-background" />
-              </div>
-            )}
-          </>
+      {/* Price */}
+      <div className="flex items-center gap-2">
+        {isActivating ? (
+          <span className="text-base font-mono text-text-muted">--</span>
+        ) : (
+          <span className={cn(
+            'text-xl font-bold font-mono',
+            colorClass === 'long' ? 'text-long' : 'text-short'
+          )}>
+            ${price.toFixed(2)}
+          </span>
+        )}
+        
+        {/* One-Click indicator */}
+        {oneClickEnabled && !isActivating && (
+          <Zap className="w-3.5 h-3.5 text-warning" />
+        )}
+        
+        {/* Selected indicator */}
+        {isSelected && !oneClickEnabled && !isActivating && (
+          <CheckCircle className={cn(
+            'w-4 h-4',
+            colorClass === 'long' ? 'text-long' : 'text-short'
+          )} />
         )}
       </div>
     </button>
@@ -1113,22 +1199,22 @@ function TimeCountdown({
   // Show activation state
   if (isActivating) {
     return (
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-2">
         {/* Activation display */}
-        <div className="flex items-center gap-3 px-5 py-3 rounded-xl font-mono transition-all bg-accent/10 text-accent border-2 border-accent/50">
-          <div className="relative w-6 h-6">
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg font-mono transition-all bg-accent/10 text-accent border border-accent/50">
+          <div className="relative w-4 h-4">
             <div className="absolute inset-0 rounded-full bg-accent/30 animate-ping" />
             <div className="absolute inset-0 flex items-center justify-center">
-              <Loader2 className="w-5 h-5 animate-spin" />
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
             </div>
           </div>
-          <span className="font-bold text-xl animate-pulse">
+          <span className="font-bold text-sm animate-pulse">
             Activating...
           </span>
         </div>
         
         {/* Animated shimmer progress bar */}
-        <div className="w-40 h-3 bg-surface rounded-full overflow-hidden border-2 border-accent/30">
+        <div className="w-24 h-2 bg-surface rounded-full overflow-hidden border border-accent/30">
           <div className="h-full w-full bg-gradient-to-r from-accent/20 via-accent to-accent/20 animate-shimmer" 
                style={{ backgroundSize: '200% 100%' }} />
         </div>
@@ -1139,37 +1225,37 @@ function TimeCountdown({
   if (!timeRemaining) return null;
 
   return (
-    <div className="flex items-center gap-4">
-      {/* Large countdown display */}
+    <div className="flex items-center gap-2">
+      {/* Compact countdown display */}
       <div className={cn(
-        'flex items-center gap-3 px-5 py-3 rounded-xl font-mono transition-all',
+        'flex items-center gap-2 px-3 py-1.5 rounded-lg font-mono transition-all',
         timeRemaining.isExpired 
-          ? 'bg-warning/20 text-warning border-2 border-warning/50' 
+          ? 'bg-warning/20 text-warning border border-warning/50' 
           : timeRemaining.urgent 
-            ? 'bg-short/20 text-short border-2 border-short/50 animate-pulse' 
-            : 'bg-surface text-text-primary border-2 border-border'
+            ? 'bg-short/20 text-short border border-short/50 animate-pulse' 
+            : 'bg-surface text-text-primary border border-border'
       )}>
         <Clock className={cn(
           'transition-all',
-          timeRemaining.urgent ? 'w-7 h-7 animate-bounce' : 'w-6 h-6'
+          timeRemaining.urgent ? 'w-4 h-4 animate-bounce' : 'w-4 h-4'
         )} />
         {timeRemaining.isExpired ? (
-          <span className="flex items-center gap-2 text-xl font-bold">
-            <RefreshCw className="w-5 h-5 animate-spin" />
+          <span className="flex items-center gap-1.5 text-sm font-bold">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
             Refreshing...
           </span>
         ) : (
           <span className={cn(
             'font-bold tabular-nums tracking-wider',
-            timeRemaining.urgent ? 'text-3xl' : 'text-2xl'
+            timeRemaining.urgent ? 'text-lg' : 'text-base'
           )}>
             {timeRemaining.text}
           </span>
         )}
       </div>
       
-      {/* Large progress bar */}
-      <div className="w-40 h-3 bg-surface rounded-full overflow-hidden border-2 border-border">
+      {/* Compact progress bar */}
+      <div className="w-20 h-2 bg-surface rounded-full overflow-hidden border border-border">
         <div 
           className={cn(
             'h-full rounded-full transition-all duration-1000',
@@ -1189,4 +1275,5 @@ function TimeCountdown({
     </div>
   );
 }
+
 

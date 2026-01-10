@@ -505,6 +505,104 @@ Since this is a centralized order book, we need to authenticate users to the API
 - **No Bonding Curve:** The system does not algorithmically set prices.
 - **Market Making:** To ensure liquidity, a "Market Maker Bot" is recommended to quote 2-sided markets (Bid/Ask) based on external volatility models.
 
+## 5.1 Single Orderbook Model (YES-Only Architecture)
+
+**CRITICAL DESIGN DECISION:** The system uses a **single orderbook model** where only the YES orderbook exists. The NO orderbook is **derived** as the complement by the frontend.
+
+### Why Single Orderbook?
+
+In binary markets, YES + NO must always equal $1.00. With dual orderbooks:
+- YES ASK @ $0.52 and NO ASK @ $0.46 could exist independently
+- User sees ABOVE = $0.52, BELOW = $0.46 → Sum = $0.98 (broken!)
+- This creates arbitrage: Buy both for $0.98, one pays $1.00 = free money
+
+With single orderbook:
+- Only YES orderbook exists with real orders
+- NO prices are ALWAYS derived as `1 - YES_price`
+- Guarantees: ABOVE + BELOW = $1.00 always
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     SINGLE ORDERBOOK MODEL                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────┐        ┌─────────────────────────────────────┐│
+│  │   YES ORDERBOOK     │        │        NO ORDERBOOK (DERIVED)       ││
+│  │   (Real Orders)     │        │                                     ││
+│  ├─────────────────────┤        ├─────────────────────────────────────┤│
+│  │ ASKS (sell YES)     │   →    │ BIDS (buy NO) = 1 - YES_ASK         ││
+│  │ $0.52  500 contracts│   →    │ $0.48  500 contracts                ││
+│  │ $0.53  500 contracts│   →    │ $0.47  500 contracts                ││
+│  │ $0.54  500 contracts│   →    │ $0.46  500 contracts                ││
+│  ├─────────────────────┤        ├─────────────────────────────────────┤│
+│  │ BIDS (buy YES)      │   →    │ ASKS (sell NO) = 1 - YES_BID        ││
+│  │ $0.48  500 contracts│   →    │ $0.52  500 contracts                ││
+│  │ $0.47  500 contracts│   →    │ $0.53  500 contracts                ││
+│  │ $0.46  500 contracts│   →    │ $0.54  500 contracts                ││
+│  └─────────────────────┘        └─────────────────────────────────────┘│
+│                                                                         │
+│  TRADE MODAL DISPLAY (with 4 cent spread):                              │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ ABOVE (Buy YES): $0.52  ← Best YES ASK                          │   │
+│  │ BELOW (Buy NO):  $0.52  ← 1 - Best YES BID (NOT YES ASK!)       │   │
+│  │ ────────────────────────                                        │   │
+│  │ SUM:             $1.04  ← Reflects MM spread (both pay to cross)│   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  NOTE: With spread=0, SUM=$1.00. With spread, SUM>$1.00 (correct!)     │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Trade Execution Flow
+
+**Economics of NO Orders:**
+When user buys NO @ $0.52 (with YES BID @ $0.48):
+1. User pays $0.52 to acquire NO position
+2. MM takes YES position (effectively "buying" YES at $0.48)
+3. Total $1.00 is locked in the market
+4. Winner at resolution gets $1.00
+
+This means: **Buy NO matches against YES BID** (MM buying YES)
+
+```
+User Action          →  Orderbook Match     →  MM Action
+─────────────────────────────────────────────────────────────────────
+Buy YES @ $0.52      →  Match YES ASK       →  MM sells YES @ $0.52
+Sell YES @ $0.48     →  Match YES BID       →  MM buys YES @ $0.48
+Buy NO @ $0.52       →  Match YES BID@$0.48 →  MM buys YES @ $0.48
+Sell NO @ $0.48      →  Match YES ASK@$0.52 →  MM sells YES @ $0.52
+```
+
+**Side Transformation Rule:**
+- YES orders: Match **opposite** side (BID→ASK, ASK→BID)
+- NO orders: Match **same** side in YES book (BID→BID, ASK→ASK)
+
+**Price Derivation (CRITICAL for UI):**
+- Buy YES: show YES ASK (direct)
+- Buy NO: show 1 - YES BID (NO ASK = complement of YES BID)
+- Sell YES: show YES BID (direct)
+- Sell NO: show 1 - YES ASK (NO BID = complement of YES ASK)
+
+### Implementation Details
+
+| Component | Behavior |
+|-----------|----------|
+| **MM Bot** | Only quotes YES side (bids + asks) |
+| **Orderbook Service** | Only maintains YES orderbook in Redis |
+| **Frontend Store** | Derives NO asks from YES bids, NO bids from YES asks |
+| **Desktop/Mobile View** | ABOVE = YES ASK, BELOW = 1 - YES BID |
+| **Matching Engine** | Transforms NO orders: BID→BID, ASK→ASK with complement price |
+
+### Benefits
+
+1. **Correct Pricing:** Displayed price = execution price (no slippage surprises)
+2. **Simpler MM:** Only manage one orderbook
+3. **Lower Costs:** Half the orders to place/cancel
+4. **Transparent Spread:** ABOVE + BELOW > $1.00 clearly shows MM spread
+
 ## 6. Database Schema (PostgreSQL)
 
 ### Entity Relationship Diagram

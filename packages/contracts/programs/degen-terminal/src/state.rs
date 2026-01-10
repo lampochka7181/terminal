@@ -117,8 +117,8 @@ pub const MAX_ORDER_SIZE: u64 = 100_000_000_000;  // 100,000 contracts max
 /// Max position size per user per market (in 6 decimals)
 pub const MAX_POSITION_SIZE: u64 = 500_000_000_000;  // 500,000 contracts
 
-/// Trading closes 30 seconds before expiry
-pub const TRADING_CLOSE_BUFFER: i64 = 30;
+/// Trading closes 2 seconds before expiry (matches MM bot + resolver timing)
+pub const TRADING_CLOSE_BUFFER: i64 = 2;
 
 /// Max string lengths
 pub const MAX_ASSET_LEN: usize = 10;

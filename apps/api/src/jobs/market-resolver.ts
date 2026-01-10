@@ -231,19 +231,27 @@ async function resolveMarket(
   let onChainResolvePending: Promise<string | null> | null = null;
   let settlementPrepPending: Promise<SettlementPrepData | null>;
   
-  // Start on-chain resolve (don't await yet)
-  if (anchorClient.isReady()) {
-    logger.info(`Resolving market on-chain: ${market.pubkey} (outcome=${outcome}, price=${finalPrice})`);
-    
-    onChainResolvePending = anchorClient.resolveMarket({
-      marketPubkey: market.pubkey,
-      outcome,
-      finalPrice,
-    }).then(sig => {
+  // Helper to attempt on-chain resolution with retry for clock skew
+  const attemptResolve = async (retryCount = 0): Promise<string | null> => {
+    try {
+      const sig = await anchorClient.resolveMarket({
+        marketPubkey: market.pubkey,
+        outcome,
+        finalPrice,
+      });
       logger.info(`✅ Market resolved on-chain: ${sig}`);
       return sig;
-    }).catch(async (err: any) => {
+    } catch (err: any) {
       const errorMsg = err.message || '';
+      
+      // Handle "MarketNotExpired" error (0x1777) - clock skew between server and Solana
+      // Retry once after a short delay to allow Solana clock to catch up
+      if ((errorMsg.includes('MarketNotExpired') || errorMsg.includes('0x1777')) && retryCount < 1) {
+        logger.warn(`Market ${marketId} not yet expired on-chain (clock skew), retrying in 1s...`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        return attemptResolve(retryCount + 1);
+      }
+      
       if (errorMsg.includes('MarketAlreadyResolved') || errorMsg.includes('0x1778')) {
         logger.debug(`Market ${marketId} already resolved on-chain, continuing`);
       } else if (errorMsg.includes('AccountNotInitialized') || errorMsg.includes('0xbc4')) {
@@ -253,7 +261,13 @@ async function resolveMarket(
         logger.error(`❌ Failed to resolve market on-chain: ${errorMsg}`);
       }
       return null;
-    });
+    }
+  };
+  
+  // Start on-chain resolve (don't await yet)
+  if (anchorClient.isReady()) {
+    logger.info(`Resolving market on-chain: ${market.pubkey} (outcome=${outcome}, price=${finalPrice})`);
+    onChainResolvePending = attemptResolve();
   }
   
   // Start settlement prep IN PARALLEL with on-chain resolve

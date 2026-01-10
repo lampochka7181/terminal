@@ -1,24 +1,24 @@
 import type { Metadata } from 'next';
-import { Space_Grotesk, IBM_Plex_Mono, Outfit } from 'next/font/google';
+import { Rajdhani, Inter, JetBrains_Mono } from 'next/font/google';
 import './globals.css';
 import { Providers } from './providers';
 
-// Primary heading font - geometric and bold
-const spaceGrotesk = Space_Grotesk({ 
+// Display font - Futuristic, bold, perfect for trading terminals
+const rajdhani = Rajdhani({ 
   subsets: ['latin'],
   variable: '--font-display',
   weight: ['400', '500', '600', '700'],
 });
 
-// Body font - clean and modern
-const outfit = Outfit({
+// Body font - Clean, highly readable for long sessions
+const inter = Inter({
   subsets: ['latin'],
   variable: '--font-sans',
   weight: ['300', '400', '500', '600', '700'],
 });
 
-// Monospace font - for prices and numbers
-const ibmPlexMono = IBM_Plex_Mono({ 
+// Monospace font - Premium, designed for code/data
+const jetbrainsMono = JetBrains_Mono({ 
   subsets: ['latin'],
   variable: '--font-mono',
   weight: ['400', '500', '600', '700'],
@@ -35,7 +35,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className={`${spaceGrotesk.variable} ${outfit.variable} ${ibmPlexMono.variable}`}>
+    <html lang="en" className={`${rajdhani.variable} ${inter.variable} ${jetbrainsMono.variable}`}>
       <body className="bg-background text-text-primary antialiased font-sans">
         <Providers>
           {children}

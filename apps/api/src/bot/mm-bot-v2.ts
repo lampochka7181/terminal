@@ -84,7 +84,7 @@ function loadConfig(): MMConfigV2 {
     
     // Time
     quoteUpdateMs: parseInt(process.env.MM_QUOTE_UPDATE_MS || '250'),
-    closeBeforeExpiryMs: parseInt(process.env.MM_CLOSE_BEFORE_EXPIRY_MS || '5000'),
+    closeBeforeExpiryMs: parseInt(process.env.MM_CLOSE_BEFORE_EXPIRY_MS || '2000'),
     stopQuotingLoserPct: parseFloat(process.env.MM_STOP_QUOTING_LOSER_PCT || '0.10'),
     
     // Volatility (annualized)
@@ -349,6 +349,17 @@ function shouldQuoteSide(
 
 /**
  * Generate complete quote set for a market
+ * 
+ * SINGLE ORDERBOOK MODEL:
+ * - Only YES quotes are generated and placed in the orderbook
+ * - NO prices are derived as complements (1 - YES price) by the frontend
+ * - This ensures ABOVE + BELOW always = $1.00 (no arbitrage)
+ * - MM stays delta neutral: buying YES vs selling YES (which = buying NO)
+ * 
+ * How NO trades work:
+ * - User buys NO @ $0.48 → Matches against YES BID @ $0.52
+ * - User sells NO @ $0.48 → Matches against YES ASK @ $0.52
+ * - Net effect: Same as trading against complement YES order
  */
 function generateQuotes(
   fairValueYes: number,
@@ -367,14 +378,14 @@ function generateQuotes(
   
   const yesBids: Quote[] = [];
   const yesAsks: Quote[] = [];
-  const noBids: Quote[] = [];
-  const noAsks: Quote[] = [];
   
-  // Generate YES quotes
+  // SINGLE ORDERBOOK: Only generate YES quotes
+  // NO quotes are derived by the matching engine and frontend
   for (let i = 0; i < config.levels; i++) {
     const levelOffset = i * config.levelSpacing;
     
-    // YES bid (we buy YES)
+    // YES bid (we buy YES / user sells YES / user buys NO)
+    // When user buys NO @ (1-bid), they match against this YES bid
     if (shouldQuoteSide(fairValueYes, timeRemainingPct, 'bid', 'YES', config)) {
       const bidPrice = fairValueYes - halfSpread - levelOffset - skew;
       const bidSize = calculateDynamicSize(fairValueYes, timeRemainingPct, yesPosition, 'bid', 'YES', config);
@@ -387,7 +398,8 @@ function generateQuotes(
       }
     }
     
-    // YES ask (we sell YES = buy NO from counterparty perspective)
+    // YES ask (we sell YES / user buys YES / user sells NO)
+    // When user sells NO @ (1-ask), they match against this YES ask
     if (shouldQuoteSide(fairValueYes, timeRemainingPct, 'ask', 'YES', config)) {
       const askPrice = fairValueYes + halfSpread + levelOffset - skew;
       const askSize = calculateDynamicSize(fairValueYes, timeRemainingPct, -noPosition, 'ask', 'YES', config);
@@ -401,42 +413,14 @@ function generateQuotes(
     }
   }
   
-  // Generate NO quotes (complementary to YES)
-  for (let i = 0; i < config.levels; i++) {
-    const levelOffset = i * config.levelSpacing;
-    
-    // NO bid (we buy NO)
-    if (shouldQuoteSide(fairValueYes, timeRemainingPct, 'bid', 'NO', config)) {
-      const bidPrice = fairValueNo - halfSpread - levelOffset + skew;  // Opposite skew direction
-      const bidSize = calculateDynamicSize(fairValueNo, timeRemainingPct, noPosition, 'bid', 'NO', config);
-      
-      if (bidPrice >= 0.01 && bidPrice <= 0.98) {
-        noBids.push({
-          price: Math.round(bidPrice * 100) / 100,
-          size: bidSize,
-        });
-      }
-    }
-    
-    // NO ask (we sell NO = buy YES from counterparty perspective)
-    if (shouldQuoteSide(fairValueYes, timeRemainingPct, 'ask', 'NO', config)) {
-      const askPrice = fairValueNo + halfSpread + levelOffset + skew;  // Opposite skew direction
-      const askSize = calculateDynamicSize(fairValueNo, timeRemainingPct, -yesPosition, 'ask', 'NO', config);
-      
-      if (askPrice >= 0.02 && askPrice <= 0.99) {
-        noAsks.push({
-          price: Math.round(askPrice * 100) / 100,
-          size: askSize,
-        });
-      }
-    }
-  }
+  // NO quotes are empty - they're derived by matching engine from YES quotes
+  // Frontend derives NO prices as complement: NO_ASK = 1 - YES_ASK
   
   return {
     yesBids,
     yesAsks,
-    noBids,
-    noAsks,
+    noBids: [],  // Empty - derived from YES bids
+    noAsks: [],  // Empty - derived from YES asks
     fairValueYes,
     fairValueNo,
     spread,
@@ -633,6 +617,7 @@ class MarketMakerBotV2 {
     }
     
     // Close WebSocket
+    this.stopWsPing();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -666,6 +651,9 @@ class MarketMakerBotV2 {
       this.ws.on('open', () => {
         mmLogger.info('MM Bot V2 WebSocket connected');
         
+        // Start ping interval to keep connection alive
+        this.startWsPing();
+        
         // Subscribe to price feeds
         this.ws?.send(JSON.stringify({
           op: 'subscribe',
@@ -695,6 +683,7 @@ class MarketMakerBotV2 {
       
       this.ws.on('close', () => {
         mmLogger.warn('MM Bot V2 WebSocket disconnected');
+        this.stopWsPing();
         this.scheduleWsReconnect();
       });
       
@@ -721,6 +710,30 @@ class MarketMakerBotV2 {
         this.connectWebSocket();
       }
     }, this.config.wsReconnectMs);
+  }
+
+  // Ping interval for WebSocket keepalive
+  private wsPingInterval: NodeJS.Timeout | null = null;
+  
+  private startWsPing(): void {
+    // Clear any existing ping interval
+    if (this.wsPingInterval) {
+      clearInterval(this.wsPingInterval);
+    }
+    
+    // Send ping every 25 seconds (server timeout is 60s)
+    this.wsPingInterval = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ op: 'ping' }));
+      }
+    }, 25000);
+  }
+  
+  private stopWsPing(): void {
+    if (this.wsPingInterval) {
+      clearInterval(this.wsPingInterval);
+      this.wsPingInterval = null;
+    }
   }
 
   private handleWsMessage(msg: any): void {
@@ -836,15 +849,23 @@ class MarketMakerBotV2 {
     
     // Filter to configured assets AND only activated markets (strikePrice > 0)
     // Markets with strikePrice = '0' are pending activation and shouldn't be quoted
+    // Also skip 24h markets for testing static orderbook behavior
+    const SKIP_TIMEFRAMES = ['24h']; // Timeframes to skip for static orderbook testing
+    
     const filteredMarkets = activeMarkets.filter(m => {
       const hasValidStrike = parseFloat(m.strikePrice) > 0;
       const isConfiguredAsset = this.config.assets.length === 0 || this.config.assets.includes(m.asset);
+      const isSkippedTimeframe = SKIP_TIMEFRAMES.includes(m.timeframe);
       
       if (!hasValidStrike) {
         mmLogger.debug(`Skipping pending market ${m.asset}-${m.timeframe} (strikePrice=0)`);
       }
       
-      return hasValidStrike && isConfiguredAsset;
+      if (isSkippedTimeframe) {
+        mmLogger.debug(`Skipping ${m.asset}-${m.timeframe} (timeframe in skip list for static testing)`);
+      }
+      
+      return hasValidStrike && isConfiguredAsset && !isSkippedTimeframe;
     });
     
     for (const market of filteredMarkets) {
@@ -993,30 +1014,32 @@ class MarketMakerBotV2 {
     const state = this.markets.get(marketId);
     if (!state) return;
     
-    // Cancel existing orders
-    await this.cancelAllOrders(marketId);
+    // IMPORTANT: Place new orders FIRST, then cancel old ones
+    // This eliminates the "empty orderbook" window that causes UI flickering
+    // Users always see liquidity instead of a brief empty state
     
-    // Place orders sequentially to avoid DB connection pool exhaustion
-    // (Parallelization was causing too many simultaneous connections)
+    // 1. Capture OLD order IDs to cancel later
+    const oldOrderIds = new Set(state.orders.keys());
+    
+    // 2. Place new orders - SINGLE ORDERBOOK: Only place YES orders
+    // NO orders are derived by the matching engine when users trade NO
     for (const bid of quotes.yesBids) {
       await this.placeOrder(marketId, 'BID', 'YES', bid.price, bid.size);
     }
     for (const ask of quotes.yesAsks) {
       await this.placeOrder(marketId, 'ASK', 'YES', ask.price, ask.size);
     }
-    for (const bid of quotes.noBids) {
-      await this.placeOrder(marketId, 'BID', 'NO', bid.price, bid.size);
-    }
-    for (const ask of quotes.noAsks) {
-      await this.placeOrder(marketId, 'ASK', 'NO', ask.price, ask.size);
-    }
+    // NO orders removed - they're derived from YES orders by matching engine
     
-    // Broadcast orderbook updates using PUBKEY (frontend subscribes by pubkey, not db id)
+    // 3. Cancel OLD orders (now the book still has new orders for liquidity)
+    await this.cancelOrdersById(marketId, oldOrderIds);
+    
+    // 4. Broadcast orderbook updates - only YES orderbook is real
+    // Frontend derives NO prices as complements (1 - YES price)
     try {
       const yesSnapshot = await orderbookService.getSnapshot(marketId, 'YES');
-      const noSnapshot = await orderbookService.getSnapshot(marketId, 'NO');
       
-      // Use pubkey for broadcast channel (frontend subscribes by market address)
+      // Broadcast YES orderbook (the only real orderbook)
       broadcastOrderbookUpdate(
         state.pubkey,
         yesSnapshot.bids.map(l => [l.price, l.size] as [number, number]),
@@ -1025,13 +1048,7 @@ class MarketMakerBotV2 {
         'YES'
       );
       
-      broadcastOrderbookUpdate(
-        state.pubkey,
-        noSnapshot.bids.map(l => [l.price, l.size] as [number, number]),
-        noSnapshot.asks.map(l => [l.price, l.size] as [number, number]),
-        noSnapshot.sequenceId,
-        'NO'
-      );
+      // NO orderbook broadcast removed - frontend derives from YES
     } catch {}
   }
 
@@ -1117,6 +1134,15 @@ class MarketMakerBotV2 {
       
       if (result.addedToBook) {
         state.orders.set(order.id, { id: order.id, side, outcome, price, size });
+        mmLogger.debug(
+          `[MM] Added to book: ${side} ${outcome} @ $${price.toFixed(2)}`
+        );
+      } else {
+        // DEBUG: Log when order was NOT added - this helps diagnose price mismatch
+        mmLogger.warn(
+          `[MM] NOT added to book: ${side} ${outcome} @ $${price.toFixed(2)} ` +
+          `(fills=${result.fills.length}, seq=${result.sequenceId})`
+        );
       }
       
       // Track fills
@@ -1150,8 +1176,20 @@ class MarketMakerBotV2 {
     const state = this.markets.get(marketId);
     if (!state) return;
     
+    await this.cancelOrdersById(marketId, new Set(state.orders.keys()));
+  }
+
+  /**
+   * Cancel specific orders by ID
+   * Used by updateMarketOrders to cancel OLD orders after NEW orders are placed
+   * This prevents the empty-book race condition
+   */
+  private async cancelOrdersById(marketId: string, orderIds: Set<string>): Promise<void> {
+    const state = this.markets.get(marketId);
+    if (!state) return;
+    
     // Cancel orders sequentially to avoid DB connection pool exhaustion
-    for (const orderId of state.orders.keys()) {
+    for (const orderId of orderIds) {
       try {
         const o = state.orders.get(orderId);
         if (o && this.userId) {
@@ -1172,11 +1210,12 @@ class MarketMakerBotV2 {
           if (!config.disableMmOrderPersistence) {
             await orderService.cancel(orderId, 'MM_CANCEL');
           }
+          
+          // Remove from tracking
+          state.orders.delete(orderId);
         }
       } catch {}
     }
-    
-    state.orders.clear();
   }
 
   private onFill(fill: { marketId: string; side: 'BID' | 'ASK'; outcome: 'YES' | 'NO'; size: number }): void {

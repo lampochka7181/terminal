@@ -155,9 +155,11 @@ export class MarketService {
 
   /**
    * Get OPEN markets that have already expired (need to be closed)
+   * Uses a 500ms buffer to account for clock skew between server and Solana cluster
    */
   async getExpiredOpenMarkets(): Promise<Market[]> {
-    const now = new Date();
+    // Add 500ms buffer to prevent "MarketNotExpired" errors from clock skew
+    const now = new Date(Date.now() - 500);
     
     const result = await db
       .select()
@@ -174,9 +176,11 @@ export class MarketService {
 
   /**
    * Get markets ready for resolution (expired but not resolved)
+   * Uses a 500ms buffer to account for clock skew between server and Solana cluster
    */
   async getMarketsToResolve(): Promise<Market[]> {
-    const now = new Date();
+    // Add 500ms buffer to prevent "MarketNotExpired" errors from clock skew
+    const now = new Date(Date.now() - 500);
     
     const result = await db
       .select()

@@ -87,13 +87,14 @@ async function cancelOrdersForClosingMarkets(now: Date): Promise<void> {
         await orderService.cancel(order.id, 'MARKET_CLOSING');
       }
       
-      // Broadcast orderbook update (empty book)
-      const snapshot = await orderbookService.getSnapshot(market.id, 'YES');
+      // SINGLE ORDERBOOK MODEL: Only broadcast YES orderbook (NO is derived by frontend)
+      const yesSnapshot = await orderbookService.getSnapshot(market.id, 'YES');
       broadcastOrderbookUpdate(
-        market.id,
-        snapshot.bids.map(l => [l.price, l.size] as [number, number]),
-        snapshot.asks.map(l => [l.price, l.size] as [number, number]),
-        snapshot.sequenceId
+        market.pubkey,
+        yesSnapshot.bids.map(l => [l.price, l.size] as [number, number]),
+        yesSnapshot.asks.map(l => [l.price, l.size] as [number, number]),
+        yesSnapshot.sequenceId,
+        'YES'
       );
       
     } catch (err: any) {
@@ -155,15 +156,15 @@ async function cancelExpiredOrders(now: Date): Promise<void> {
     try {
       const firstOrder = marketOrders[0];
       if (firstOrder?.outcome) {
-        const snapshot = await orderbookService.getSnapshot(
-          marketId,
-          firstOrder.outcome as 'YES' | 'NO'
-        );
+        const market = await marketService.getById(marketId);
+        const outcome = firstOrder.outcome as 'YES' | 'NO';
+        const snapshot = await orderbookService.getSnapshot(marketId, outcome);
         broadcastOrderbookUpdate(
-          marketId,
+          market?.pubkey || marketId,
           snapshot.bids.map(l => [l.price, l.size] as [number, number]),
           snapshot.asks.map(l => [l.price, l.size] as [number, number]),
-          snapshot.sequenceId
+          snapshot.sequenceId,
+          outcome  // FIX: Pass the correct outcome!
         );
       }
     } catch (err) {

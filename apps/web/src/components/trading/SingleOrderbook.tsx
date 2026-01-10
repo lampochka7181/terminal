@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useCallback, useRef, memo, useState } from 'react';
+import { useEffect, useCallback, useRef, memo } from 'react';
 import { cn } from '@/lib/utils';
 import { 
   useOrderbookStore, 
@@ -14,6 +14,7 @@ interface SingleOrderbookProps {
   marketAddress: string;
   className?: string;
   onPriceClick?: (price: number, side: 'bid' | 'ask') => void;
+  compact?: boolean;
 }
 
 /**
@@ -22,20 +23,19 @@ interface SingleOrderbookProps {
  * - NO price is always displayed as (1 - YES price)
  * - Simplest UX for binary markets
  */
-export function SingleOrderbook({ marketAddress, className, onPriceClick }: SingleOrderbookProps) {
+export function SingleOrderbook({ marketAddress, className, onPriceClick, compact = false }: SingleOrderbookProps) {
   const subscribed = useRef(false);
   const { 
     yes, 
     sequenceId, 
     isLoading, 
     setOrderbook, 
-    setBothOrderbooks,
     updateLevel,
     setLoading, 
     setError 
   } = useOrderbookStore();
   
-  // Fetch initial orderbook data
+  // Fetch initial orderbook data (SINGLE ORDERBOOK MODEL: only YES)
   const fetchOrderbook = useCallback(async () => {
     if (!marketAddress) return;
     
@@ -43,17 +43,16 @@ export function SingleOrderbook({ marketAddress, className, onPriceClick }: Sing
     try {
       const data = await api.getOrderbook(marketAddress) as any;
       
+      // SINGLE ORDERBOOK MODEL: Only fetch YES, NO is derived by store
       const yesBids = (data.yes?.bids || data.bids || []) as [number, number][];
       const yesAsks = (data.yes?.asks || data.asks || []) as [number, number][];
-      const noBids = (data.no?.bids || []) as [number, number][];
-      const noAsks = (data.no?.asks || []) as [number, number][];
       
-      setBothOrderbooks(yesBids, yesAsks, noBids, noAsks, data.sequenceId);
+      setOrderbook('YES', yesBids, yesAsks, data.sequenceId);
     } catch (err) {
       console.error('[SingleOrderbook] Fetch error:', err);
       setError('Failed to load orderbook');
     }
-  }, [marketAddress, setBothOrderbooks, setLoading, setError]);
+  }, [marketAddress, setOrderbook, setLoading, setError]);
   
   // Subscribe to WebSocket updates
   useEffect(() => {
@@ -74,12 +73,8 @@ export function SingleOrderbook({ marketAddress, className, onPriceClick }: Sing
       const bids = (data.bids || []) as [number, number][];
       const asks = (data.asks || []) as [number, number][];
       
-      if (message.snapshot || (bids.length > 5 || asks.length > 5)) {
-        setOrderbook(outcome, bids, asks, data.sequenceId);
-      } else {
-        bids.forEach(([price, size]) => updateLevel(outcome, 'bid', price, size));
-        asks.forEach(([price, size]) => updateLevel(outcome, 'ask', price, size));
-      }
+      // Always do full update for real-time responsiveness
+      setOrderbook(outcome, bids, asks, data.sequenceId);
     });
     
     const handleConnect = () => {
@@ -130,15 +125,21 @@ export function SingleOrderbook({ marketAddress, className, onPriceClick }: Sing
   return (
     <div className={cn('bg-surface rounded-xl border border-border overflow-hidden flex flex-col', className)}>
       {/* Header */}
-      <div className="px-3 py-2.5 border-b border-border bg-surface-light/30">
+      <div className={cn(
+        "border-b border-border bg-surface-light/30 flex-shrink-0",
+        compact ? "px-3 py-2" : "px-3 py-2.5"
+      )}>
         <div className="flex items-center justify-between">
-          <h2 className="text-xs font-bold text-text-primary tracking-wide">ORDER BOOK</h2>
+          <h2 className={cn("font-bold text-text-primary tracking-wide", compact ? "text-xs" : "text-xs")}>ORDER BOOK</h2>
           <span className="text-[9px] text-text-muted font-mono">#{sequenceId}</span>
         </div>
       </div>
       
       {/* Column Headers */}
-      <div className="grid grid-cols-4 gap-1 px-2 py-1.5 text-[9px] text-text-muted uppercase tracking-wider bg-surface-light/20 border-b border-border/50">
+      <div className={cn(
+        "grid grid-cols-4 gap-1 px-3 text-text-muted uppercase tracking-wider bg-surface-light/20 border-b border-border/50 flex-shrink-0",
+        compact ? "py-1.5 text-[10px]" : "py-1.5 text-[9px]"
+      )}>
         <span>Size</span>
         <span className="text-center text-long">ABOVE</span>
         <span className="text-center text-short">BELOW</span>
@@ -146,39 +147,44 @@ export function SingleOrderbook({ marketAddress, className, onPriceClick }: Sing
       </div>
       
       {!hasLiquidity ? (
-        <div className="flex-1 flex items-center justify-center py-12">
-          <span className="text-xs text-text-muted">No liquidity</span>
+        <div className="flex-1 flex items-center justify-center py-6">
+          <span className="text-sm text-text-muted">No liquidity</span>
         </div>
       ) : (
-        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-          {/* Asks (sells) - slice first to get best 8, then reverse so lowest is at bottom near spread */}
-          <div className="flex-1 flex flex-col justify-end overflow-hidden">
-            {[...yes.asks.slice(0, 8)].reverse().map((level, i) => (
+        <div className="flex-1 flex flex-col min-h-0">
+          {/* Asks (sells) - each row takes equal space */}
+          <div className="flex-1 flex flex-col justify-end">
+            {[...yes.asks.slice(0, compact ? 4 : 8)].reverse().map((level, i) => (
               <PriceRow
-                key={`ask-${level.price.toFixed(2)}`}
+                key={`ask-${i}-${level.price.toFixed(2)}`}
                 level={level}
                 side="ask"
                 maxSize={maxSize}
                 onPriceClick={onPriceClick}
+                compact={compact}
+                fillSpace={compact}
               />
             ))}
           </div>
           
-          {/* Spread Indicator - Always visible, calculated from actual displayed data */}
+          {/* Spread Indicator */}
           <SpreadIndicator 
             bestAsk={yes.asks[0]?.price} 
-            bestBid={yes.bids[0]?.price} 
+            bestBid={yes.bids[0]?.price}
+            compact={compact}
           />
           
-          {/* Bids (buys) */}
-          <div className="flex-1 overflow-hidden">
-            {yes.bids.slice(0, 8).map((level, i) => (
+          {/* Bids (buys) - each row takes equal space */}
+          <div className="flex-1 flex flex-col">
+            {yes.bids.slice(0, compact ? 4 : 8).map((level, i) => (
               <PriceRow
-                key={`bid-${level.price.toFixed(2)}`}
+                key={`bid-${i}-${level.price.toFixed(2)}`}
                 level={level}
                 side="bid"
                 maxSize={maxSize}
                 onPriceClick={onPriceClick}
+                compact={compact}
+                fillSpace={compact}
               />
             ))}
           </div>
@@ -186,7 +192,7 @@ export function SingleOrderbook({ marketAddress, className, onPriceClick }: Sing
       )}
       
       {/* Footer with best prices - use actual orderbook data for accuracy */}
-      {hasLiquidity && (
+      {hasLiquidity && !compact && (
         <div className="px-3 py-2 border-t border-border bg-surface-light/20">
           <div className="flex items-center justify-between text-[10px]">
             <div className="flex items-center gap-1.5">
@@ -216,10 +222,12 @@ export function SingleOrderbook({ marketAddress, className, onPriceClick }: Sing
  */
 const SpreadIndicator = memo(function SpreadIndicator({ 
   bestAsk, 
-  bestBid 
+  bestBid,
+  compact = false 
 }: { 
   bestAsk?: number; 
   bestBid?: number;
+  compact?: boolean;
 }) {
   // Calculate spread from actual data
   const ask = bestAsk ?? 1;
@@ -229,14 +237,14 @@ const SpreadIndicator = memo(function SpreadIndicator({
   const spreadPercent = midPrice > 0 ? (spread / midPrice) * 100 : 0;
   
   return (
-    <div className="flex items-center justify-center py-2 px-2 bg-gradient-to-r from-long/5 via-surface-light/50 to-short/5 border-y border-border/30">
-      <div className="flex items-center gap-3 text-[10px]">
+    <div className={cn(
+      "flex items-center justify-center px-3 bg-gradient-to-r from-long/5 via-surface-light/50 to-short/5 border-y border-border/30 flex-shrink-0",
+      compact ? "py-2" : "py-2"
+    )}>
+      <div className={cn("flex items-center gap-3", compact ? "text-xs" : "text-[10px]")}>
         <span className="text-text-muted font-bold tracking-wider">SPREAD</span>
-        <span className="font-mono font-bold text-accent">
+        <span className="font-mono font-bold text-accent text-sm">
           ${spread.toFixed(2)}
-        </span>
-        <span className="text-text-muted font-medium">
-          ({spreadPercent.toFixed(1)}%)
         </span>
       </div>
     </div>
@@ -251,40 +259,18 @@ interface PriceRowProps {
   side: 'bid' | 'ask';
   maxSize: number;
   onPriceClick?: (price: number, side: 'bid' | 'ask') => void;
+  compact?: boolean;
+  fillSpace?: boolean;
 }
 
 const PriceRow = memo(function PriceRow({ 
   level, 
   side, 
   maxSize,
-  onPriceClick 
+  onPriceClick,
+  compact = false,
+  fillSpace = false
 }: PriceRowProps) {
-  const [flash, setFlash] = useState<'up' | 'down' | null>(null);
-  const prevSizeRef = useRef(level.size);
-  const clearFlash = useOrderbookStore(state => state.clearFlash);
-  
-  // Flash on size changes
-  useEffect(() => {
-    if (level.flash) {
-      setFlash(level.flash);
-      const timer = setTimeout(() => {
-        setFlash(null);
-        clearFlash('YES', side, level.price);
-      }, 300);
-      return () => clearTimeout(timer);
-    }
-  }, [level.flash, level.price, side, clearFlash]);
-  
-  useEffect(() => {
-    if (prevSizeRef.current !== level.size) {
-      const direction = level.size > prevSizeRef.current ? 'up' : 'down';
-      setFlash(direction);
-      const timer = setTimeout(() => setFlash(null), 300);
-      prevSizeRef.current = level.size;
-      return () => clearTimeout(timer);
-    }
-  }, [level.size]);
-  
   const depthPercent = ((level.total || level.size) / maxSize) * 100;
   const isBid = side === 'bid';
   const impliedNoPrice = 1 - level.price;
@@ -292,18 +278,17 @@ const PriceRow = memo(function PriceRow({
   return (
     <div 
       className={cn(
-        'relative grid grid-cols-4 gap-1 py-1 px-2',
+        'relative grid grid-cols-4 gap-1 px-3 items-center',
         'hover:bg-surface-light/50 cursor-pointer transition-colors duration-75',
         'group',
-        flash === 'up' && 'animate-flash-green',
-        flash === 'down' && 'animate-flash-red'
+        fillSpace ? 'flex-1' : (compact ? 'py-1' : 'py-1.5')
       )}
       onClick={() => onPriceClick?.(level.price, side)}
     >
       {/* Depth bar background */}
       <div 
         className={cn(
-          'absolute top-0 bottom-0 opacity-[0.08] transition-all duration-150',
+          'absolute top-0 bottom-0 opacity-[0.12] transition-all duration-150',
           isBid ? 'bg-long left-0 rounded-r' : 'bg-short right-0 rounded-l'
         )}
         style={{ width: `${Math.min(100, depthPercent)}%` }}
@@ -311,7 +296,8 @@ const PriceRow = memo(function PriceRow({
       
       {/* Size */}
       <span className={cn(
-        'relative z-10 text-[10px] font-mono tabular-nums',
+        'relative z-10 font-mono tabular-nums font-medium',
+        compact ? 'text-xs' : 'text-[11px]',
         isBid ? 'text-text-primary' : 'text-text-muted',
         'group-hover:text-text-primary transition-colors'
       )}>
@@ -320,7 +306,8 @@ const PriceRow = memo(function PriceRow({
       
       {/* YES Price (ABOVE) */}
       <span className={cn(
-        'relative z-10 text-[10px] font-mono tabular-nums text-center font-bold',
+        'relative z-10 font-mono tabular-nums text-center font-bold',
+        compact ? 'text-sm' : 'text-xs',
         isBid ? 'text-long' : 'text-long/70'
       )}>
         ${level.price.toFixed(2)}
@@ -328,14 +315,18 @@ const PriceRow = memo(function PriceRow({
       
       {/* Implied NO Price (BELOW = 1 - YES) */}
       <span className={cn(
-        'relative z-10 text-[10px] font-mono tabular-nums text-center',
+        'relative z-10 font-mono tabular-nums text-center font-bold',
+        compact ? 'text-sm' : 'text-xs',
         isBid ? 'text-short/70' : 'text-short'
       )}>
         ${impliedNoPrice.toFixed(2)}
       </span>
       
       {/* Cumulative total */}
-      <span className="relative z-10 text-[9px] font-mono tabular-nums text-right text-text-muted">
+      <span className={cn(
+        "relative z-10 font-mono tabular-nums text-right text-text-muted",
+        compact ? 'text-xs' : 'text-[10px]'
+      )}>
         {formatSize(level.total || level.size)}
       </span>
     </div>

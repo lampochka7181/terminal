@@ -30,18 +30,27 @@ export function registerClients(clientsMap: Map<WebSocketLike, { subscriptions: 
  */
 function broadcast(channel: string, data: any): void {
   let sent = 0;
+  let totalClients = 0;
+  let subscribed = 0;
+  let ready = 0;
   
   for (const [ws, client] of clients) {
-    if (ws.readyState === WS_OPEN && client.subscriptions.has(channel)) {
-      try {
-        ws.send(JSON.stringify(data));
-        sent++;
-      } catch (err) {
-        logger.error(`Failed to send to client:`, err);
+    totalClients++;
+    if (ws.readyState === WS_OPEN) {
+      ready++;
+      if (client.subscriptions.has(channel)) {
+        subscribed++;
+        try {
+          ws.send(JSON.stringify(data));
+          sent++;
+        } catch (err) {
+          logger.error(`Failed to send to client:`, err);
+        }
       }
     }
   }
   
+  // Only log when actually sending to clients (reduce noise)
   if (sent > 0) {
     logger.debug(`Broadcast to ${sent} clients on ${channel}`);
   }
@@ -81,6 +90,9 @@ export function broadcastOrderbookUpdate(
   sequenceId: number,
   outcome?: 'YES' | 'NO'
 ): void {
+  // DEBUG: Log broadcast details
+  logger.debug(`[Broadcast] Orderbook update: market=${marketId.slice(0, 8)}..., outcome=${outcome || 'YES'}, bids=${bids.length}, asks=${asks.length}, seq=${sequenceId}`);
+  
   // Broadcast to market-specific channel
   broadcast(`orderbook:${marketId}`, {
     type: 'orderbook_update',
@@ -117,6 +129,37 @@ export function broadcastTrade(
       marketId,
       id: trade.id || `trade-${Date.now()}`,
       ...trade,
+    },
+  });
+}
+
+/**
+ * Broadcast a trade to the global trade blotter
+ * Shows all trades across the platform in real-time
+ */
+export function broadcastGlobalTrade(
+  trade: {
+    id: string;
+    market: string;
+    marketAddress: string;
+    asset: string;
+    timeframe: string;
+    side: 'buy' | 'sell';
+    outcome: 'yes' | 'no';
+    price: number;
+    size: number;
+    notional: number;
+    txSignature: string | null;
+    timestamp: number;
+  }
+): void {
+  // Broadcast to global trades channel
+  broadcast('trades:global', {
+    type: 'global_trade',
+    channel: 'trades:global',
+    data: {
+      ...trade,
+      solscanUrl: trade.txSignature ? `https://solscan.io/tx/${trade.txSignature}` : null,
     },
   });
 }

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useCallback, useRef, memo, useState } from 'react';
+import { useEffect, useCallback, useRef, memo } from 'react';
 import { cn } from '@/lib/utils';
 import { 
   useOrderbookStore, 
@@ -27,13 +27,12 @@ export function Orderbook({ marketAddress, className }: OrderbookProps) {
     sequenceId, 
     isLoading, 
     setOrderbook, 
-    setBothOrderbooks,
     updateLevel,
     setLoading, 
     setError 
   } = useOrderbookStore();
   
-  // Fetch initial orderbook data
+  // Fetch initial orderbook data (SINGLE ORDERBOOK MODEL: only YES)
   const fetchOrderbook = useCallback(async () => {
     if (!marketAddress) return;
     
@@ -41,18 +40,16 @@ export function Orderbook({ marketAddress, className }: OrderbookProps) {
     try {
       const data = await api.getOrderbook(marketAddress) as any;
       
-      // Get both YES and NO orderbooks
+      // SINGLE ORDERBOOK MODEL: Only fetch YES, NO is derived by store
       const yesBids = (data.yes?.bids || data.bids || []) as [number, number][];
       const yesAsks = (data.yes?.asks || data.asks || []) as [number, number][];
-      const noBids = (data.no?.bids || []) as [number, number][];
-      const noAsks = (data.no?.asks || []) as [number, number][];
       
-      setBothOrderbooks(yesBids, yesAsks, noBids, noAsks, data.sequenceId);
+      setOrderbook('YES', yesBids, yesAsks, data.sequenceId);
     } catch (err) {
       console.error('[Orderbook] Fetch error:', err);
       setError('Failed to load orderbook');
     }
-  }, [marketAddress, setBothOrderbooks, setLoading, setError]);
+  }, [marketAddress, setOrderbook, setLoading, setError]);
   
   // Subscribe to WebSocket updates
   useEffect(() => {
@@ -303,33 +300,6 @@ const PriceRow = memo(function PriceRow({
   colorClass,
   outcome
 }: PriceRowProps) {
-  const [flash, setFlash] = useState<'up' | 'down' | null>(null);
-  const prevSizeRef = useRef(level.size);
-  const clearFlash = useOrderbookStore(state => state.clearFlash);
-  
-  // Detect size changes and trigger flash
-  useEffect(() => {
-    if (level.flash) {
-      setFlash(level.flash);
-      const timer = setTimeout(() => {
-        setFlash(null);
-        clearFlash(outcome, side, level.price);
-      }, 300);
-      return () => clearTimeout(timer);
-    }
-  }, [level.flash, level.price, side, outcome, clearFlash]);
-  
-  // Also detect direct size changes
-  useEffect(() => {
-    if (prevSizeRef.current !== level.size) {
-      const direction = level.size > prevSizeRef.current ? 'up' : 'down';
-      setFlash(direction);
-      const timer = setTimeout(() => setFlash(null), 300);
-      prevSizeRef.current = level.size;
-      return () => clearTimeout(timer);
-    }
-  }, [level.size]);
-  
   const depthPercent = ((level.total || level.size) / maxSize) * 100;
   const isBid = side === 'bid';
   
@@ -341,10 +311,7 @@ const PriceRow = memo(function PriceRow({
       className={cn(
         'relative grid grid-cols-3 gap-1 py-1 px-2',
         'hover:bg-surface-light/50 cursor-pointer transition-colors duration-75',
-        'group',
-        // Flash animation classes
-        flash === 'up' && 'animate-flash-green',
-        flash === 'down' && 'animate-flash-red'
+        'group'
       )}
     >
       {/* Depth bar background */}
@@ -405,12 +372,11 @@ export function CompactOrderbook({ marketAddress, className }: OrderbookProps) {
   const { 
     yes, 
     no, 
-    setBothOrderbooks,
     setOrderbook,
     updateLevel
   } = useOrderbookStore();
   
-  // Simplified fetch
+  // SINGLE ORDERBOOK MODEL: Simplified fetch (only YES)
   useEffect(() => {
     if (!marketAddress) return;
     
@@ -419,9 +385,7 @@ export function CompactOrderbook({ marketAddress, className }: OrderbookProps) {
         const data = await api.getOrderbook(marketAddress) as any;
         const yesBids = (data.yes?.bids || data.bids || []) as [number, number][];
         const yesAsks = (data.yes?.asks || data.asks || []) as [number, number][];
-        const noBids = (data.no?.bids || []) as [number, number][];
-        const noAsks = (data.no?.asks || []) as [number, number][];
-        setBothOrderbooks(yesBids, yesAsks, noBids, noAsks, data.sequenceId);
+        setOrderbook('YES', yesBids, yesAsks, data.sequenceId);
       } catch (err) {
         console.error('[CompactOrderbook] Error:', err);
       }
@@ -439,15 +403,18 @@ export function CompactOrderbook({ marketAddress, className }: OrderbookProps) {
       const data = message.data;
       if (!data) return;
       
+      // SINGLE ORDERBOOK MODEL: Only process YES updates, ignore NO
       const outcome = (data.outcome as 'YES' | 'NO') || 'YES';
+      if (outcome === 'NO') return;
+      
       const bids = (data.bids || []) as [number, number][];
       const asks = (data.asks || []) as [number, number][];
       
       if (message.snapshot || bids.length > 3 || asks.length > 3) {
-        setOrderbook(outcome, bids, asks, data.sequenceId);
+        setOrderbook('YES', bids, asks, data.sequenceId);
       } else {
-        bids.forEach(([price, size]) => updateLevel(outcome, 'bid', price, size));
-        asks.forEach(([price, size]) => updateLevel(outcome, 'ask', price, size));
+        bids.forEach(([price, size]) => updateLevel('YES', 'bid', price, size));
+        asks.forEach(([price, size]) => updateLevel('YES', 'ask', price, size));
       }
     });
     
@@ -472,7 +439,7 @@ export function CompactOrderbook({ marketAddress, className }: OrderbookProps) {
         subscribed.current = false;
       }
     };
-  }, [marketAddress, setBothOrderbooks, setOrderbook, updateLevel]);
+  }, [marketAddress, setOrderbook, updateLevel]);
   
   return (
     <div className={cn('grid grid-cols-2 gap-3', className)}>
@@ -574,26 +541,12 @@ const MiniRow = memo(function MiniRow({
   bgColor: string;
   textColor: string;
 }) {
-  const [flash, setFlash] = useState<'up' | 'down' | null>(null);
-  const prevSizeRef = useRef(level.size);
-  
-  useEffect(() => {
-    if (prevSizeRef.current !== level.size) {
-      setFlash(level.size > prevSizeRef.current ? 'up' : 'down');
-      const timer = setTimeout(() => setFlash(null), 300);
-      prevSizeRef.current = level.size;
-      return () => clearTimeout(timer);
-    }
-  }, [level.size]);
-  
   const pct = (level.size / maxSize) * 100;
   const isBid = side === 'bid';
   
   return (
     <div className={cn(
-      'relative grid grid-cols-2 px-2 py-0.5 text-[9px] font-mono',
-      flash === 'up' && 'animate-flash-green',
-      flash === 'down' && 'animate-flash-red'
+      'relative grid grid-cols-2 px-2 py-0.5 text-[9px] font-mono'
     )}>
       <div 
         className={cn('absolute top-0 bottom-0 opacity-20', bgColor, isBid ? 'left-0' : 'right-0')}

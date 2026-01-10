@@ -1,6 +1,8 @@
 /**
- * useOrderbook Hook (v2)
- * Fetches orderbook and subscribes to real-time updates for both YES and NO outcomes
+ * useOrderbook Hook (v3) - SINGLE ORDERBOOK MODEL
+ * 
+ * Fetches YES orderbook and subscribes to real-time updates.
+ * NO orderbook is DERIVED from YES by the store (complement pricing).
  */
 
 import { useEffect, useCallback, useRef } from 'react';
@@ -18,7 +20,6 @@ export function useOrderbook(marketAddress: string | null) {
     yes,
     no,
     sequenceId,
-    setBothOrderbooks,
     setOrderbook,
     updateLevel,
     setLoading,
@@ -29,7 +30,7 @@ export function useOrderbook(marketAddress: string | null) {
   
   const subscribed = useRef(false);
 
-  // Fetch initial snapshot for both outcomes
+  // Fetch initial YES orderbook (NO is derived by store)
   const fetchOrderbook = useCallback(async () => {
     if (!marketAddress) return;
 
@@ -39,13 +40,13 @@ export function useOrderbook(marketAddress: string | null) {
     try {
       const data = await api.getOrderbook(marketAddress) as any;
       
-      // Parse both YES and NO orderbooks
+      // SINGLE ORDERBOOK MODEL: Only parse YES data
+      // NO orderbook is derived by the store as complement
       const yesBids = (data.yes?.bids || data.bids || []) as [number, number][];
       const yesAsks = (data.yes?.asks || data.asks || []) as [number, number][];
-      const noBids = (data.no?.bids || []) as [number, number][];
-      const noAsks = (data.no?.asks || []) as [number, number][];
       
-      setBothOrderbooks(yesBids, yesAsks, noBids, noAsks, data.sequenceId);
+      // setOrderbook for YES will automatically derive NO in the store
+      setOrderbook('YES', yesBids, yesAsks, data.sequenceId);
     } catch (error) {
       const message = error instanceof ApiError ? error.message : 'Failed to fetch orderbook';
       setError(message);
@@ -53,7 +54,7 @@ export function useOrderbook(marketAddress: string | null) {
     } finally {
       setLoading(false);
     }
-  }, [marketAddress, setBothOrderbooks, setLoading, setError]);
+  }, [marketAddress, setOrderbook, setLoading, setError]);
 
   // Subscribe to WebSocket updates
   useEffect(() => {
@@ -68,7 +69,6 @@ export function useOrderbook(marketAddress: string | null) {
       // Handle both message formats
       const data = message.data as any;
       const messageMarket = (message as any).market || data?.marketId;
-      
       if (messageMarket !== marketAddress) return;
 
       // Get outcome from message (default to YES for backwards compatibility)
@@ -77,19 +77,8 @@ export function useOrderbook(marketAddress: string | null) {
       const asks = (data?.asks || []) as [number, number][];
       const newSequenceId = data?.sequenceId;
       
-      // For full snapshot, replace entire orderbook for that outcome
-      if ((message as any).snapshot || bids.length > 5 || asks.length > 5) {
-        setOrderbook(outcome, bids, asks, newSequenceId);
-        return;
-      }
-      
-      // Apply tick-by-tick delta updates
-      bids.forEach(([price, size]) => {
-        updateLevel(outcome, 'bid', price, size);
-      });
-      asks.forEach(([price, size]) => {
-        updateLevel(outcome, 'ask', price, size);
-      });
+      // Always do full update for real-time responsiveness
+      setOrderbook(outcome, bids, asks, newSequenceId);
     });
 
     // Subscribe when connected

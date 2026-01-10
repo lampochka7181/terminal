@@ -36,9 +36,10 @@ interface PositionsProps {
   currentMarketAddress?: string;
   currentYesPrice?: number;
   currentNoPrice?: number;
+  compact?: boolean;
 }
 
-export function Positions({ onSell, currentMarketAddress, currentYesPrice, currentNoPrice }: PositionsProps) {
+export function Positions({ onSell, currentMarketAddress, currentYesPrice, currentNoPrice, compact = false }: PositionsProps) {
   const [activeTab, setActiveTab] = useState<Tab>('active');
   const [, setTick] = useState(0); // Force re-render for expiry filtering
   const { isAuthenticated } = useAuthStore();
@@ -190,66 +191,103 @@ export function Positions({ onSell, currentMarketAddress, currentYesPrice, curre
 
   if (!isAuthenticated) {
     return (
-      <div className="bg-surface rounded-xl border border-border p-8 h-full flex flex-col items-center justify-center text-center space-y-4">
-        <div className="w-12 h-12 bg-surface-light rounded-full flex items-center justify-center">
-          <Clock className="w-6 h-6 text-text-muted" />
+      <div className={cn(
+        "h-full flex flex-col items-center justify-center text-center",
+        compact ? "p-4 space-y-2" : "p-8 space-y-4"
+      )}>
+        <div className={cn(
+          "bg-surface-light rounded-full flex items-center justify-center",
+          compact ? "w-8 h-8" : "w-12 h-12"
+        )}>
+          <Clock className={cn("text-text-muted", compact ? "w-4 h-4" : "w-6 h-6")} />
         </div>
         <div>
-          <h3 className="font-bold text-lg">Positions Locked</h3>
-          <p className="text-text-muted text-sm max-w-xs">Connect your wallet to see your active positions and open orders.</p>
+          <h3 className={cn("font-bold", compact ? "text-sm" : "text-lg")}>Positions Locked</h3>
+          <p className={cn("text-text-muted max-w-xs", compact ? "text-xs" : "text-sm")}>Connect wallet to view</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="bg-surface rounded-xl border border-border overflow-hidden h-full flex flex-col">
-      <div className="flex items-center justify-between p-4 bg-surface-light/30 border-b border-border">
-        <div className="flex gap-1">
-          {(['active', 'history'] as Tab[]).map((tab) => (
-            <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
-              className={cn(
-                'px-4 py-2 text-sm font-bold rounded-lg transition-all capitalize',
-                activeTab === tab
-                  ? 'bg-accent text-background shadow-sm'
-                  : 'text-text-muted hover:text-text-primary hover:bg-surface-light'
-              )}
+    <div className="h-full flex flex-col overflow-hidden">
+      {!compact && (
+        <div className="flex items-center justify-between p-4 bg-surface-light/30 border-b border-border">
+          <div className="flex gap-1">
+            {(['active', 'history'] as Tab[]).map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={cn(
+                  'px-4 py-2 text-sm font-bold rounded-lg transition-all capitalize',
+                  activeTab === tab
+                    ? 'bg-accent text-background shadow-sm'
+                    : 'text-text-muted hover:text-text-primary hover:bg-surface-light'
+                )}
+              >
+                {tab === 'active' ? 'Open Positions' : 'Trade History'}
+                {tab === 'active' && combinedActive.length > 0 && (
+                  <span className={cn(
+                    "ml-2 px-1.5 py-0.5 text-[10px] rounded-full font-black",
+                    activeTab === tab ? "bg-background/20 text-background" : "bg-accent/20 text-accent"
+                  )}>
+                    {combinedActive.length}
+                  </span>
+                )}
+                {tab === 'history' && transactions && transactions.length > 0 && (
+                  <span className={cn(
+                    "ml-2 px-1.5 py-0.5 text-[10px] rounded-full font-black",
+                    activeTab === tab ? "bg-background/20 text-background" : "bg-accent/20 text-accent"
+                  )}>
+                    {transactions.length}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+          
+          <div className="flex items-center gap-4">
+            <button 
+              onClick={() => refetchAll()}
+              className="p-2 hover:bg-surface-light rounded-lg transition-colors"
+              disabled={isLoading}
             >
-              {tab === 'active' ? 'Live Trades' : 'History'}
-              {tab === 'active' && combinedActive.length > 0 && (
-                <span className={cn(
-                  "ml-2 px-1.5 py-0.5 text-[10px] rounded-full font-black",
-                  activeTab === tab ? "bg-background/20 text-background" : "bg-accent/20 text-accent"
-                )}>
-                  {combinedActive.length}
-                </span>
-              )}
-              {tab === 'history' && transactions && transactions.length > 0 && (
-                <span className={cn(
-                  "ml-2 px-1.5 py-0.5 text-[10px] rounded-full font-black",
-                  activeTab === tab ? "bg-background/20 text-background" : "bg-accent/20 text-accent"
-                )}>
-                  {transactions.length}
-                </span>
-              )}
+              <RefreshCw className={cn("w-4 h-4 text-text-muted", isLoading && "animate-spin")} />
             </button>
-          ))}
+          </div>
         </div>
-        
-        <div className="flex items-center gap-4">
+      )}
+
+      {/* Compact mode: inline tabs */}
+      {compact && (
+        <div className="flex items-center justify-between px-3 py-2 border-b border-border/50 flex-shrink-0">
+          <div className="flex gap-1.5">
+            {(['active', 'history'] as Tab[]).map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={cn(
+                  'px-3 py-1.5 text-xs font-bold rounded transition-all',
+                  activeTab === tab
+                    ? 'bg-accent/20 text-accent'
+                    : 'text-text-muted hover:text-text-primary'
+                )}
+              >
+                {tab === 'active' ? `Open (${combinedActive.length})` : `History (${transactions?.length || 0})`}
+              </button>
+            ))}
+          </div>
           <button 
             onClick={() => refetchAll()}
-            className="p-2 hover:bg-surface-light rounded-lg transition-colors"
+            className="p-1.5 hover:bg-surface-light rounded transition-colors"
             disabled={isLoading}
           >
             <RefreshCw className={cn("w-4 h-4 text-text-muted", isLoading && "animate-spin")} />
           </button>
         </div>
-      </div>
+      )}
 
-      <div className="flex-1 min-h-0">
+      <div className="flex-1 min-h-0 overflow-auto">
         {activeTab === 'active' && (
           <UnifiedTable 
             trades={combinedActive} 
@@ -258,18 +296,20 @@ export function Positions({ onSell, currentMarketAddress, currentYesPrice, curre
             onCancel={handleCancel}
             isCancelling={isCancelling}
             showPnLPercent={showPnLPercent}
+            compact={compact}
           />
         )}
         {activeTab === 'history' && (
           <TransactionHistoryTable 
             transactions={transactions || []} 
-            isLoading={transactionsLoading} 
+            isLoading={transactionsLoading}
+            compact={compact}
           />
         )}
       </div>
 
-      {activeTab === 'active' && positions.length > 0 && (
-        <div className="px-4 py-3 bg-surface-light/50 border-t border-border">
+      {activeTab === 'active' && positions.length > 0 && !compact && (
+        <div className="px-4 py-3 bg-surface-light/50 border-t border-border flex-shrink-0">
           <div className="flex items-center justify-between">
             {/* Portfolio Summary */}
             <div className="flex items-center gap-6">
@@ -302,6 +342,16 @@ export function Positions({ onSell, currentMarketAddress, currentYesPrice, curre
           </div>
         </div>
       )}
+
+      {/* Compact footer with P&L */}
+      {activeTab === 'active' && positions.length > 0 && compact && (
+        <div className="px-3 py-2.5 bg-surface-light/30 border-t border-border/50 flex items-center justify-between text-sm flex-shrink-0">
+          <span className="text-text-muted">{positions.length} pos · ${totalValue.toFixed(0)} value</span>
+          <span className={cn('font-mono font-bold text-base', totalPnl >= 0 ? 'text-long' : 'text-short')}>
+            {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -312,7 +362,8 @@ function UnifiedTable({
   onSell,
   onCancel,
   isCancelling,
-  showPnLPercent = true
+  showPnLPercent = true,
+  compact = false
 }: { 
   trades: UnifiedTrade[]; 
   isLoading: boolean;
@@ -320,18 +371,18 @@ function UnifiedTable({
   onCancel: (id: string) => void;
   isCancelling: boolean;
   showPnLPercent?: boolean;
+  compact?: boolean;
 }) {
   if (isLoading && trades.length === 0) {
     return (
       <div className="divide-y divide-border">
-        {[1, 2, 3].map(i => (
-          <div key={i} className="h-20 px-4 py-3 flex items-center gap-4">
-            <div className="w-16 h-8 rounded skeleton" />
-            <div className="flex-1 space-y-2">
-              <div className="w-24 h-4 rounded skeleton" />
-              <div className="w-16 h-3 rounded skeleton" />
+        {[1, 2].map(i => (
+          <div key={i} className={cn("flex items-center gap-3", compact ? "h-14 px-3 py-2" : "h-20 px-4 py-3")}>
+            <div className="w-16 h-5 rounded skeleton" />
+            <div className="flex-1 space-y-1">
+              <div className="w-20 h-4 rounded skeleton" />
             </div>
-            <div className="w-20 h-6 rounded skeleton" />
+            <div className="w-14 h-5 rounded skeleton" />
           </div>
         ))}
       </div>
@@ -340,12 +391,43 @@ function UnifiedTable({
 
   if (trades.length === 0) {
     return (
-      <div className="text-center py-16 text-text-muted">
-        <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-surface-light flex items-center justify-center">
-          <Target className="w-8 h-8 opacity-30" />
+      <div className={cn("text-center text-text-muted", compact ? "py-8" : "py-16")}>
+        <div className={cn("mx-auto mb-2 rounded-full bg-surface-light flex items-center justify-center", compact ? "w-10 h-10" : "w-16 h-16")}>
+          <Target className={cn("opacity-30", compact ? "w-5 h-5" : "w-8 h-8")} />
         </div>
-        <p className="text-lg font-medium mb-1">No active positions</p>
-        <p className="text-sm">Start trading to see your positions here</p>
+        <p className={cn("font-medium", compact ? "text-sm mb-0.5" : "text-lg mb-1")}>No positions</p>
+        <p className={cn(compact ? "text-xs" : "text-sm")}>Start trading</p>
+      </div>
+    );
+  }
+
+  if (compact) {
+    return (
+      <div className="w-full">
+        <table className="w-full text-left border-collapse">
+          <thead>
+            <tr className="text-xs text-text-muted uppercase tracking-wider border-b border-border/50 bg-surface-light/5">
+              <th className="px-3 py-2.5 font-bold">Market</th>
+              <th className="px-2 py-2.5 font-bold text-center">Side</th>
+              <th className="px-2 py-2.5 font-bold text-right">Size</th>
+              <th className="px-2 py-2.5 font-bold text-right">Avg</th>
+              <th className="px-2 py-2.5 font-bold text-right">Now</th>
+              <th className="px-2 py-2.5 font-bold text-right">P&L</th>
+              <th className="px-3 py-2.5 font-bold text-right"></th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-border/30">
+            {trades.map((trade) => (
+              <CompactTradeRow 
+                key={trade.id} 
+                trade={trade} 
+                onSell={onSell} 
+                onCancel={onCancel}
+                isCancelling={isCancelling}
+              />
+            ))}
+          </tbody>
+        </table>
       </div>
     );
   }
@@ -542,6 +624,115 @@ function TradeRow({
   );
 }
 
+function CompactTradeRow({ 
+  trade, 
+  onSell,
+  onCancel,
+  isCancelling
+}: { 
+  trade: UnifiedTrade;
+  onSell?: (marketAddress: string, outcome: 'YES' | 'NO', shares: number, avgEntry: number, price: number, timeframe: any, expiry: number) => void;
+  onCancel: (id: string) => void;
+  isCancelling: boolean;
+}) {
+  const timeframe = trade.market.split('-')[1];
+  const isOrder = trade.type === 'order';
+
+  return (
+    <tr className={cn(
+      "hover:bg-surface-light/30 transition-colors",
+      isOrder && "bg-accent/5"
+    )}>
+      {/* Market */}
+      <td className="px-3 py-3">
+        <span className="font-bold text-base">{trade.market}</span>
+      </td>
+      
+      {/* Side/Outcome */}
+      <td className="px-2 py-3 text-center">
+        <span className={cn(
+          'px-2 py-1 rounded text-xs font-black',
+          trade.outcome === 'YES' ? 'bg-long/20 text-long' : 'bg-short/20 text-short'
+        )}>
+          {trade.outcome === 'YES' ? 'ABOVE' : 'BELOW'}
+        </span>
+      </td>
+      
+      {/* Size */}
+      <td className="px-2 py-3 text-right">
+        <span className="font-mono text-base font-bold">{trade.size.toFixed(0)}</span>
+      </td>
+      
+      {/* Avg Price */}
+      <td className="px-2 py-3 text-right">
+        <span className="font-mono text-base text-text-secondary">${trade.price.toFixed(2)}</span>
+      </td>
+      
+      {/* Current Price */}
+      <td className="px-2 py-3 text-right">
+        <span className={cn(
+          'font-mono text-base font-medium',
+          trade.currentPrice > trade.price ? 'text-long' : trade.currentPrice < trade.price ? 'text-short' : 'text-text-primary'
+        )}>
+          ${trade.currentPrice.toFixed(2)}
+        </span>
+      </td>
+      
+      {/* P&L with % */}
+      <td className="px-2 py-3 text-right">
+        {trade.pnl !== undefined ? (
+          <div className="flex flex-col items-end">
+            <span className={cn(
+              'font-mono text-base font-bold',
+              trade.pnl >= 0 ? 'text-long' : 'text-short'
+            )}>
+              {trade.pnl >= 0 ? '+' : ''}${Math.abs(trade.pnl).toFixed(2)}
+            </span>
+            {trade.pnlPercent !== undefined && (
+              <span className={cn(
+                'font-mono text-xs',
+                trade.pnlPercent >= 0 ? 'text-long/70' : 'text-short/70'
+              )}>
+                {trade.pnlPercent >= 0 ? '+' : ''}{trade.pnlPercent.toFixed(1)}%
+              </span>
+            )}
+          </div>
+        ) : (
+          <span className="text-text-muted text-base">--</span>
+        )}
+      </td>
+      
+      {/* Action */}
+      <td className="px-3 py-3 text-right">
+        {isOrder ? (
+          <button 
+            onClick={() => onCancel(trade.id.replace('ord-', ''))}
+            disabled={isCancelling}
+            className="px-4 py-2 text-sm font-bold rounded-lg bg-short/20 text-short hover:bg-short/30 transition-colors"
+          >
+            Cancel
+          </button>
+        ) : (
+          <button 
+            onClick={() => onSell?.(
+              trade.marketAddress, 
+              trade.outcome, 
+              trade.size, 
+              trade.price, 
+              trade.currentPrice,
+              timeframe,
+              trade.expiryAt
+            )}
+            className="px-4 py-2 text-sm font-bold rounded-lg bg-warning/20 text-warning hover:bg-warning/30 transition-colors"
+          >
+            Sell
+          </button>
+        )}
+      </td>
+    </tr>
+  );
+}
+
 function ExpiryCountdown({ expiry }: { expiry: number }) {
   const [timeLeft, setTimeLeft] = useState('');
 
@@ -584,10 +775,12 @@ function ExpiryCountdown({ expiry }: { expiry: number }) {
 // Transaction History Table Component - Shows all trades and settlements
 function TransactionHistoryTable({ 
   transactions, 
-  isLoading 
+  isLoading,
+  compact = false
 }: { 
   transactions: UserTransaction[]; 
   isLoading: boolean;
+  compact?: boolean;
 }) {
   // Calculate realized P&L from closing transactions (settlements with pnl)
   const totalPnl = transactions
@@ -597,17 +790,80 @@ function TransactionHistoryTable({
   if (isLoading && transactions.length === 0) {
     return (
       <div className="divide-y divide-border">
-        {[1, 2, 3].map(i => <div key={i} className="h-16 bg-surface animate-pulse" />)}
+        {[1, 2].map(i => <div key={i} className={cn("bg-surface animate-pulse", compact ? "h-12" : "h-16")} />)}
       </div>
     );
   }
 
   if (transactions.length === 0) {
     return (
-      <div className="text-center py-16 text-text-muted">
-        <History className="w-8 h-8 mx-auto opacity-20 mb-2" />
-        <p>No transaction history yet</p>
-        <p className="text-xs mt-1">Your trades will appear here</p>
+      <div className={cn("text-center text-text-muted", compact ? "py-8" : "py-16")}>
+        <History className={cn("mx-auto opacity-20 mb-2", compact ? "w-5 h-5" : "w-8 h-8")} />
+        <p className={compact ? "text-sm" : ""}>No history yet</p>
+        {!compact && <p className="text-xs mt-1">Your trades will appear here</p>}
+      </div>
+    );
+  }
+
+  if (compact) {
+    return (
+      <div className="flex flex-col h-full">
+        <div className="flex-1 overflow-auto">
+          <table className="w-full text-left border-collapse">
+            <thead>
+              <tr className="text-[10px] text-text-muted uppercase tracking-wider border-b border-border/50 bg-surface-light/5 sticky top-0">
+                <th className="px-3 py-2 font-bold">Market</th>
+                <th className="px-2 py-2 font-bold text-right">Size</th>
+                <th className="px-2 py-2 font-bold text-right">P&L</th>
+                <th className="px-2 py-2 font-bold text-right">Tx</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border/30">
+              {transactions.slice(0, 10).map((tx, idx) => {
+                const solscanUrl = tx.txSignature 
+                  ? `https://solscan.io/tx/${tx.txSignature}` 
+                  : null;
+                return (
+                  <tr key={`${tx.id}-${idx}`} className="hover:bg-surface-light/30">
+                    <td className="px-3 py-2.5">
+                      <span className="font-bold text-sm truncate block max-w-[100px]">{tx.market || '--'}</span>
+                    </td>
+                    <td className="px-2 py-2.5 text-right">
+                      <span className="font-mono text-sm">{tx.size.toFixed(0)}</span>
+                    </td>
+                    <td className="px-2 py-2.5 text-right">
+                      {tx.pnl !== undefined && tx.pnl !== null ? (
+                        <span className={cn('font-mono text-sm font-bold', tx.pnl >= 0 ? 'text-long' : 'text-short')}>
+                          {tx.pnl >= 0 ? '+' : ''}${tx.pnl.toFixed(2)}
+                        </span>
+                      ) : (
+                        <span className="text-text-muted text-sm">--</span>
+                      )}
+                    </td>
+                    <td className="px-2 py-2.5 text-right">
+                      {solscanUrl ? (
+                        <a 
+                          href={solscanUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="p-1 text-text-muted hover:text-accent hover:bg-accent/10 rounded transition-all inline-flex"
+                          title="View on Solscan"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                        </a>
+                      ) : (
+                        <span className="text-text-muted text-[9px]">--</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div className="px-3 py-2 border-t border-border/50 text-xs text-text-muted flex-shrink-0">
+          Realized: <span className={cn('font-bold text-sm', totalPnl >= 0 ? 'text-long' : 'text-short')}>{totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}</span>
+        </div>
       </div>
     );
   }

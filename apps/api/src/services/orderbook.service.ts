@@ -207,18 +207,33 @@ export class OrderbookService {
   async getBestAsk(marketId: string, outcome: 'YES' | 'NO'): Promise<OrderbookOrder | null> {
     const key = RedisKeys.orderbook(marketId, outcome, 'ASK');
     
+    // DEBUG: Log all asks in the sorted set
+    const allAsks = await redis.zrange(key, 0, 4, 'WITHSCORES');
+    if (allAsks.length > 0) {
+      const askPrices: string[] = [];
+      for (let i = 0; i < allAsks.length; i += 2) {
+        const score = parseFloat(allAsks[i + 1]) / 1000000;
+        askPrices.push(`$${score.toFixed(2)}`);
+      }
+      logger.debug(`[ORDERBOOK DEBUG] ${key} top asks: ${askPrices.join(', ')}`);
+    }
+    
     // Keep trying until we find a valid order or exhaust the book
     while (true) {
       const results = await redis.zrange(key, 0, 0, 'WITHSCORES');
       
       if (results.length < 2) return null;
       
-      const [member] = results;
+      const [member, scoreStr] = results;
       const [orderId] = member.split(':');
+      const price = parseFloat(scoreStr) / 1000000;
+      
+      logger.debug(`[ORDERBOOK DEBUG] getBestAsk checking orderId=${orderId.slice(0,8)}, score/price=$${price.toFixed(2)}`);
       
       const order = await this.getOrderFromHash(orderId);
       
       if (order) {
+        logger.debug(`[ORDERBOOK DEBUG] getBestAsk returning order at $${order.price.toFixed(2)}`);
         return order;
       }
       

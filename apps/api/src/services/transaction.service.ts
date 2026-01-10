@@ -69,6 +69,9 @@ export interface CloseParams {
   outcome: 'YES' | 'NO';
   price: number;
   matchSize: number;
+  tradeId?: string;  // Optional trade ID to update with tx signature
+  makerOrderId?: string;  // For updating trade by order IDs
+  takerOrderId?: string;  // For updating trade by order IDs
 }
 
 interface TransactionResult {
@@ -171,10 +174,15 @@ class TransactionService {
    */
   async executeClose(params: CloseParams): Promise<TransactionResult> {
     if (!anchorClient.isReady()) {
+      const simSignature = `sim_close_${Date.now()}_${Math.random().toString(36).slice(2)}`;
       logger.debug(`[SIMULATION] Close: buyer=${params.buyerWallet} ← seller=${params.sellerWallet} - ${params.matchSize} @ ${params.price}`);
+      
+      // Update trade with simulation signature
+      await this.updateCloseTradeSignature(params, simSignature);
+      
       return {
         success: true,
-        signature: `sim_close_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        signature: simSignature,
       };
     }
 
@@ -192,6 +200,10 @@ class TransactionService {
         });
 
         logger.debug(`Close trade executed on-chain: ${signature}`);
+        
+        // Update trade with tx signature
+        await this.updateCloseTradeSignature(params, signature);
+        
         return { success: true, signature };
       } catch (err: any) {
         lastError = err;
@@ -304,6 +316,38 @@ class TransactionService {
         .set(updateData)
         .where(eq(trades.takerOrderId, takerOrderId));
     }
+  }
+
+  /**
+   * Update trade with tx signature by trade ID
+   * Used for close transactions where we have the trade ID directly
+   */
+  private async updateTradeSignature(tradeId: string, signature: string): Promise<void> {
+    const updateData = {
+      txSignature: signature,
+      txStatus: signature.startsWith('sim_') ? 'PENDING' as const : 'CONFIRMED' as const,
+      confirmedAt: signature.startsWith('sim_') ? null : new Date(),
+    };
+
+    await db
+      .update(trades)
+      .set(updateData)
+      .where(eq(trades.id, tradeId));
+    
+    logger.debug(`Updated trade ${tradeId} with signature ${signature.slice(0, 16)}...`);
+  }
+
+  /**
+   * Update close trade with tx signature
+   * Uses tradeId if available, otherwise falls back to order IDs
+   */
+  private async updateCloseTradeSignature(params: CloseParams, signature: string): Promise<void> {
+    if (params.tradeId) {
+      await this.updateTradeSignature(params.tradeId, signature);
+    } else if (params.makerOrderId && params.takerOrderId) {
+      await this.updateTradeStatus(params.makerOrderId, params.takerOrderId, signature);
+    }
+    // If neither is provided, signature won't be saved (legacy code path)
   }
 
   /**

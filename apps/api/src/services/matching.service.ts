@@ -7,7 +7,7 @@ import { transactionService, MatchParams, CloseParams } from './transaction.serv
 import { getMarketPda, anchorClient } from '../lib/anchor-client.js';
 import { db, trades, type NewTrade } from '../db/index.js';
 import { logger, tradeLogger, orderLogger, logEvents } from '../lib/logger.js';
-import { broadcastOrderbookUpdate, broadcastTrade, broadcastUserFill } from '../lib/broadcasts.js';
+import { broadcastOrderbookUpdate, broadcastTrade, broadcastGlobalTrade, broadcastUserFill } from '../lib/broadcasts.js';
 import { config } from '../config.js';
 import { mmBotV2 } from '../bot/mm-bot-v2.js';
 
@@ -281,9 +281,18 @@ export class MatchingService {
     const fills: Fill[] = [];
     let remainingSize = takerOrder.remainingSize;
     
-    // Determine which side of the book to match against
-    // BID (buy) matches against ASK (sell) and vice versa
-    const matchSide = takerOrder.side === 'BID' ? 'ASK' : 'BID';
+    // SINGLE ORDERBOOK MODEL: Transform NO orders to match against YES orderbook
+    // Same rules as matchMarketOrderByDollar: YES=opposite, NO=same
+    const isNoOrder = takerOrder.outcome === 'NO';
+    const effectiveOutcome: 'YES' | 'NO' = 'YES';
+    
+    // Side transformation: YES=opposite, NO=same
+    let matchSide: 'BID' | 'ASK';
+    if (isNoOrder) {
+      matchSide = takerOrder.side;
+    } else {
+      matchSide = takerOrder.side === 'BID' ? 'ASK' : 'BID';
+    }
     
     // For MARKET orders, use extreme prices to guarantee matching
     // BID (buy) uses 0.99 to match any ask
@@ -295,28 +304,33 @@ export class MatchingService {
     
     logger.debug(
       `Matching ${takerOrder.side} ${takerOrder.outcome} ${takerOrder.orderType || 'LIMIT'} order for ` +
-      `${takerOrder.remainingSize} @ ${takerOrder.price} (effective: ${effectivePrice})`
+      `${takerOrder.remainingSize} @ ${takerOrder.price} (effective: ${effectivePrice})` +
+      (isNoOrder ? ` [matching YES ${matchSide}s]` : '')
     );
     
     while (remainingSize > 0) {
-      // Get best opposing order
+      // Get best opposing order from YES orderbook
       const bestOrder = matchSide === 'ASK'
-        ? await orderbookService.getBestAsk(takerOrder.marketId, takerOrder.outcome)
-        : await orderbookService.getBestBid(takerOrder.marketId, takerOrder.outcome);
+        ? await orderbookService.getBestAsk(takerOrder.marketId, effectiveOutcome)
+        : await orderbookService.getBestBid(takerOrder.marketId, effectiveOutcome);
       
       if (!bestOrder) {
         logger.debug('No opposing orders in book');
         break;
       }
       
-      // Check if prices cross
-      // For market orders, use effective price (0.99 for BID, 0.01 for ASK) to guarantee crossing
+      // SINGLE ORDERBOOK MODEL: Calculate user's effective price
+      // For NO orders, the user's price is the complement of the YES order price
+      const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
+      
+      // Check if prices cross using user's effective price
+      // For market orders, use extreme price (0.99 for BID, 0.01 for ASK) to guarantee crossing
       const pricesCross = takerOrder.side === 'BID'
-        ? effectivePrice >= bestOrder.price  // Buyer willing to pay >= seller asking
-        : effectivePrice <= bestOrder.price; // Seller willing to accept <= buyer bidding
+        ? effectivePrice >= userEffectivePrice  // Buyer willing to pay >= seller asking
+        : effectivePrice <= userEffectivePrice; // Seller willing to accept <= buyer bidding
       
       if (!pricesCross) {
-        logger.debug(`Prices don't cross: taker ${effectivePrice} vs maker ${bestOrder.price}`);
+        logger.debug(`Prices don't cross: taker ${effectivePrice} vs maker ${userEffectivePrice}`);
         break;
       }
       
@@ -334,10 +348,10 @@ export class MatchingService {
       // Calculate fill size (minimum of both remaining sizes)
       const fillSize = Math.min(remainingSize, bestOrder.remainingSize);
       
-      // Execute at maker's price (price improvement for taker)
-      const fillPrice = bestOrder.price;
+      // Execute at user's effective price
+      const fillPrice = userEffectivePrice;
       
-      // Calculate fees
+      // Calculate fees based on user's cost
       const notional = fillPrice * fillSize;
       const makerFee = (notional * MAKER_FEE_BPS) / 10000;
       const takerFee = (notional * TAKER_FEE_BPS) / 10000;
@@ -348,12 +362,12 @@ export class MatchingService {
         takerOrderId: takerOrder.id,
         makerUserId: bestOrder.userId,
         takerUserId: takerOrder.userId,
-        price: fillPrice,
+        price: fillPrice,  // User's effective price
         size: fillSize,
-        outcome: takerOrder.outcome,
+        outcome: takerOrder.outcome,  // User's original outcome
         makerFee,
         takerFee,
-        makerSide: bestOrder.side,
+        makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side,
         takerSide: takerOrder.side,
         makerClientOrderId: bestOrder.clientOrderId || Date.now(),
         takerClientOrderId: takerOrder.clientOrderId || Date.now(),
@@ -396,6 +410,12 @@ export class MatchingService {
    * Walks the orderbook from best price up to maxPrice, filling orders
    * until the dollarAmount is exhausted or no more liquidity.
    * 
+   * SINGLE ORDERBOOK MODEL:
+   * - Only YES orderbook exists
+   * - NO orders are transformed to match against YES orderbook:
+   *   - BID NO @ X → Match against YES BID @ (1-X) [MM buying YES = MM selling NO]
+   *   - ASK NO @ X → Match against YES ASK @ (1-X) [MM selling YES = MM buying NO]
+   * 
    * @param order Dollar-based market order parameters
    * @returns Match result with all fills and aggregated stats
    */
@@ -405,20 +425,39 @@ export class MatchingService {
     let totalContracts = 0;
     let totalSpent = 0;
     
-    // For BID (buy), match against ASKs
-    // For ASK (sell), match against BIDs
-    const matchSide = order.side === 'BID' ? 'ASK' : 'BID';
+    // SINGLE ORDERBOOK MODEL: Transform NO orders to match against YES orderbook
+    // 
+    // NO price derivation from YES:
+    // - NO ASK (what user pays to buy NO) = 1 - YES BID
+    // - NO BID (what user receives to sell NO) = 1 - YES ASK
+    //
+    // So matching rules:
+    // - YES: BID→ASK, ASK→BID (opposite side)
+    // - NO: BID→BID, ASK→ASK (SAME side - because NO is derived from opposite YES)
+    const isNoOrder = order.outcome === 'NO';
+    const effectiveOutcome: 'YES' | 'NO' = 'YES'; // Always match against YES orderbook
     
-    logger.info(
-      `Walk-the-book MARKET ${order.side} ${order.outcome}: ` +
-      `$${order.dollarAmount} (max price: ${order.maxPrice})`
-    );
+    // Side transformation:
+    // - YES BID → YES ASK (opposite)
+    // - NO BID → YES BID (same side, because NO ASK = complement of YES BID)
+    let matchSide: 'BID' | 'ASK';
+    if (isNoOrder) {
+      matchSide = order.side;  // Same side for NO
+    } else {
+      matchSide = order.side === 'BID' ? 'ASK' : 'BID';  // Opposite for YES
+    }
+    
+    if (isNoOrder) {
+      logger.info(
+        `[SINGLE ORDERBOOK] ${order.side} NO → matching YES ${matchSide}s (NO price = 1 - YES_${matchSide})`
+      );
+    }
     
     while (remainingDollars > 0) {
-      // Get best opposing order
+      // Get best opposing order from YES orderbook
       const bestOrder = matchSide === 'ASK'
-        ? await orderbookService.getBestAsk(order.marketId, order.outcome)
-        : await orderbookService.getBestBid(order.marketId, order.outcome);
+        ? await orderbookService.getBestAsk(order.marketId, effectiveOutcome)
+        : await orderbookService.getBestBid(order.marketId, effectiveOutcome);
       
       if (!bestOrder) {
         // Devnet/testing: force-fill against MM if the book is empty so market orders always fill.
@@ -469,19 +508,10 @@ export class MatchingService {
         break;
       }
       
-      // Check price protection
-      const exceedsMaxPrice = order.side === 'BID'
-        ? bestOrder.price > order.maxPrice
-        : bestOrder.price < order.maxPrice;
-      
-      if (exceedsMaxPrice) {
-        if (!config.devAlwaysFillMarketOrders) {
-          logger.debug(
-            `Walk-the-book: Price ${bestOrder.price} exceeds max ${order.maxPrice}`
-          );
-          break;
-        }
-      }
+      // SINGLE ORDERBOOK MODEL: Calculate effective price for user
+      // For NO orders, the user's price is the complement of the YES order price
+      // YES BID @ $0.56 → User pays $0.44 for NO
+      const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
       
       // Self-trade prevention
       if (bestOrder.userId === order.userId) {
@@ -491,8 +521,8 @@ export class MatchingService {
         continue;
       }
       
-      // Calculate how many contracts we can afford at this price (fractional allowed)
-      const maxContractsAtPrice = remainingDollars / bestOrder.price;
+      // Calculate how many contracts we can afford at the user's effective price
+      const maxContractsAtPrice = remainingDollars / userEffectivePrice;
       
       // Minimum fill threshold: 0.01 contracts (1 cent payout worth)
       const MIN_FILL_SIZE = 0.01;
@@ -504,10 +534,10 @@ export class MatchingService {
       // Calculate fill size (minimum of what we can afford and what's available)
       // No Math.floor() - allow fractional contracts
       const fillSize = Math.min(maxContractsAtPrice, bestOrder.remainingSize);
-      const fillPrice = bestOrder.price;
+      const fillPrice = userEffectivePrice;  // User sees their effective price
       const fillCost = fillSize * fillPrice;
       
-      // Calculate fees
+      // Calculate fees based on user's cost
       const notional = fillCost;
       const makerFee = (notional * MAKER_FEE_BPS) / 10000;
       const takerFee = (notional * TAKER_FEE_BPS) / 10000;
@@ -516,17 +546,18 @@ export class MatchingService {
       const takerOrderId = 'pending';
       
       // Create fill record
+      // For NO orders: record the user's outcome (NO) and their effective price
       const fill: Fill = {
         makerOrderId: bestOrder.id,
         takerOrderId,
         makerUserId: bestOrder.userId,
         takerUserId: order.userId,
-        price: fillPrice,
+        price: fillPrice,  // User's effective price (complement for NO)
         size: fillSize,
-        outcome: order.outcome,
+        outcome: order.outcome,  // User's original outcome (YES or NO)
         makerFee,
         takerFee,
-        makerSide: bestOrder.side,
+        makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side, // Flip for NO
         takerSide: order.side,
         makerClientOrderId: bestOrder.clientOrderId || Date.now(),
         takerClientOrderId: order.clientOrderId || Date.now(),
@@ -627,21 +658,34 @@ export class MatchingService {
   /**
    * Match sell order against orderbook (walk the bids)
    * Seller wants to sell shares at or above minPrice
+   * 
+   * SINGLE ORDERBOOK MODEL:
+   * - Sell YES → Match YES BIDs (normal)
+   * - Sell NO → Match YES ASKs (MM selling YES = buying NO from user)
    */
   async matchSellOrder(order: SellOrder): Promise<SellMatchResult> {
     const fills: Fill[] = [];
     let remainingSize = order.size;
     let totalProceeds = 0;
     
+    // SINGLE ORDERBOOK MODEL: Transform NO sell to match YES orderbook
+    const isNoOrder = order.outcome === 'NO';
+    const effectiveOutcome: 'YES' | 'NO' = 'YES';
+    
     logger.info(
-      `Sell order: ${order.size} ${order.outcome} contracts (min price: ${order.minPrice})`
+      `Sell order: ${order.size} ${order.outcome} contracts (min price: ${order.minPrice})` +
+      (isNoOrder ? ` [matching YES ASKs]` : '')
     );
     
     while (remainingSize > 0.001) {  // Min 0.001 contracts
-      // Get best bid (highest price buyer)
-      const bestBid = await orderbookService.getBestBid(order.marketId, order.outcome);
+      // SINGLE ORDERBOOK: 
+      // - Sell YES → Get best YES BID (buyer for YES)
+      // - Sell NO → Get best YES ASK (MM selling YES = buying NO from user)
+      const bestOrder = isNoOrder
+        ? await orderbookService.getBestAsk(order.marketId, effectiveOutcome)
+        : await orderbookService.getBestBid(order.marketId, effectiveOutcome);
       
-      if (!bestBid) {
+      if (!bestOrder) {
         // Devnet/testing: force-fill sell orders against MM if the book is empty
         if (config.devAlwaysFillMarketOrders) {
           const mmUserId = getMMUserId();
@@ -687,13 +731,18 @@ export class MatchingService {
             `DEV fill: synthetic MM bid ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for SELL ${order.outcome}`
           );
         } else {
-          logger.debug('Sell order: No more bids');
+          logger.debug('Sell order: No more orders to match');
         }
         break;
       }
       
+      // SINGLE ORDERBOOK MODEL: Calculate user's effective price
+      // For NO sells, user's price is complement of YES order price
+      // YES ASK @ $0.56 → User sells NO @ $0.44
+      const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
+      
       // Check price floor (seller won't accept below minPrice)
-      if (bestBid.price < order.minPrice) {
+      if (userEffectivePrice < order.minPrice) {
         // Devnet/testing: still fill at the user's min price if MM is available
         if (config.devAlwaysFillMarketOrders) {
           const mmUserId = getMMUserId();
@@ -730,20 +779,20 @@ export class MatchingService {
             break;
           }
         }
-        logger.debug(`Sell order: Bid ${bestBid.price} below min ${order.minPrice}`);
+        logger.debug(`Sell order: Price ${userEffectivePrice} below min ${order.minPrice}`);
         break;
       }
       
       // Self-trade prevention
-      if (bestBid.userId === order.userId) {
+      if (bestOrder.userId === order.userId) {
         logger.debug(`Sell order: Self-trade prevented for user ${order.userId}`);
-        await orderbookService.removeOrder(bestBid);
+        await orderbookService.removeOrder(bestOrder);
         continue;
       }
       
-      // Calculate fill size
-      const fillSize = Math.min(remainingSize, bestBid.remainingSize);
-      const fillPrice = bestBid.price;
+      // Calculate fill size and proceeds using user's effective price
+      const fillSize = Math.min(remainingSize, bestOrder.remainingSize);
+      const fillPrice = userEffectivePrice;  // User sees their effective price
       const fillProceeds = fillSize * fillPrice;
       
       // Calculate fees
@@ -752,22 +801,22 @@ export class MatchingService {
       
       // Create fill record (seller is taker, buyer is maker)
       const fill: Fill = {
-        makerOrderId: bestBid.id,
+        makerOrderId: bestOrder.id,
         takerOrderId: 'pending',  // Will be replaced
-        makerUserId: bestBid.userId,  // Buyer (maker)
-        takerUserId: order.userId,     // Seller (taker)
-        price: fillPrice,
+        makerUserId: bestOrder.userId,  // Buyer (maker)
+        takerUserId: order.userId,       // Seller (taker)
+        price: fillPrice,  // User's effective price
         size: fillSize,
-        outcome: order.outcome,
+        outcome: order.outcome,  // User's original outcome
         makerFee,
         takerFee,
-        makerSide: 'BID',   // Buyer is bidding
+        makerSide: isNoOrder ? 'ASK' : 'BID',  // For NO: maker was YES ASK
         takerSide: 'ASK',   // Seller is asking
-        makerClientOrderId: bestBid.clientOrderId || Date.now(),
+        makerClientOrderId: bestOrder.clientOrderId || Date.now(),
         takerClientOrderId: order.clientOrderId || Date.now(),
-        makerOrderPda: (bestBid as any).orderPda,
-        makerSignature: bestBid.signature,
-        makerMessage: bestBid.binaryMessage,
+        makerOrderPda: (bestOrder as any).orderPda,
+        makerSignature: bestOrder.signature,
+        makerMessage: bestOrder.binaryMessage,
         takerSignature: order.signature,
         takerMessage: order.binaryMessage,
       };
@@ -777,11 +826,11 @@ export class MatchingService {
       remainingSize -= fillSize;
       
       // Update maker order in orderbook
-      const newMakerRemaining = bestBid.remainingSize - fillSize;
+      const newMakerRemaining = bestOrder.remainingSize - fillSize;
       if (newMakerRemaining > 0) {
-        await orderbookService.updateOrderSize(bestBid, newMakerRemaining);
+        await orderbookService.updateOrderSize(bestOrder, newMakerRemaining);
       } else {
-        await orderbookService.removeOrder(bestBid);
+        await orderbookService.removeOrder(bestOrder);
       }
       
       logger.debug(
@@ -1076,13 +1125,34 @@ export class MatchingService {
       takerWalletForWs = await this.getWalletForUser(fill.takerUserId);
     } catch {}
     if (marketAddress) {
+      const tradeTimestamp = Date.now();
+      const tradeSide = fill.takerSide === 'BID' ? 'buy' : 'sell';
+      const tradeOutcome = String(fill.outcome).toLowerCase() as 'yes' | 'no';
+      
+      // Market-specific trade feed
       broadcastTrade(marketAddress, {
         price: fill.price,
         size: fill.size,
-        side: fill.takerSide === 'BID' ? 'buy' : 'sell',
-        outcome: String(fill.outcome).toLowerCase(),
-        timestamp: Date.now(),
+        side: tradeSide,
+        outcome: tradeOutcome,
+        timestamp: tradeTimestamp,
         takerWallet: takerWalletForWs,
+      });
+      
+      // Global trade blotter feed
+      broadcastGlobalTrade({
+        id: trade.id,
+        market: `${market?.asset}-${market?.timeframe}`,
+        marketAddress,
+        asset: market?.asset || '',
+        timeframe: market?.timeframe || '',
+        side: tradeSide as 'buy' | 'sell',
+        outcome: tradeOutcome,
+        price: fill.price,
+        size: fill.size,
+        notional: fill.price * fill.size,
+        txSignature: null, // Will be updated after on-chain execution
+        timestamp: tradeTimestamp,
       });
     }
 
@@ -1130,6 +1200,7 @@ export class MatchingService {
           outcome: takerOutcome,
           price: fill.price,
           matchSize: fill.size,
+          tradeId: trade.id,  // Pass trade ID to update with tx signature
         };
         logger.info(`Executing on-chain CLOSE: ${fill.size} ${takerOutcome} @ ${fill.price} (seller=${takerWallet}, buyer=${makerWallet})`);
         transactionService.executeClose(closeParams).catch(err => 
@@ -1264,6 +1335,8 @@ export class MatchingService {
         outcome: fill.outcome,
         price: fill.price,
         matchSize: fill.size,
+        makerOrderId: fill.makerOrderId,  // For updating trade with tx signature
+        takerOrderId: fill.takerOrderId,  // For updating trade with tx signature
       };
       
       transactionService.executeClose(closeParams).then(result => {
@@ -1294,6 +1367,8 @@ export class MatchingService {
           outcome: fill.outcome,
           price: fill.price,
           matchSize: fill.size,
+          makerOrderId: fill.makerOrderId,  // For updating trade with tx signature
+          takerOrderId: fill.takerOrderId,  // For updating trade with tx signature
         };
         
         transactionService.executeClose(closeParams).then(result => {
@@ -1475,7 +1550,8 @@ export class MatchingService {
         marketForBroadcast?.pubkey || order.marketId,
         snapshot.bids.map(l => [l.price, l.size] as [number, number]),
         snapshot.asks.map(l => [l.price, l.size] as [number, number]),
-        sequenceId
+        sequenceId,
+        order.outcome  // FIX: Pass the correct outcome so YES/NO don't get mixed up!
       );
     } else if (matchResult.remainingSize > 0 && orderType !== 'LIMIT') {
       // Log that the order was partially filled but remainder was cancelled
@@ -1638,6 +1714,7 @@ export class MatchingService {
               outcome: fill.outcome,
               price: fill.price,
               matchSize: fill.size,
+              tradeId: trade.id,  // Pass trade ID to update with tx signature
             };
             
             transactionService.executeClose(closeParams).then(result => {
@@ -1771,7 +1848,8 @@ export class MatchingService {
       marketForCancel?.pubkey || order.marketId!,
       snapshot.bids.map(l => [l.price, l.size] as [number, number]),
       snapshot.asks.map(l => [l.price, l.size] as [number, number]),
-      sequenceId
+      sequenceId,
+      order.outcome as 'YES' | 'NO'  // FIX: Pass the correct outcome!
     );
     
     return true;

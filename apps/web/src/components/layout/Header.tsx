@@ -1,17 +1,18 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { WalletButton } from '@/components/WalletButton';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { usePriceStore } from '@/stores/priceStore';
 import { cn } from '@/lib/utils';
-import { TrendingUp, TrendingDown, Activity, Wallet, User, Zap } from 'lucide-react';
+import { TrendingUp, TrendingDown, Activity, Wallet, User, Zap, Settings, X, RefreshCw, ChevronDown } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useBalance } from '@/hooks/useUser';
 import { useAuth } from '@/hooks/useAuth';
 import { useAuthStore } from '@/stores/authStore';
 import { useSettingsStore } from '@/stores/settingsStore';
+import { useDelegation } from '@/hooks/useDelegation';
 
 export function Header() {
   const { connected, publicKey } = useWallet();
@@ -21,8 +22,24 @@ export function Header() {
   const { isAuthenticated, isAuthenticating, signIn, signOut } = useAuth();
   const authedWalletAddress = useAuthStore((s) => s.walletAddress);
   const { oneClickEnabled, oneClickAmount } = useSettingsStore();
+  const { isApproved: isDelegationApproved, delegatedAmount, approve: approveDelegation, revoke: revokeDelegation, isApproving } = useDelegation();
+  
+  const [showDelegationDropdown, setShowDelegationDropdown] = useState(false);
+  const [delegationInput, setDelegationInput] = useState('');
+  const delegationDropdownRef = useRef<HTMLDivElement>(null);
 
   const lastAttemptRef = useRef<{ wallet: string | null; at: number }>({ wallet: null, at: 0 });
+  
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (delegationDropdownRef.current && !delegationDropdownRef.current.contains(event.target as Node)) {
+        setShowDelegationDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
 
   // Ensure SIWS runs from any page:
   // - When wallet connects and we're not authenticated -> prompt sign message
@@ -59,7 +76,7 @@ export function Header() {
 
   return (
     <header className="sticky top-0 z-50 glass-strong border-b border-border/50">
-      <div className="max-w-[1800px] mx-auto px-4 py-3 flex items-center justify-between relative">
+      <div className="w-full px-1 py-2 flex items-center justify-between relative">
         {/* Logo + Navigation */}
         <div className="flex items-center gap-4 sm:gap-8">
           <Link href="/" className="flex items-center gap-2 group btn-press">
@@ -77,41 +94,16 @@ export function Header() {
 
           <nav className="flex items-center gap-1">
             <Link 
-              href="/" 
-              className={cn(
-                "px-2 sm:px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-colors btn-press",
-                pathname === '/' ? "bg-accent/10 text-accent" : "text-text-muted hover:text-text-primary hover:bg-surface-light"
-              )}
-            >
-              Markets
-            </Link>
-            <Link 
-              href="/orders" 
-              className={cn(
-                "px-2 sm:px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-colors btn-press",
-                pathname === '/orders' ? "bg-accent/10 text-accent" : "text-text-muted hover:text-text-primary hover:bg-surface-light"
-              )}
-            >
-              Orders
-            </Link>
-            <Link 
-              href="/portfolio" 
-              className={cn(
-                "px-2 sm:px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-colors btn-press hidden sm:block",
-                pathname === '/portfolio' ? "bg-accent/10 text-accent" : "text-text-muted hover:text-text-primary hover:bg-surface-light"
-              )}
-            >
-              Analytics
-            </Link>
-            <Link 
               href="/profile" 
               className={cn(
                 "px-2 sm:px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-colors btn-press flex items-center gap-1.5",
-                pathname === '/profile' ? "bg-accent/10 text-accent" : "text-text-muted hover:text-text-primary hover:bg-surface-light"
+                (pathname === '/profile' || pathname === '/orders' || pathname === '/portfolio') 
+                  ? "bg-accent/10 text-accent" 
+                  : "text-text-muted hover:text-text-primary hover:bg-surface-light"
               )}
             >
               <User className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Settings</span>
+              <span className="hidden sm:inline">Profile</span>
             </Link>
           </nav>
         </div>
@@ -123,8 +115,127 @@ export function Header() {
           <PriceTicker symbol="SOL" price={prices.SOL} />
         </div>
 
-        {/* Right Side: One-Click Indicator + Balance + Wallet */}
-        <div className="flex items-center gap-2 sm:gap-4">
+        {/* Right Side: Delegation + Balance + Wallet */}
+        <div className="flex items-center gap-2 sm:gap-3">
+          {/* Delegation Status / Enable Button */}
+          {connected && (
+            <div className="relative" ref={delegationDropdownRef}>
+              {isDelegationApproved ? (
+                <button
+                  onClick={() => {
+                    setDelegationInput(((delegatedAmount || 0) / 1_000_000).toFixed(0));
+                    setShowDelegationDropdown(!showDelegationDropdown);
+                  }}
+                  className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 bg-long/10 border border-long/30 rounded-lg text-long text-xs font-bold hover:bg-long/20 transition-colors btn-press"
+                  title="Delegation Active - Click to manage"
+                >
+                  <Zap className="w-3.5 h-3.5" />
+                  <span className="font-mono">${(delegatedAmount / 1_000_000).toFixed(0)}</span>
+                  <ChevronDown className="w-3 h-3" />
+                </button>
+              ) : (
+                <button
+                  onClick={() => approveDelegation()}
+                  disabled={isApproving}
+                  className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 bg-surface-light border border-border/50 rounded-lg text-text-muted text-xs font-bold hover:border-accent/50 hover:text-accent transition-colors btn-press"
+                  title="Enable delegation to start trading"
+                >
+                  {isApproving ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>Enabling...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Zap className="w-3.5 h-3.5" />
+                      <span>Enable Trading</span>
+                    </>
+                  )}
+                </button>
+              )}
+              
+              {/* Delegation Dropdown */}
+              {showDelegationDropdown && isDelegationApproved && (
+                <div className="absolute right-0 top-full mt-2 w-72 bg-surface border border-border rounded-xl shadow-xl z-50 overflow-hidden animate-fade-in">
+                  <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-surface-light/30">
+                    <div className="flex items-center gap-2">
+                      <Zap className="w-4 h-4 text-long" />
+                      <span className="font-bold text-sm">Delegated Balance</span>
+                    </div>
+                    <button
+                      onClick={() => setShowDelegationDropdown(false)}
+                      className="p-1 hover:bg-surface-light rounded transition-colors"
+                    >
+                      <X className="w-4 h-4 text-text-muted" />
+                    </button>
+                  </div>
+                  
+                  <div className="p-4 space-y-4">
+                    <div className="flex items-center justify-between p-3 bg-surface-light/50 rounded-lg">
+                      <span className="text-xs text-text-muted">Currently delegated</span>
+                      <span className="font-mono text-lg font-bold text-accent">${(delegatedAmount / 1_000_000).toFixed(2)}</span>
+                    </div>
+                    
+                    <div className="space-y-2">
+                      <label className="text-xs font-medium text-text-muted">Adjust amount (USDC)</label>
+                      <input
+                        value={delegationInput}
+                        onChange={(e) => setDelegationInput(e.target.value)}
+                        inputMode="decimal"
+                        placeholder="e.g. 10000"
+                        className="w-full px-3 py-2 rounded-lg bg-surface-light border border-border text-text-primary font-mono text-sm outline-none focus:border-accent transition-colors"
+                      />
+                      <div className="grid grid-cols-4 gap-1">
+                        {[1000, 5000, 10000, 25000].map((amt) => (
+                          <button
+                            key={amt}
+                            onClick={() => setDelegationInput(amt.toString())}
+                            className="py-1.5 text-[10px] font-mono font-bold rounded bg-surface-light hover:bg-border border border-border/50 text-text-muted hover:text-text-primary transition-all"
+                          >
+                            ${(amt / 1000).toFixed(0)}k
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    
+                    <div className="flex items-center gap-2 pt-1">
+                      <button
+                        onClick={async () => {
+                          await revokeDelegation();
+                          setShowDelegationDropdown(false);
+                        }}
+                        disabled={isApproving}
+                        className="flex-1 px-3 py-2 rounded-lg border border-short/30 text-short text-xs font-bold hover:bg-short/10 transition-colors btn-press"
+                      >
+                        Revoke All
+                      </button>
+                      <button
+                        onClick={async () => {
+                          const parsed = Number(delegationInput);
+                          if (!Number.isFinite(parsed) || parsed < 0) return;
+                          const micro = Math.floor(parsed * 1_000_000);
+                          await approveDelegation(micro);
+                          setShowDelegationDropdown(false);
+                        }}
+                        disabled={isApproving}
+                        className="flex-1 px-3 py-2 rounded-lg bg-accent text-background text-xs font-bold hover:bg-accent-dim transition-all btn-press flex items-center justify-center gap-1.5"
+                      >
+                        {isApproving ? (
+                          <>
+                            <RefreshCw className="w-3 h-3 animate-spin" />
+                            Saving...
+                          </>
+                        ) : (
+                          'Update'
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          
           {/* One-Click Mode Indicator */}
           {connected && oneClickEnabled && (
             <Link
@@ -165,13 +276,13 @@ function PriceTicker({ symbol, price }: { symbol: string; price?: number }) {
   };
 
   // Market URL for this asset
-  const marketUrl = `/market/${symbol.toLowerCase()}`;
+  const marketUrl = `/${symbol.toLowerCase()}`;
 
   // Color for each asset
   const symbolColors: Record<string, string> = {
     BTC: 'text-orange',
-    ETH: 'text-violet',
-    SOL: 'text-electric-blue',
+    ETH: 'text-electric-blue',
+    SOL: 'text-violet',
   };
 
   return (

@@ -14,11 +14,12 @@ if (!config.databaseUrl) {
 
 // Create PostgreSQL connection pool
 // Optimized for Supabase's connection pooler (Supavisor)
+// Supabase Pro plan supports 200+ pooled connections
 export const pool = new Pool({
   connectionString: config.databaseUrl,
-  max: 10,                    // Reduced to 10 to play nicer with Supabase limits
-  min: 0,                     // Let the pool shrink to 0 (Supavisor can kill idles; avoid holding stale conns)
-  idleTimeoutMillis: 10000,   // Release idle connections faster (10s)
+  max: 100,                   // Increased for MM bot + keeper jobs concurrency
+  min: 2,                     // Keep a couple warm connections ready
+  idleTimeoutMillis: 30000,   // Release idle connections after 30s
   connectionTimeoutMillis: 15000, // Be more tolerant of pooler / network jitter (15s)
   ssl: config.databaseUrl?.includes('supabase') 
     ? { rejectUnauthorized: false } 
@@ -34,7 +35,7 @@ pool.on('acquire', () => {
   const waiting = pool.waitingCount;
   
   // Only log if there's actual pressure (waiting clients) and not too frequently
-  if (waiting > 2 && Date.now() - lastHighLoadLog > 30000) {
+  if (waiting > 10 && Date.now() - lastHighLoadLog > 30000) {
     lastHighLoadLog = Date.now();
     logger.warn(`Database connection pool high load: total=${total}, idle=${idle}, waiting=${waiting}`);
   }

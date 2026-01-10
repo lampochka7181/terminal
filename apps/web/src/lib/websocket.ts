@@ -9,7 +9,7 @@ import { getAuthToken } from './api';
 const WS_BASE_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:4000';
 const WS_URL = WS_BASE_URL.endsWith('/ws') ? WS_BASE_URL : `${WS_BASE_URL}/ws`;
 
-export type Channel = 'orderbook' | 'trades' | 'prices' | 'user' | 'market';
+export type Channel = 'orderbook' | 'trades' | 'trades:global' | 'prices' | 'user' | 'market';
 
 export interface WSMessage {
   op?: string;
@@ -116,6 +116,26 @@ export interface UserSettlementUpdate {
   };
 }
 
+export interface GlobalTradeUpdate {
+  channel: 'trades:global';
+  type: 'global_trade';
+  data: {
+    id: string;
+    market: string;
+    marketAddress: string;
+    asset: string;
+    timeframe: string;
+    side: 'buy' | 'sell';
+    outcome: 'yes' | 'no';
+    price: number;
+    size: number;
+    notional: number;
+    txSignature: string | null;
+    solscanUrl: string | null;
+    timestamp: number;
+  };
+}
+
 type WSUpdate =
   | OrderbookUpdate
   | TradeUpdate
@@ -123,7 +143,8 @@ type WSUpdate =
   | MarketResolvedUpdate
   | MarketActivatedUpdate
   | UserFillUpdate
-  | UserSettlementUpdate;
+  | UserSettlementUpdate
+  | GlobalTradeUpdate;
 
 type MessageHandler = (message: WSUpdate) => void;
 type ConnectionHandler = () => void;
@@ -239,9 +260,14 @@ export class WebSocketService {
   }
 
   private startPingInterval(): void {
+    // Send first ping immediately to establish connection health
+    setTimeout(() => {
+      this.send({ op: 'ping' });
+    }, 1000);
+    
     this.pingInterval = setInterval(() => {
       this.send({ op: 'ping' });
-    }, 30000); // 30 second heartbeat
+    }, 25000); // 25 second heartbeat (server timeout is 60s)
   }
 
   private stopPingInterval(): void {
@@ -293,13 +319,11 @@ export class WebSocketService {
 
     // Handle welcome message
     if (message.op === 'welcome') {
-      console.log('[WS] Received welcome, server time:', message.serverTime);
       return;
     }
 
     // Handle subscription confirmations
     if (message.op === 'subscribed' || message.op === 'unsubscribed') {
-      console.log(`[WS] ${message.op}: ${message.channel}`, message.market || message.assets);
       return;
     }
 
@@ -345,6 +369,11 @@ export class WebSocketService {
           ...message,
           channel: 'user',
           event: 'settlement',
+        };
+      } else if (message.type === 'global_trade') {
+        normalizedMessage = {
+          ...message,
+          channel: 'trades:global',
         };
       }
     }
@@ -393,7 +422,7 @@ export class WebSocketService {
       this.ws.send(JSON.stringify(message));
     } else {
       // Queue the message to be sent when connected
-      console.debug('[WS] Queuing message, not connected yet:', message.op, message.channel);
+      console.warn('[WS] Queuing message, not connected yet:', message.op, message.channel, 'readyState:', this.ws?.readyState);
     }
   }
 
@@ -487,6 +516,25 @@ export class WebSocketService {
       op: 'unsubscribe',
       channel: 'market',
       market: marketAddress,
+    });
+  }
+
+  subscribeGlobalTrades(): void {
+    const key = 'trades:global';
+    const message: WSMessage = {
+      op: 'subscribe',
+      channel: 'trades:global',
+    };
+    this.subscriptions.set(key, message);
+    this.send(message);
+  }
+
+  unsubscribeGlobalTrades(): void {
+    const key = 'trades:global';
+    this.subscriptions.delete(key);
+    this.send({
+      op: 'unsubscribe',
+      channel: 'trades:global',
     });
   }
 

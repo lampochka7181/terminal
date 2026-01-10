@@ -3,35 +3,40 @@
 @tailwind utilities;
 
 /* ===========================================
-   CSS CUSTOM PROPERTIES
+   CSS CUSTOM PROPERTIES - ARCTIC TERMINAL THEME
+   A premium dark theme designed for traders:
+   - Deep navy base reduces eye strain
+   - Ice blue accent is calming & distinct from P&L
+   - High contrast for critical data
    =========================================== */
 :root {
-  /* Core palette - Deep dark with blue undertones */
-  --background: #03030a;
-  --surface: #0a0a14;
-  --surface-light: #12121e;
-  --border: #1a1a2e;
+  /* Core palette - Deep navy with blue undertones */
+  --background: #060a10;
+  --surface: #0c1219;
+  --surface-light: #141d28;
+  --border: #1c2a3a;
   
-  /* Accent colors - Electric cyan-green */
-  --accent: #00ffa3;
-  --accent-dim: #00cc82;
-  --accent-light: #33ffb5;
-  --accent-glow: rgba(0, 255, 163, 0.15);
+  /* Primary accent - Electric ice blue (calming, professional) */
+  --accent: #00d4ff;
+  --accent-dim: #00a8cc;
+  --accent-light: #4de8ff;
+  --accent-glow: rgba(0, 212, 255, 0.15);
   
-  /* Status colors */
-  --long: #00ffa3;
-  --short: #ff3d71;
-  --warning: #ffb800;
+  /* Status colors - Vibrant but balanced */
+  --long: #00ff88;      /* Bright mint green - profit */
+  --short: #ff4757;     /* Coral red - loss (softer than pure red) */
+  --warning: #ffb830;   /* Warm amber */
   
-  /* Text hierarchy */
-  --text-primary: #f0f2f5;
-  --text-secondary: #7c8494;
-  --text-muted: #464c5c;
+  /* Text hierarchy - Cool whites for readability */
+  --text-primary: #f0f6fc;
+  --text-secondary: #8b9eb3;
+  --text-muted: #4a5c70;
   
-  /* Additional accents */
-  --electric-blue: #00a3ff;
-  --violet: #8b5cf6;
-  --orange: #ff6b35;
+  /* Additional accents for variety */
+  --electric-blue: #3b82f6;
+  --violet: #a78bfa;
+  --orange: #ff9f43;
+  --cyan: #00d4ff;
   
   /* Animation timings */
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
@@ -78,7 +83,7 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 /* ===========================================
-   CUSTOM SCROLLBAR
+   CUSTOM SCROLLBAR - Minimal, elegant
    =========================================== */
 ::-webkit-scrollbar {
   width: 6px;
@@ -135,11 +140,13 @@ input[type='range']::-webkit-slider-thumb {
   background: var(--accent);
   border-radius: 50%;
   cursor: pointer;
+  box-shadow: 0 0 10px var(--accent-glow);
   transition: transform 0.15s var(--ease-spring);
 }
 
 input[type='range']::-webkit-slider-thumb:hover {
   transform: scale(1.15);
+  box-shadow: 0 0 20px var(--accent-glow);
 }
 
 input[type='range']::-webkit-slider-thumb:active {
@@ -151,15 +158,15 @@ input[type='range']::-webkit-slider-thumb:active {
    =========================================== */
 .terminal-text {
   font-family: var(--font-mono);
-  text-shadow: 0 0 8px rgba(0, 255, 163, 0.4);
+  text-shadow: 0 0 10px var(--accent-glow);
 }
 
 .glow {
-  box-shadow: 0 0 24px var(--accent-glow);
+  box-shadow: 0 0 30px var(--accent-glow);
 }
 
 .glow-subtle {
-  box-shadow: 0 0 12px var(--accent-glow);
+  box-shadow: 0 0 15px var(--accent-glow);
 }
 
 /* ===========================================
@@ -199,7 +206,7 @@ input[type='range']::-webkit-slider-thumb:active {
 
 .btn-primary:hover {
   background: var(--accent-light);
-  box-shadow: 0 0 24px var(--accent-glow);
+  box-shadow: 0 0 30px var(--accent-glow);
 }
 
 .btn-primary:active {
@@ -221,10 +228,10 @@ input[type='range']::-webkit-slider-thumb:active {
 
 @keyframes flash-green {
   0% { 
-    background-color: rgba(0, 255, 163, 0.5); 
+    background-color: rgba(0, 255, 136, 0.5); 
     transform: scale(1.02);
   }
-  50% { background-color: rgba(0, 255, 163, 0.25); }
+  50% { background-color: rgba(0, 255, 136, 0.25); }
   100% { 
     background-color: transparent; 
     transform: scale(1);
@@ -233,10 +240,10 @@ input[type='range']::-webkit-slider-thumb:active {
 
 @keyframes flash-red {
   0% { 
-    background-color: rgba(255, 61, 113, 0.5); 
+    background-color: rgba(255, 71, 87, 0.5); 
     transform: scale(1.02);
   }
-  50% { background-color: rgba(255, 61, 113, 0.25); }
+  50% { background-color: rgba(255, 71, 87, 0.25); }
   100% { 
     background-color: transparent; 
     transform: scale(1);
@@ -432,7 +439,7 @@ input[type='range']::-webkit-slider-thumb:active {
     box-shadow: 0 0 0 0 var(--accent-glow);
   }
   50% {
-    box-shadow: 0 0 20px 4px var(--accent-glow);
+    box-shadow: 0 0 25px 6px var(--accent-glow);
   }
 }
 
@@ -511,31 +518,32 @@ input[type='range']::-webkit-slider-thumb:active {
 
 .card-hover:hover {
   transform: translateY(-2px);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  border-color: var(--accent-dim);
 }
 
 /* ===========================================
-   GLASSMORPHISM
+   GLASSMORPHISM - Arctic style
    =========================================== */
 .glass {
-  background: rgba(10, 10, 20, 0.8);
+  background: rgba(12, 18, 25, 0.85);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(0, 212, 255, 0.08);
 }
 
 .glass-strong {
-  background: rgba(10, 10, 20, 0.9);
+  background: rgba(12, 18, 25, 0.95);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(0, 212, 255, 0.12);
 }
 
 .glass-card {
-  background: linear-gradient(135deg, rgba(255,255,255,0.03) 0%, rgba(255,255,255,0.01) 100%);
+  background: linear-gradient(135deg, rgba(0, 212, 255, 0.03) 0%, rgba(0, 212, 255, 0.01) 100%);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
-  border: 1px solid rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(0, 212, 255, 0.06);
 }
 
 /* ===========================================
@@ -544,7 +552,7 @@ input[type='range']::-webkit-slider-thumb:active {
 .bg-gradient-radial {
   background: radial-gradient(
     ellipse at 50% 0%,
-    rgba(0, 255, 163, 0.08) 0%,
+    rgba(0, 255, 136, 0.06) 0%,
     transparent 50%
   );
 }
@@ -552,23 +560,30 @@ input[type='range']::-webkit-slider-thumb:active {
 .bg-gradient-radial-short {
   background: radial-gradient(
     ellipse at 50% 0%,
-    rgba(255, 61, 113, 0.08) 0%,
+    rgba(255, 71, 87, 0.06) 0%,
     transparent 50%
   );
 }
 
 .bg-gradient-mesh {
   background: 
-    radial-gradient(at 40% 20%, rgba(0, 255, 163, 0.08) 0px, transparent 50%),
-    radial-gradient(at 80% 0%, rgba(0, 163, 255, 0.05) 0px, transparent 50%),
-    radial-gradient(at 0% 50%, rgba(139, 92, 246, 0.05) 0px, transparent 50%);
+    radial-gradient(at 40% 20%, rgba(0, 212, 255, 0.08) 0px, transparent 50%),
+    radial-gradient(at 80% 0%, rgba(59, 130, 246, 0.04) 0px, transparent 50%),
+    radial-gradient(at 0% 50%, rgba(167, 139, 250, 0.04) 0px, transparent 50%);
 }
 
 .bg-grid {
   background-image: 
-    linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
-  background-size: 20px 20px;
+    linear-gradient(rgba(0, 212, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 212, 255, 0.03) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Arctic subtle glow behind main content */
+.bg-arctic-glow {
+  background: 
+    radial-gradient(ellipse at 50% -20%, rgba(0, 212, 255, 0.08) 0%, transparent 60%),
+    var(--background);
 }
 
 /* ===========================================
@@ -625,6 +640,13 @@ input[type='range']::-webkit-slider-thumb:active {
   background-clip: text;
 }
 
+.gradient-text-arctic {
+  background: linear-gradient(135deg, var(--accent-light) 0%, var(--accent) 50%, var(--electric-blue) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
 /* ===========================================
    SPECIAL EFFECTS
    =========================================== */
@@ -634,7 +656,7 @@ input[type='range']::-webkit-slider-thumb:active {
   position: absolute;
   inset: 0;
   background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
-  opacity: 0.03;
+  opacity: 0.02;
   pointer-events: none;
 }
 
@@ -647,14 +669,14 @@ input[type='range']::-webkit-slider-thumb:active {
     0deg,
     transparent,
     transparent 1px,
-    rgba(0, 0, 0, 0.1) 2px,
-    rgba(0, 0, 0, 0.1) 3px
+    rgba(0, 0, 0, 0.08) 2px,
+    rgba(0, 0, 0, 0.08) 3px
   );
   pointer-events: none;
-  opacity: 0.15;
+  opacity: 0.12;
 }
 
-/* Border gradient */
+/* Border gradient - Arctic style */
 .border-gradient {
   position: relative;
   border: none;
@@ -669,7 +691,31 @@ input[type='range']::-webkit-slider-thumb:active {
   background: linear-gradient(135deg, var(--accent) 0%, var(--electric-blue) 50%, var(--violet) 100%);
   border-radius: inherit;
   z-index: -1;
+  opacity: 0.4;
+}
+
+/* Ice line - decorative accent line */
+.ice-line {
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  height: 1px;
   opacity: 0.5;
+}
+
+/* ===========================================
+   TRADING PANEL SPECIFIC STYLES
+   =========================================== */
+.trading-panel {
+  background: linear-gradient(180deg, var(--surface) 0%, var(--background) 100%);
+  border: 1px solid var(--border);
+}
+
+.trading-panel:hover {
+  border-color: rgba(0, 212, 255, 0.2);
+}
+
+/* Price display enhancement */
+.price-display {
+  text-shadow: 0 0 20px var(--accent-glow);
 }
 
 /* ===========================================

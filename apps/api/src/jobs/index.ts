@@ -41,7 +41,7 @@ const jobs: JobConfig[] = [
   },
   {
     name: 'Market Resolver',
-    intervalMs: 5 * 1000, // Every 5 seconds (fast resolution for better UX)
+    intervalMs: 2 * 1000, // Every 2 seconds (matches 2s trading cutoff window)
     job: marketResolverJob,
     enabled: true,
   },
@@ -142,9 +142,10 @@ const runningIntervals = new Set<string>();
 async function runJobSafe(config: JobConfig): Promise<void> {
   // HIGH LOAD SHIELD: If the DB is already struggling, don't add more pressure.
   // This helps prioritize existing queries and prevents the pool from freezing.
+  // With pool max=100, only skip when truly overwhelmed (>25 waiting)
   const waitingCount = (pool as any).waitingCount || 0;
   
-  if (waitingCount > 5 && config.name !== 'Market Closer') {
+  if (waitingCount > 25 && config.name !== 'Market Closer') {
     keeperLogger.warn(`[KEEPER] Skipping "${config.name}" - DB load high (waiting=${waitingCount})`);
     return;
   }

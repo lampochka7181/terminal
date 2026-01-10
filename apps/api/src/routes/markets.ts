@@ -337,7 +337,12 @@ export async function marketRoutes(app: FastifyInstance) {
 
   /**
    * GET /markets/:address/orderbook
-   * Get orderbook snapshot for a market (both YES and NO outcomes)
+   * Get orderbook snapshot for a market
+   * 
+   * SINGLE ORDERBOOK MODEL:
+   * - Only YES orderbook is stored in Redis
+   * - NO orderbook is DERIVED as complement by frontend
+   * - API returns empty NO data for backwards compatibility
    */
   app.get('/:address/orderbook', async (request: FastifyRequest, reply: FastifyReply) => {
     const params = marketParamsSchema.safeParse(request.params);
@@ -362,16 +367,17 @@ export async function marketRoutes(app: FastifyInstance) {
       });
     }
     
-    // Get orderbook from Redis for BOTH YES and NO outcomes
+    // SINGLE ORDERBOOK MODEL: Only fetch YES orderbook from Redis
+    // NO orderbook is derived by frontend as complement (1 - YES price)
+    // NOTE: Bids use NEGATIVE scores (-price * 1M), so zrange (lowest to highest) 
+    // returns highest prices first (e.g., -550000 before -540000 = $0.55 before $0.54)
+    // Asks use POSITIVE scores, so zrange returns lowest prices first (correct)
     const [
       yesBidData, yesAskData,
-      noBidData, noAskData,
       sequenceId
     ] = await Promise.all([
-      redis.zrevrange(RedisKeys.orderbook(market.id, 'YES', 'BID'), 0, -1, 'WITHSCORES'),
+      redis.zrange(RedisKeys.orderbook(market.id, 'YES', 'BID'), 0, -1, 'WITHSCORES'),
       redis.zrange(RedisKeys.orderbook(market.id, 'YES', 'ASK'), 0, -1, 'WITHSCORES'),
-      redis.zrevrange(RedisKeys.orderbook(market.id, 'NO', 'BID'), 0, -1, 'WITHSCORES'),
-      redis.zrange(RedisKeys.orderbook(market.id, 'NO', 'ASK'), 0, -1, 'WITHSCORES'),
       redis.get(RedisKeys.sequence(market.id)),
     ]);
     
@@ -379,20 +385,12 @@ export async function marketRoutes(app: FastifyInstance) {
     // Format: [[price, size], [price, size], ...]
     const yesBids = parseOrderbookData(yesBidData);
     const yesAsks = parseOrderbookData(yesAskData);
-    const noBids = parseOrderbookData(noBidData);
-    const noAsks = parseOrderbookData(noAskData);
     
     // Calculate mid price and spread for YES
     const yesBestBid = yesBids[0]?.[0] || 0;
     const yesBestAsk = yesAsks[0]?.[0] || 1;
     const yesMidPrice = (yesBestBid + yesBestAsk) / 2;
     const yesSpread = yesBestAsk - yesBestBid;
-    
-    // Calculate mid price and spread for NO
-    const noBestBid = noBids[0]?.[0] || 0;
-    const noBestAsk = noAsks[0]?.[0] || 1;
-    const noMidPrice = (noBestBid + noBestAsk) / 2;
-    const noSpread = noBestAsk - noBestBid;
     
     return {
       // Legacy format (YES only) for backwards compatibility
@@ -401,18 +399,19 @@ export async function marketRoutes(app: FastifyInstance) {
       midPrice: parseFloat(yesMidPrice.toFixed(2)),
       spread: parseFloat(yesSpread.toFixed(2)),
       sequenceId: parseInt(sequenceId || '0'),
-      // New format with both outcomes
+      // YES orderbook (the only real orderbook)
       yes: {
         bids: yesBids,
         asks: yesAsks,
         midPrice: parseFloat(yesMidPrice.toFixed(2)),
         spread: parseFloat(yesSpread.toFixed(2)),
       },
+      // NO orderbook - empty, frontend derives from YES
       no: {
-        bids: noBids,
-        asks: noAsks,
-        midPrice: parseFloat(noMidPrice.toFixed(2)),
-        spread: parseFloat(noSpread.toFixed(2)),
+        bids: [],
+        asks: [],
+        midPrice: 0.5,
+        spread: 0,
       },
     };
   });
@@ -465,17 +464,25 @@ export async function marketRoutes(app: FastifyInstance) {
 
 /**
  * Parse Redis ZRANGE WITHSCORES data into orderbook format
+ * Member format: {orderId}:{remainingSize}:{createdAt}
+ * Score: price * 1000000
  */
 function parseOrderbookData(data: string[]): [number, number][] {
   const result: [number, number][] = [];
   
   // Data comes as [member, score, member, score, ...]
+  // member = "orderId:size:timestamp", score = price * 1000000
   for (let i = 0; i < data.length; i += 2) {
-    const size = parseFloat(data[i]);
-    const price = parseFloat(data[i + 1]);
+    const member = data[i];
+    const scoreStr = data[i + 1];
     
-    if (!isNaN(price) && !isNaN(size)) {
-      result.push([price / 1000000, size]); // Convert from 6 decimals
+    // Extract size from member (format: orderId:size:timestamp)
+    const parts = member.split(':');
+    const size = parts.length >= 2 ? parseFloat(parts[1]) : NaN;
+    const price = Math.abs(parseFloat(scoreStr)) / 1000000;
+    
+    if (!isNaN(price) && !isNaN(size) && size > 0) {
+      result.push([price, size]);
     }
   }
   

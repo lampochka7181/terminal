@@ -16,7 +16,8 @@ import {
   Crosshair,
   Target,
   RotateCcw,
-  Maximize2
+  Maximize2,
+  AlertTriangle
 } from 'lucide-react';
 
 function productIdForAsset(asset: string): string {
@@ -38,6 +39,17 @@ function getVisibleBarsForInterval(interval: number): number {
   if (interval <= 30) return 25;
   return 20;
 }
+
+function getTimeframeDurationMs(timeframe: string): number {
+  switch (timeframe) {
+    case '5m': return 5 * 60 * 1000;
+    case '15m': return 15 * 60 * 1000;
+    case '1h': return 60 * 60 * 1000;
+    case '4h': return 4 * 60 * 60 * 1000;
+    case '24h': return 24 * 60 * 60 * 1000;
+    default: return 5 * 60 * 1000;
+  }
+}
 export function Chart() {
   const containerRef = useRef<HTMLDivElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
@@ -48,7 +60,6 @@ export function Chart() {
   const prevCloseRef = useRef<number | null>(null);
   const lastTickAtRef = useRef<number>(0);
   const userInteractingRef = useRef<boolean>(false);
-  const interactionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [chartReady, setChartReady] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   
@@ -88,6 +99,11 @@ export function Chart() {
     x: number;
     y: number;
   }>>([]);
+  
+  // Expiry line state
+  const [expiryLineX, setExpiryLineX] = useState<number | null>(null);
+  const [secondsToExpiry, setSecondsToExpiry] = useState<number | null>(null);
+  const [isFlashingRed, setIsFlashingRed] = useState(false);
 
   const productId = useMemo(() => productIdForAsset(selectedAsset), [selectedAsset]);
   // Use candle interval from settings
@@ -97,16 +113,9 @@ export function Chart() {
   const marketAddress = selectedMarket?.address;
   
   // Track user interaction to prevent auto-scroll hijacking
+  // Once user pans/zooms, stay in that position until they click Reset View
   const handleUserInteraction = useCallback(() => {
     userInteractingRef.current = true;
-    // Clear any existing timeout
-    if (interactionTimeoutRef.current) {
-      clearTimeout(interactionTimeoutRef.current);
-    }
-    // Reset after 10 seconds of no interaction - user can scroll back manually
-    interactionTimeoutRef.current = setTimeout(() => {
-      userInteractingRef.current = false;
-    }, 10000);
   }, []);
 
   // Create chart - only recreate when chart TYPE changes (not display options)
@@ -242,9 +251,6 @@ export function Chart() {
       container.removeEventListener('mousedown', handleUserInteraction);
       container.removeEventListener('wheel', handleUserInteraction);
       container.removeEventListener('touchstart', handleUserInteraction);
-      if (interactionTimeoutRef.current) {
-        clearTimeout(interactionTimeoutRef.current);
-      }
       chart.remove();
     };
   }, [handleUserInteraction, chartType]);
@@ -393,21 +399,31 @@ export function Chart() {
           setPriceChange(0);
         }
 
-        // Set initial view with dynamic visible bars
+        // Set initial view to show recent candles with space for expiry
         const chart = chartRef.current;
         if (chart && candles.length > 0) {
           const timeScale = chart.timeScale();
           const lastIdx = candles.length - 1;
-          const from = Math.max(0, lastIdx - visibleBars + 1);
           
-          // Apply time scale options - tighter spacing for faster candles
-          const barSpacing = selectedTimeframe === '5m' ? 12 : selectedTimeframe === '1h' ? 15 : 18;
+          // Calculate how many candles to show and right offset for expiry visibility
+          // For 5m markets with 15s candles, that's 20 candles in the market period
+          const candlesInMarket = Math.ceil(getTimeframeDurationMs(selectedTimeframe) / 1000 / candleIntervalSec);
+          const from = Math.max(0, lastIdx - candlesInMarket);
+          
+          // Calculate right offset to show expiry (future time beyond current candles)
+          // Estimate candles until expiry based on typical market timing
+          const rightOffset = Math.max(Math.ceil(candlesInMarket * 0.3), 10);
+          
+          // Apply time scale options
+          const barSpacing = selectedTimeframe === '5m' ? 18 : selectedTimeframe === '1h' ? 22 : 26;
           timeScale.applyOptions({
-            rightOffset: 5, // Less padding on right
+            rightOffset,
             barSpacing,
-            minBarSpacing: 1, // Allow very tight zoom
+            minBarSpacing: 3,
           });
-          timeScale.setVisibleLogicalRange({ from, to: lastIdx + 5 });
+          
+          // Set visible range to show market period
+          timeScale.setVisibleLogicalRange({ from, to: lastIdx + rightOffset });
         }
       } catch (e: any) {
         if (e?.name === 'AbortError') return;
@@ -496,12 +512,7 @@ export function Chart() {
         setPriceChange(((price - prevCloseRef.current) / prevCloseRef.current) * 100);
       }
 
-      // ONLY auto-scroll if user is NOT interacting with the chart
-      // This prevents the annoying "snap back" when exploring history
-      const chart = chartRef.current;
-      if (chart && !userInteractingRef.current) {
-        chart.timeScale().scrollToRealTime();
-      }
+      // No auto-scroll - let user control the view. Use Reset View button to return to real-time.
     });
 
     const unsubscribeDisconnect = ws.onDisconnect(() => setIsStreaming(false));
@@ -591,7 +602,10 @@ export function Chart() {
     };
   }, [marketAddress]);
 
-  // Strike price line (updates with market selection or chart type change)
+  // Get market expiry for expiry line display
+  const marketExpiry = selectedMarket?.expiry;
+
+  // Strike price line (horizontal line at strike price)
   useEffect(() => {
     if (!seriesRef.current || !chartReady) return;
 
@@ -617,10 +631,117 @@ export function Chart() {
     });
   }, [strikePrice, showStrikeLine, chartReady, chartType]);
 
-  // Reset view handler
+  
+  useEffect(() => {
+    if (!chartReady || !chartRef.current || !marketExpiry || !containerRef.current) {
+      setExpiryLineX(null);
+      setSecondsToExpiry(null);
+      setIsFlashingRed(false);
+      return;
+    }
+
+    const updateExpiryLine = () => {
+      const chart = chartRef.current;
+      const container = containerRef.current;
+      const lastCandle = lastCandleRef.current;
+      if (!chart || !container) return;
+
+      const expiryTimeSec = Math.floor(marketExpiry / 1000);
+      const nowSec = Math.floor(Date.now() / 1000);
+      const remaining = expiryTimeSec - nowSec;
+      
+      setSecondsToExpiry(remaining);
+      
+      // Flash red in the last 5 seconds
+      if (remaining <= 5 && remaining > 0) {
+        setIsFlashingRed(true);
+      } else {
+        setIsFlashingRed(false);
+      }
+
+      // Calculate expiry line position using time-to-coordinate
+      // This works even for times in the future that have no data
+      const timeScale = chart.timeScale();
+      
+      // Try to get the coordinate directly
+      let x = timeScale.timeToCoordinate(expiryTimeSec as Time);
+      
+      // If that fails (no data at that time), calculate manually
+      if (x === null && lastCandle) {
+        const lastCandleTime = Number(lastCandle.time);
+        const lastCandleX = timeScale.timeToCoordinate(lastCandle.time);
+        
+        if (lastCandleX !== null) {
+          // Get visible time range to calculate pixels per second
+          const visibleRange = timeScale.getVisibleRange();
+          
+          if (visibleRange) {
+            const visibleStartSec = Number(visibleRange.from);
+            const visibleEndSec = Number(visibleRange.to);
+            const visibleDurationSec = visibleEndSec - visibleStartSec;
+            
+            // Get chart width (excluding price scale)
+            const chartWidth = container.clientWidth - 60;
+            const pixelsPerSecond = chartWidth / visibleDurationSec;
+            
+            // Calculate how many seconds from last candle to expiry
+            const secondsFromLastCandle = expiryTimeSec - lastCandleTime;
+            
+            // Calculate x position
+            x = lastCandleX + (secondsFromLastCandle * pixelsPerSecond);
+          }
+        }
+      }
+      
+      // If still null, try calculating from current time
+      if (x === null) {
+        const nowX = timeScale.timeToCoordinate(nowSec as Time);
+        if (nowX !== null) {
+          const visibleRange = timeScale.getVisibleRange();
+          if (visibleRange) {
+            const visibleStartSec = Number(visibleRange.from);
+            const visibleEndSec = Number(visibleRange.to);
+            const visibleDurationSec = visibleEndSec - visibleStartSec;
+            const chartWidth = container.clientWidth - 60;
+            const pixelsPerSecond = chartWidth / visibleDurationSec;
+            
+            // Seconds from now to expiry
+            const secondsToExpiry = expiryTimeSec - nowSec;
+            x = nowX + (secondsToExpiry * pixelsPerSecond);
+          }
+        }
+      }
+      
+      setExpiryLineX(x);
+    };
+
+    // Update immediately
+    updateExpiryLine();
+
+    // Update every 100ms for smooth countdown and line position
+    const interval = setInterval(updateExpiryLine, 100);
+
+    // Also update on time scale changes (zoom/pan)
+    const chart = chartRef.current;
+    const timeScale = chart.timeScale();
+    
+    const handleTimeRangeChange = () => {
+      updateExpiryLine();
+    };
+
+    timeScale.subscribeVisibleTimeRangeChange(handleTimeRangeChange);
+
+    return () => {
+      clearInterval(interval);
+      timeScale.unsubscribeVisibleTimeRangeChange(handleTimeRangeChange);
+    };
+  }, [chartReady, marketExpiry, candleIntervalSec]);
+
+  // Reset view handler - also clears user interaction flag
   const handleResetView = useCallback(() => {
     const chart = chartRef.current;
     if (chart) {
+      userInteractingRef.current = false;
       chart.timeScale().resetTimeScale();
       chart.timeScale().scrollToRealTime();
     }
@@ -830,11 +951,70 @@ export function Chart() {
       </div>
 
       {/* Chart Container */}
-      <div className="relative flex-1 min-h-0 rounded-lg overflow-hidden">
+      <div className={cn(
+        "relative flex-1 min-h-0 rounded-lg overflow-hidden transition-all duration-150",
+        isFlashingRed && "ring-4 ring-short animate-expiry-glow"
+      )}>
         <div
           ref={containerRef}
           className="absolute inset-0"
         />
+        
+        {/* RED FLASH OVERLAY - covers entire chart when expiring in last 5 seconds */}
+        {isFlashingRed && (
+          <div className="absolute inset-0 pointer-events-none z-30 animate-urgent-flash" />
+        )}
+        
+        {/* Expiry Vertical Line */}
+        {expiryLineX !== null && (
+          <div 
+            className="absolute top-0 bottom-0 pointer-events-none z-10 flex flex-col items-center"
+            style={{ left: expiryLineX, transform: 'translateX(-50%)' }}
+          >
+            {/* Vertical line */}
+            <div className={cn(
+              "h-full transition-all duration-300",
+              isFlashingRed 
+                ? "w-1 bg-short animate-expiry-glow" 
+                : secondsToExpiry !== null && secondsToExpiry <= 30
+                  ? "w-0.5 bg-warning shadow-[0_0_8px_rgba(255,184,0,0.5)]"
+                  : "w-0.5 bg-accent/70"
+            )} />
+            
+            {/* Expiry label */}
+            <div className={cn(
+              "absolute top-2 px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider whitespace-nowrap transition-all duration-300",
+              isFlashingRed
+                ? "bg-short text-white animate-pulse scale-110"
+                : secondsToExpiry !== null && secondsToExpiry <= 30
+                  ? "bg-warning/90 text-background"
+                  : "bg-accent/90 text-background"
+            )}>
+              <div className="flex items-center gap-1">
+                {isFlashingRed && <AlertTriangle className="w-3 h-3 animate-bounce" />}
+                <span>Expiry</span>
+                {secondsToExpiry !== null && secondsToExpiry > 0 && (
+                  <span className="ml-1 tabular-nums font-mono">
+                    {secondsToExpiry <= 60 
+                      ? `${secondsToExpiry}s`
+                      : secondsToExpiry <= 3600
+                        ? `${Math.floor(secondsToExpiry / 60)}m`
+                        : `${Math.floor(secondsToExpiry / 3600)}h`
+                    }
+                  </span>
+                )}
+              </div>
+            </div>
+            
+            {/* Countdown badge when close to expiry */}
+            {isFlashingRed && secondsToExpiry !== null && secondsToExpiry > 0 && (
+              <div className="absolute top-12 bg-short text-white text-2xl font-black font-mono px-4 py-2 rounded-lg animate-pulse shadow-lg shadow-short/50">
+                {secondsToExpiry}
+              </div>
+            )}
+          </div>
+        )}
+        
         <div ref={overlayRef} className="absolute inset-0 pointer-events-none z-10">
           {/* Toasts near the execution / latest candle */}
           {moneyToasts.map((t, idx) => (

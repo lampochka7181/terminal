@@ -356,6 +356,49 @@ export async function getFees(): Promise<FeeSchedule> {
 }
 
 // ===================
+// Global Trades
+// ===================
+
+export interface GlobalTrade {
+  id: string;
+  market: string;
+  marketAddress: string;
+  asset: string;
+  timeframe: string;
+  side: 'buy' | 'sell';
+  outcome: 'yes' | 'no';
+  price: number;
+  size: number;
+  notional: number;
+  txSignature: string | null;
+  txStatus: string;
+  solscanUrl: string | null;
+  solanaExplorerUrl: string | null;
+  timestamp: number;
+  marketExpiry: number;
+}
+
+export interface GetGlobalTradesParams {
+  limit?: number;
+  before?: string;
+  asset?: Asset;
+}
+
+export async function getGlobalTrades(
+  params?: GetGlobalTradesParams
+): Promise<{ trades: GlobalTrade[]; nextCursor: string | null }> {
+  const searchParams = new URLSearchParams();
+  if (params?.limit) searchParams.set('limit', params.limit.toString());
+  if (params?.before) searchParams.set('before', params.before);
+  if (params?.asset) searchParams.set('asset', params.asset);
+
+  const query = searchParams.toString();
+  return apiFetch<{ trades: GlobalTrade[]; nextCursor: string | null }>(
+    `/trades/global${query ? `?${query}` : ''}`
+  );
+}
+
+// ===================
 // Trading (Authenticated)
 // ===================
 
@@ -592,6 +635,8 @@ export const api = {
   getUserOrders,
   getUserTransactions,
   getUserSettlements,
+  // Global
+  getGlobalTrades,
 };
 
 export default api;
