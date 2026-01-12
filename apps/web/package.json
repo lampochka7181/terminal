@@ -27,6 +27,7 @@
     "socket.io-client": "^4.7.4",
     "tailwind-merge": "^2.2.0",
     "zustand": "^4.5.0",
+    "tweetnacl": "^1.0.3",
     "@degen/types": "workspace:*"
   },
   "devDependencies": {

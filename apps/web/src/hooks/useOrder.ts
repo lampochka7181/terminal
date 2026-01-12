@@ -156,8 +156,8 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
         };
       }
 
-      let signature: string;
-      let binaryMessage: string;
+      let signature: string = '';
+      let binaryMessage: string = '';
       let sessionPublicKey: string | undefined;
       let useSessionSigning = false;
 

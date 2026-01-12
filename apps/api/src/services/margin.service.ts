@@ -195,7 +195,12 @@ export class MarginService {
     marginDeposited: number;
     loanAmount: number;
   }): Promise<MarginAccount> {
-    const { userId, positionId, marketId, side, shares, entryPrice, leverage, marginDeposited, loanAmount } = params;
+    const { userId, positionId, marketId, side, entryPrice, leverage, marginDeposited, loanAmount } = params;
+    
+    // Floor shares to 6 decimal places to match on-chain precision
+    // Smart contract uses SHARE_MULTIPLIER = 10^6, so we must floor to avoid
+    // "InsufficientShares" errors when trying to sell slightly more than we have
+    const shares = Math.floor(params.shares * 1_000_000) / 1_000_000;
     
     // Validate leverage
     if (leverage < config.leverage.minLeverage || leverage > config.leverage.maxLeverage) {
@@ -429,15 +434,18 @@ export class MarginService {
       ? shares * executionPrice
       : shares * (1 - executionPrice);
     
-    // Calculate penalty (2% of position value)
-    const positionValue = shares * parseFloat(account.entryPrice);
-    const penalty = positionValue * config.leverage.liquidationPenaltyPct;
-    
     // Calculate what's returned to user
-    // Order: 1) Repay loan, 2) Take penalty, 3) Return remainder to user
+    // Order: 1) Repay loan, 2) Take penalty from remaining equity, 3) Return remainder
     const afterLoanRepaid = proceeds - loanAmount;
+    
+    // Calculate penalty as % of REMAINING EQUITY (not position value)
+    // This ensures user gets a meaningful return on liquidation
+    // Old: penalty = 2% of $500 position = $10 (too much!)
+    // New: penalty = 2% of $14 equity = $0.28 (reasonable)
+    const penalty = Math.max(0, afterLoanRepaid) * config.leverage.liquidationPenaltyPct;
+    
     const returnedToUser = Math.max(0, afterLoanRepaid - penalty);
-    const actualPenalty = Math.min(penalty, Math.max(0, afterLoanRepaid));
+    const actualPenalty = penalty;
     
     // Calculate bad debt (if proceeds don't cover loan)
     const badDebt = Math.max(0, loanAmount - proceeds);

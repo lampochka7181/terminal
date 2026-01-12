@@ -120,6 +120,61 @@ const closePrice = side === 'NO'
 
 ---
 
+### B5: Share Precision Mismatch - InsufficientShares (Fixed)
+
+**Date Fixed:** 2026-01-12  
+**Affected:** Leverage liquidation close
+
+**Issue:** Liquidation close failed with "InsufficientShares" error even though position had shares.
+
+**Root cause:** Backend calculated shares (e.g., 480.769231) with `Math.round()`, but smart contract used floor rounding, resulting in 1 microshare less (480.769230). When trying to sell 480.769231 shares from a position with only 480.769230, the contract rejected it.
+
+**Fix:** 
+1. Floor shares to 6 decimals when storing in margin account
+2. Floor shares when reading for liquidation
+
+```typescript
+// Floor to match on-chain SHARE_MULTIPLIER = 10^6
+const shares = Math.floor(params.shares * 1_000_000) / 1_000_000;
+```
+
+**Location:** 
+- `apps/api/src/services/margin.service.ts` (createMarginAccount)
+- `apps/api/src/jobs/liquidation-checker.ts` (liquidation loop)
+
+---
+
+### B6: Liquidation Causing Bad Debt (Fixed)
+
+**Date Fixed:** 2026-01-12  
+**Affected:** Leverage liquidations
+
+**Issues:**
+1. Execution price used MM orderbook bid (e.g., $0.40) instead of market price ($0.405) or liquidation price ($0.4175)
+2. Penalty calculated on entry position value ($500), not remaining equity (~$14)
+
+**Result:** Every liquidation generated bad debt and returned $0 to users.
+
+**Fixes:**
+1. Execute liquidation at **liquidation price**, not orderbook price - guarantees solvency
+2. Calculate penalty as **2% of remaining equity**, not position value
+
+**New Math (for 10x, $50 margin, 3% maintenance):**
+```
+At liquidation price:
+- Proceeds: $463.89
+- Loan repay: $450.00
+- Remaining equity: $13.89
+- Penalty (2% of equity): $0.28
+- Returned to user: $13.61 (~27% of margin) ✓
+```
+
+**Location:**
+- `apps/api/src/jobs/liquidation-checker.ts` (execution price)
+- `apps/api/src/services/margin.service.ts` (penalty calculation)
+
+---
+
 ## Future Improvements
 
 ### F1: On-Chain Margin Accounts (v2)

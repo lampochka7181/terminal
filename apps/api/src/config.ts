@@ -133,7 +133,7 @@ export const config = {
   leverage: {
     maxLeverage: parseFloat(process.env.MAX_LEVERAGE || '10'),           // Maximum 10x leverage
     minLeverage: 1.0,                                                     // Minimum (no leverage)
-    maintenanceMarginPct: parseFloat(process.env.MAINTENANCE_MARGIN_PCT || '3') / 100,  // 3% = 0.03 (liquidate later, ~35% returned)
+    maintenanceMarginPct: parseFloat(process.env.MAINTENANCE_MARGIN_PCT || '3') / 100,  // 3% = 0.03 (liquidate later, ~30% returned with new penalty calc)
     liquidationPenaltyPct: parseFloat(process.env.LIQUIDATION_PENALTY_PCT || '2') / 100, // 2% = 0.02
     minMarginUsd: parseFloat(process.env.MIN_MARGIN_USD || '5'),          // Minimum $5 margin
     maxSingleLoanPct: parseFloat(process.env.MAX_SINGLE_LOAN_PCT || '10') / 100,  // Max 10% of pool per loan

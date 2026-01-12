@@ -116,6 +116,18 @@ export interface UserSettlementUpdate {
   };
 }
 
+export interface UserLiquidationUpdate {
+  channel: 'user';
+  event: 'liquidation';
+  data: {
+    marketAddress: string;
+    outcome: 'yes' | 'no';
+    shares: number;
+    liquidationPrice: number;
+    timestamp: number;
+  };
+}
+
 export interface GlobalTradeUpdate {
   channel: 'trades:global';
   type: 'global_trade';
@@ -144,6 +156,7 @@ type WSUpdate =
   | MarketActivatedUpdate
   | UserFillUpdate
   | UserSettlementUpdate
+  | UserLiquidationUpdate
   | GlobalTradeUpdate;
 
 type MessageHandler = (message: WSUpdate) => void;

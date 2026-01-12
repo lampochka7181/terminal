@@ -105,7 +105,9 @@ export async function liquidationCheckerJob(): Promise<void> {
     
     const liquidationPrice = parseFloat(account.liquidationPrice);
     const side = account.side as 'YES' | 'NO';
-    const shares = parseFloat(account.shares);
+    // Floor shares to 6 decimals to match on-chain precision (SHARE_MULTIPLIER = 10^6)
+    // This prevents "InsufficientShares" errors from precision mismatches
+    const shares = Math.floor(parseFloat(account.shares) * 1_000_000) / 1_000_000;
     
     // Check if should liquidate
     // currentPrice is YES price from orderbook
@@ -140,9 +142,27 @@ export async function liquidationCheckerJob(): Promise<void> {
         loanAmount: account.loanAmount,
       });
       
-      // Get execution price (use current price as trigger, may slip on actual execution)
+      // For liquidations, execute at the LIQUIDATION PRICE to guarantee expected equity
+      // This ensures:
+      // 1. No bad debt (loan is always covered)
+      // 2. User gets their expected remaining equity returned
+      // 3. MM acts as liquidator and buys at the calculated liq price
       const triggerPrice = currentPrice;
-      const executionPrice = await getExecutionPrice(market.id, side, shares, currentPrice);
+      
+      // Calculate execution price - use liquidation price to guarantee solvency
+      // liquidationPrice is stored in the position's native price (YES for YES, NO for NO)
+      // currentPrice is always YES price from orderbook
+      let executionPrice: number;
+      if (side === 'YES') {
+        // YES: use liq price (higher = better for seller)
+        executionPrice = liquidationPrice;
+      } else {
+        // NO: liquidationPrice is NO price, need to return YES price for proceeds calc
+        // Since NO liq happens when NO drops, we execute at liq NO price
+        // But proceeds = shares × price, and for NO shares price = NO price
+        // So executionPrice should be the NO liquidation price
+        executionPrice = liquidationPrice;
+      }
       
       // Execute on-chain close: Lending Pool sells shares to MM
       const lendingPoolWallet = lendingService.getLendingWalletPubkey()?.toBase58();

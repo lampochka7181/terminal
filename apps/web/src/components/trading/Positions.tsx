@@ -107,7 +107,7 @@ export function Positions({ onSell, currentMarketAddress, currentYesPrice, curre
           // This shows the true return on invested capital (e.g., 10x leverage × 100% gain = 1000% return)
           const isLeveraged = p.leverage && p.leverage > 1 && p.marginDeposited && p.marginDeposited > 0;
           const pnlPercent = isLeveraged
-            ? (pnl / p.marginDeposited) * 100
+            ? (pnl / p.marginDeposited!) * 100
             : (p.avgEntryPrice > 0 ? ((yesPrice - p.avgEntryPrice) / p.avgEntryPrice) * 100 : 0);
           results.push({
             id: `pos-${p.marketAddress}-yes`,
@@ -139,7 +139,7 @@ export function Positions({ onSell, currentMarketAddress, currentYesPrice, curre
           // For leveraged positions, P&L% is relative to margin deposited
           const isLeveraged = p.leverage && p.leverage > 1 && p.marginDeposited && p.marginDeposited > 0;
           const pnlPercent = isLeveraged
-            ? (pnl / p.marginDeposited) * 100
+            ? (pnl / p.marginDeposited!) * 100
             : (noAvgEntry > 0 ? ((noPrice - noAvgEntry) / noAvgEntry) * 100 : 0);
           results.push({
             id: `pos-${p.marketAddress}-no`,
