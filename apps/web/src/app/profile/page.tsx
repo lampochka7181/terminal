@@ -569,8 +569,9 @@ function OpenPositionsContent({ openOrders, positions, isLoading, onCancel, isCa
 
 function PositionRow({ position }: { position: any }) {
   const isYes = position.yesShares > 0;
-  const shares = isYes ? position.yesShares : position.noShares;
-  const pnl = position.unrealizedPnL;
+  const shares = isYes ? (position.yesShares ?? 0) : (position.noShares ?? 0);
+  const pnl = position.unrealizedPnL ?? 0;
+  const currentPrice = position.currentPrice ?? 0;
   
   return (
     <div className="p-4 hover:bg-surface-light/20 transition-colors animate-fade-in">
@@ -587,7 +588,7 @@ function PositionRow({ position }: { position: any }) {
               </span>
             </div>
             <div className="text-xs text-text-muted mt-1">
-              Avg: ${position.avgCost.toFixed(2)}
+              Avg: ${(position.avgEntryPrice ?? 0).toFixed(2)}
             </div>
           </div>
         </div>
@@ -595,7 +596,7 @@ function PositionRow({ position }: { position: any }) {
         <div className="flex items-center gap-6">
           <div className="text-right">
             <div className="font-mono font-bold">{shares.toFixed(0)} contracts</div>
-            <div className="text-sm text-text-muted">@ ${position.currentPrice.toFixed(2)}</div>
+            <div className="text-sm text-text-muted">@ ${currentPrice.toFixed(2)}</div>
           </div>
           
           <div className="w-24 text-right">

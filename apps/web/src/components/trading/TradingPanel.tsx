@@ -6,11 +6,26 @@ import { useOrderbookStore } from '@/stores/orderbookStore';
 import { useMarketStore } from '@/stores/marketStore';
 import { useQuickOrder } from '@/hooks/useOrder';
 import { cn } from '@/lib/utils';
-import { AlertCircle, ArrowRight, Zap, Loader2, CheckCircle, XCircle, Settings2 } from 'lucide-react';
+import { AlertCircle, ArrowRight, Zap, Loader2, CheckCircle, XCircle, Settings2, TrendingUp } from 'lucide-react';
 
 type Side = 'YES' | 'NO';
 type OrderType = 'limit' | 'market';
 type OrderStatus = 'idle' | 'signing' | 'submitting' | 'success' | 'error';
+
+// Leverage calculation helpers
+const leverageCalc = {
+  initialMarginRequired: (totalPosition: number, leverage: number) => totalPosition / leverage,
+  loanAmount: (totalPosition: number, leverage: number) => totalPosition - (totalPosition / leverage),
+  liquidationPrice: (shares: number, entryPrice: number, loanAmount: number, side: 'YES' | 'NO') => {
+    const maintenanceMarginPct = 0.10; // 10%
+    const maintenanceMargin = entryPrice * shares * maintenanceMarginPct;
+    if (side === 'YES') {
+      return Math.max(0, Math.min(0.99, (loanAmount + maintenanceMargin) / shares));
+    } else {
+      return Math.max(0.01, Math.min(1, 1 - (loanAmount + maintenanceMargin) / shares));
+    }
+  },
+};
 
 interface OrderbookLevel {
   price: number;
@@ -34,6 +49,10 @@ export function TradingPanel() {
   const [dollarAmount, setDollarAmount] = useState('50');
   const [priceProtection, setPriceProtection] = useState('0.10');
   const [showAdvanced, setShowAdvanced] = useState(false);
+  
+  // Leverage
+  const [leverage, setLeverage] = useState(1);
+  const [showLeverage, setShowLeverage] = useState(false);
   
   const [orderStatus, setOrderStatus] = useState<OrderStatus>('idle');
   const [orderResult, setOrderResult] = useState<{
@@ -124,6 +143,41 @@ export function TradingPanel() {
   const limitCost = limitPriceNum * limitSizeNum;
   const limitPayout = limitSizeNum * 1.0;
   const limitProfit = limitPayout - limitCost;
+  
+  // Leverage calculations
+  const leverageStats = useMemo(() => {
+    const isLeveraged = leverage > 1;
+    
+    if (orderType === 'market') {
+      const totalPosition = marketEstimate.totalSpent;
+      const contracts = marketEstimate.contracts;
+      const avgPrice = marketEstimate.avgPrice;
+      
+      if (!isLeveraged || contracts === 0) {
+        return { isLeveraged: false, marginRequired: totalPosition, loanAmount: 0, liquidationPrice: 0 };
+      }
+      
+      const marginRequired = leverageCalc.initialMarginRequired(totalPosition, leverage);
+      const loanAmount = leverageCalc.loanAmount(totalPosition, leverage);
+      const liquidationPrice = leverageCalc.liquidationPrice(contracts, avgPrice, loanAmount, side);
+      
+      return { isLeveraged, marginRequired, loanAmount, liquidationPrice };
+    } else {
+      const totalPosition = limitCost;
+      const contracts = limitSizeNum;
+      const price = limitPriceNum;
+      
+      if (!isLeveraged || contracts === 0 || price === 0) {
+        return { isLeveraged: false, marginRequired: totalPosition, loanAmount: 0, liquidationPrice: 0 };
+      }
+      
+      const marginRequired = leverageCalc.initialMarginRequired(totalPosition, leverage);
+      const loanAmount = leverageCalc.loanAmount(totalPosition, leverage);
+      const liquidationPrice = leverageCalc.liquidationPrice(contracts, price, loanAmount, side);
+      
+      return { isLeveraged, marginRequired, loanAmount, liquidationPrice };
+    }
+  }, [orderType, leverage, marketEstimate, limitCost, limitSizeNum, limitPriceNum, side]);
 
   // Quick fill helpers
   const fillAtBest = () => {
@@ -162,6 +216,8 @@ export function TradingPanel() {
         dollarAmount: parseFloat(dollarAmount),
         maxPrice: marketEstimate.maxPrice,
         expiryTimestamp,
+        leverage: leverage > 1 ? leverage : undefined,
+        marginAmount: leverage > 1 ? leverageStats.marginRequired : undefined,
       });
 
       handleOrderResult(result);
@@ -175,6 +231,8 @@ export function TradingPanel() {
         price: limitPriceNum,
         size: limitSizeNum,
         expiryTimestamp,
+        leverage: leverage > 1 ? leverage : undefined,
+        marginAmount: leverage > 1 ? leverageStats.marginRequired : undefined,
       });
 
       handleOrderResult(result);
@@ -269,6 +327,95 @@ export function TradingPanel() {
           <span>NO</span>
           <span className="text-sm font-normal opacity-70">Short</span>
         </button>
+      </div>
+
+      {/* Leverage Toggle */}
+      <div className="mb-4">
+        <button 
+          onClick={() => setShowLeverage(!showLeverage)}
+          className={cn(
+            'flex items-center gap-2 text-sm transition-colors w-full justify-between px-3 py-2 rounded-lg',
+            showLeverage || leverage > 1
+              ? 'bg-accent/10 text-accent'
+              : 'bg-surface-light text-text-muted hover:text-text-primary'
+          )}
+        >
+          <div className="flex items-center gap-2">
+            <TrendingUp className="w-4 h-4" />
+            <span className="font-medium">Leverage</span>
+            {leverage > 1 && (
+              <span className="px-1.5 py-0.5 bg-accent/20 rounded text-xs font-bold">{leverage}x</span>
+            )}
+          </div>
+          <span className="text-xs">{showLeverage ? 'Hide' : leverage > 1 ? 'Edit' : 'Enable'}</span>
+        </button>
+        
+        {showLeverage && (
+          <div className="mt-2 p-3 bg-surface-light rounded-lg border border-border">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm text-text-muted">Leverage Multiplier</span>
+              <span className="text-lg font-bold text-accent">{leverage}x</span>
+            </div>
+            <input
+              type="range"
+              value={leverage}
+              onChange={(e) => setLeverage(parseInt(e.target.value))}
+              min="1"
+              max="10"
+              step="1"
+              className="w-full accent-accent"
+            />
+            <div className="flex justify-between text-xs text-text-muted mt-1">
+              <span>1x (No Leverage)</span>
+              <span>10x (Max)</span>
+            </div>
+            
+            {/* Quick leverage buttons */}
+            <div className="flex gap-1 mt-3">
+              {[1, 2, 3, 5, 10].map((lev) => (
+                <button
+                  key={lev}
+                  onClick={() => setLeverage(lev)}
+                  className={cn(
+                    'flex-1 py-1.5 text-xs rounded font-medium transition-colors',
+                    leverage === lev
+                      ? 'bg-accent text-background'
+                      : 'bg-surface text-text-muted hover:text-text-primary hover:bg-surface-light'
+                  )}
+                >
+                  {lev}x
+                </button>
+              ))}
+            </div>
+            
+            {/* Leverage info */}
+            {leverage > 1 && (
+              <div className="mt-3 pt-3 border-t border-border space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-text-muted">Margin Required</span>
+                  <span className="font-mono text-accent">${leverageStats.marginRequired.toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-text-muted">Loan Amount</span>
+                  <span className="font-mono">${leverageStats.loanAmount.toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-text-muted">⚠️ Liquidation Price</span>
+                  <span className={cn(
+                    'font-mono font-bold',
+                    side === 'YES' ? 'text-short' : 'text-long'
+                  )}>
+                    ${leverageStats.liquidationPrice.toFixed(3)}
+                  </span>
+                </div>
+                <div className="text-xs text-warning bg-warning/10 rounded p-2 mt-2">
+                  <strong>Warning:</strong> With {leverage}x leverage, you can gain or lose {leverage}x faster. 
+                  Position will be liquidated if price reaches ${leverageStats.liquidationPrice.toFixed(3)}.
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* MARKET Order Input */}

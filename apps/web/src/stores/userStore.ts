@@ -236,6 +236,10 @@ export function subscribeToUserUpdates(): () => void {
     } else if (message.event === 'settlement') {
       const settlementMessage = message as UserSettlementUpdate;
       store.handleSettlement(settlementMessage.data);
+    } else if (message.event === 'liquidation') {
+      // Position was liquidated - refresh positions to get updated state
+      console.log('[UserStore] Position liquidated, refreshing positions:', message.data);
+      store.fetchPositions('open').catch(err => console.error('[UserStore] Failed to refresh positions after liquidation:', err));
     }
   });
 

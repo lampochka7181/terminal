@@ -4,6 +4,7 @@ import nacl from 'tweetnacl';
 import bs58 from 'bs58';
 import { randomBytes } from 'crypto';
 import { userService } from '../services/user.service.js';
+import { sessionService } from '../services/session.service.js';
 import { logger } from '../lib/logger.js';
 
 // Validation schemas
@@ -249,5 +250,133 @@ export async function authRoutes(app: FastifyInstance) {
     logger.info(`User logged out: ${address}`);
     
     return { success: true };
+  });
+
+  // ============================================
+  // SESSION KEY ENDPOINTS (for one-click trading)
+  // ============================================
+
+  const createSessionSchema = z.object({
+    sessionPublicKey: z.string().min(32).max(64),
+    walletAddress: z.string().length(44),
+    expiresAt: z.number().int().positive(),
+    signature: z.string().min(1),
+    message: z.string().min(1),
+  });
+
+  /**
+   * POST /auth/session
+   * Create a new trading session with an ephemeral session key
+   */
+  app.post('/session', {
+    preHandler: [async (request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        await request.jwtVerify();
+      } catch (err) {
+        return reply.code(401).send({
+          error: {
+            code: 'UNAUTHORIZED',
+            message: 'Invalid or expired token.',
+          },
+        });
+      }
+    }],
+  }, async (request: FastifyRequest, reply: FastifyReply) => {
+    const body = createSessionSchema.safeParse(request.body);
+    
+    if (!body.success) {
+      return reply.code(400).send({
+        error: {
+          code: 'INVALID_REQUEST',
+          message: 'Invalid request body',
+          details: body.error.flatten(),
+        },
+      });
+    }
+    
+    const { address: jwtAddress } = request.user as { address: string };
+    const { walletAddress } = body.data;
+    
+    // Verify the session is being created for the authenticated user
+    if (jwtAddress !== walletAddress) {
+      return reply.code(403).send({
+        error: {
+          code: 'FORBIDDEN',
+          message: 'Cannot create session for a different wallet',
+        },
+      });
+    }
+    
+    const result = await sessionService.createSession(body.data);
+    
+    if (!result.success) {
+      return reply.code(400).send({
+        error: {
+          code: 'SESSION_ERROR',
+          message: result.error,
+        },
+      });
+    }
+    
+    return { success: true };
+  });
+
+  /**
+   * DELETE /auth/session/:sessionPublicKey
+   * Revoke a trading session
+   */
+  app.delete('/session/:sessionPublicKey', {
+    preHandler: [async (request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        await request.jwtVerify();
+      } catch (err) {
+        return reply.code(401).send({
+          error: {
+            code: 'UNAUTHORIZED',
+            message: 'Invalid or expired token.',
+          },
+        });
+      }
+    }],
+  }, async (request: FastifyRequest<{ Params: { sessionPublicKey: string } }>, reply: FastifyReply) => {
+    const { sessionPublicKey } = request.params;
+    const { address } = request.user as { address: string };
+    
+    // Verify the session belongs to the authenticated user
+    const session = sessionService.getSession(sessionPublicKey);
+    if (session && session.walletAddress !== address) {
+      return reply.code(403).send({
+        error: {
+          code: 'FORBIDDEN',
+          message: 'Cannot revoke session for a different wallet',
+        },
+      });
+    }
+    
+    sessionService.revokeSession(sessionPublicKey);
+    
+    return { success: true };
+  });
+
+  /**
+   * GET /auth/session/status
+   * Get current session status for the authenticated user
+   */
+  app.get('/session/status', {
+    preHandler: [async (request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        await request.jwtVerify();
+      } catch (err) {
+        return reply.code(401).send({
+          error: {
+            code: 'UNAUTHORIZED',
+            message: 'Invalid or expired token.',
+          },
+        });
+      }
+    }],
+  }, async (request: FastifyRequest) => {
+    const { address } = request.user as { address: string };
+    return sessionService.getSessionStatus(address);
   });
 }

@@ -6,6 +6,7 @@ import { positionService } from '../services/position.service.js';
 import { orderService } from '../services/order.service.js';
 import { userService } from '../services/user.service.js';
 import { marketService } from '../services/market.service.js';
+import { marginService } from '../services/margin.service.js';
 import { anchorClient } from '../lib/anchor-client.js';
 import { db, trades, settlements, markets } from '../db/index.js';
 
@@ -104,7 +105,17 @@ export async function userRoutes(app: FastifyInstance) {
       ? undefined 
       : query.data.status.toUpperCase() as 'OPEN' | 'SETTLED';
     
-    const positions = await positionService.getUserPositions(userId, status);
+    const [positions, marginAccountsList] = await Promise.all([
+      positionService.getUserPositions(userId, status),
+      marginService.getUserMarginAccounts(userId),
+    ]);
+
+    // Create a map of market+outcome -> margin account for quick lookup
+    const marginAccountMap = new Map<string, typeof marginAccountsList[0]>();
+    for (const ma of marginAccountsList) {
+      const key = `${ma.marketId}-${ma.side}`;
+      marginAccountMap.set(key, ma);
+    }
 
     // Truncate to 6 decimals to match on-chain precision
     const truncate6 = (n: number) => Math.floor(n * 1_000_000) / 1_000_000;
@@ -121,7 +132,11 @@ export async function userRoutes(app: FastifyInstance) {
       const shares = yesShares > 0 ? yesShares : noShares;
       const unrealizedPnL = shares * (currentPrice - avgEntry);
 
-      return {
+      // Look up margin account for this position (use p.marketId, not p.market.id)
+      const side = yesShares > 0 ? 'YES' : 'NO';
+      const marginAccount = marginAccountMap.get(`${p.marketId}-${side}`);
+
+      const basePosition = {
         marketAddress: p.market?.pubkey || '',
         market: p.market 
           ? `${p.market.asset}-${p.market.timeframe}` 
@@ -136,6 +151,20 @@ export async function userRoutes(app: FastifyInstance) {
         totalCost: parseFloat(p.totalCost || '0'),
         status: p.status?.toLowerCase() || 'open',
       };
+
+      // Add leverage fields if margin account exists
+      if (marginAccount) {
+        return {
+          ...basePosition,
+          leverage: marginAccount.leverage,
+          marginDeposited: parseFloat(marginAccount.marginDeposited),
+          loanAmount: parseFloat(marginAccount.loanAmount),
+          liquidationPrice: parseFloat(marginAccount.liquidationPrice),
+          marginAccountId: marginAccount.id,
+        };
+      }
+
+      return basePosition;
     });
   });
 

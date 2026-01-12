@@ -541,103 +541,100 @@ function PositionMarkers({
   chartHeight: number;
   onPositionClick?: (position: UserPosition) => void;
 }) {
-  const [updateTrigger, setUpdateTrigger] = useState(0);
-  const isMountedRef = useRef(false);
+  const [coords, setCoords] = useState<Map<string, { x: number; y: number; visible: boolean }>>(new Map());
 
-  // Subscribe to chart time scale changes for smooth updates
+  // Calculate and update coordinates - runs in effect to avoid setState during render
   useEffect(() => {
-    if (!chart || !chartReady) return;
+    if (!chart || !series || !chartReady || positions.length === 0 || candles.length === 0) {
+      setCoords(new Map());
+      return;
+    }
 
-    // Mark as mounted after first effect run
-    isMountedRef.current = true;
+    let animationFrameId: number;
+    let isActive = true;
 
-    const timeScale = chart.timeScale();
-    
-    // Handler for visible range changes (pan/zoom)
-    // Use setTimeout to defer updates and avoid setState during render
-    const handler = () => {
-      if (isMountedRef.current) {
-        // Use requestAnimationFrame to batch updates and avoid render-phase setState
-        requestAnimationFrame(() => {
-          setUpdateTrigger(t => t + 1);
-        });
+    const calculateCoords = () => {
+      if (!isActive || !chart || !series) return;
+      
+      const timeScale = chart.timeScale();
+      const newCoords = new Map<string, { x: number; y: number; visible: boolean }>();
+
+      positions.forEach((position) => {
+        // Get entry time in seconds
+        let entryTimeSec = position.entryTime;
+        if (entryTimeSec > 1000000000000) {
+          entryTimeSec = Math.floor(entryTimeSec / 1000);
+        }
+
+        // Find the closest candle to the entry time
+        let closestCandle = candles[candles.length - 1];
+        let minDiff = Infinity;
+        
+        for (const candle of candles) {
+          const diff = Math.abs(candle.time - entryTimeSec);
+          if (diff < minDiff) {
+            minDiff = diff;
+            closestCandle = candle;
+          }
+        }
+
+        // If entry time is invalid (0 or way off), use recent candle
+        const lastCandleTime = candles[candles.length - 1]?.time ?? 0;
+        const firstCandleTime = candles[0]?.time ?? 0;
+        const isValidTime = entryTimeSec >= firstCandleTime - 60 && entryTimeSec <= lastCandleTime + 60;
+        
+        if (!isValidTime) {
+          const recentIndex = Math.max(0, candles.length - 5);
+          closestCandle = candles[recentIndex];
+        }
+
+        // Get X coordinate from candle time
+        const x = timeScale.timeToCoordinate(closestCandle.time as Time);
+        if (x === null) return;
+
+        // Get Y coordinate from BTC price at entry
+        const btcPrice = position.entryBtcPrice > 0 ? position.entryBtcPrice : closestCandle.close;
+        
+        // Convert BTC price to pixel coordinate first
+        const baseY = series.priceToCoordinate(btcPrice);
+        if (baseY === null) return;
+        
+        // Offset in pixels: ABOVE positions go up (negative), BELOW go down (positive)
+        const isYes = position.outcome === 'yes';
+        const pixelOffset = isYes ? -45 : 45;
+        
+        // Clamp Y to stay within visible chart area
+        const margin = 35;
+        const clampedY = Math.max(margin, Math.min(chartHeight - margin - 50, baseY + pixelOffset));
+        
+        newCoords.set(position.id, { x, y: clampedY, visible: true });
+      });
+
+      if (isActive) {
+        setCoords(newCoords);
       }
     };
+
+    // Calculate initially
+    calculateCoords();
+
+    // Subscribe to chart changes
+    const timeScale = chart.timeScale();
+    const handler = () => {
+      // Use RAF to avoid setState during render and batch updates
+      animationFrameId = requestAnimationFrame(calculateCoords);
+    };
     
-    // Subscribe to visible range changes
     timeScale.subscribeVisibleLogicalRangeChange(handler);
 
     return () => {
-      isMountedRef.current = false;
-      // Use the proper unsubscribe method
+      isActive = false;
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
+      }
       timeScale.unsubscribeVisibleLogicalRangeChange(handler);
     };
-  }, [chart, chartReady]);
-
-  // Calculate coordinates for each position
-  const coords = useMemo(() => {
-    if (!chart || !series || !chartReady || positions.length === 0 || candles.length === 0) {
-      return new Map<string, { x: number; y: number; visible: boolean }>();
-    }
-
-    const timeScale = chart.timeScale();
-    const newCoords = new Map<string, { x: number; y: number; visible: boolean }>();
-
-    positions.forEach((position) => {
-      // Get entry time in seconds
-      let entryTimeSec = position.entryTime;
-      if (entryTimeSec > 1000000000000) {
-        entryTimeSec = Math.floor(entryTimeSec / 1000);
-      }
-
-      // Find the closest candle to the entry time
-      let closestCandle = candles[candles.length - 1];
-      let minDiff = Infinity;
-      
-      for (const candle of candles) {
-        const diff = Math.abs(candle.time - entryTimeSec);
-        if (diff < minDiff) {
-          minDiff = diff;
-          closestCandle = candle;
-        }
-      }
-
-      // If entry time is invalid (0 or way off), use recent candle
-      const lastCandleTime = candles[candles.length - 1]?.time ?? 0;
-      const firstCandleTime = candles[0]?.time ?? 0;
-      const isValidTime = entryTimeSec >= firstCandleTime - 60 && entryTimeSec <= lastCandleTime + 60;
-      
-      if (!isValidTime) {
-        const recentIndex = Math.max(0, candles.length - 5);
-        closestCandle = candles[recentIndex];
-      }
-
-      // Get X coordinate from candle time
-      const x = timeScale.timeToCoordinate(closestCandle.time as Time);
-      if (x === null) return;
-
-      // Get Y coordinate from BTC price at entry
-      const btcPrice = position.entryBtcPrice > 0 ? position.entryBtcPrice : closestCandle.close;
-      
-      // Convert BTC price to pixel coordinate first
-      const baseY = series.priceToCoordinate(btcPrice);
-      if (baseY === null) return;
-      
-      // Offset in pixels: ABOVE positions go up (negative), BELOW go down (positive)
-      // Keep bubbles close to the chart action but not blocking candles
-      const isYes = position.outcome === 'yes';
-      const pixelOffset = isYes ? -45 : 45; // Fixed pixel offset from the entry price
-      
-      // Clamp Y to stay within visible chart area (leave margin for bubble height)
-      const margin = 35; // Bubble half-height approx
-      const clampedY = Math.max(margin, Math.min(chartHeight - margin - 50, baseY + pixelOffset));
-      
-      newCoords.set(position.id, { x, y: clampedY, visible: true });
-    });
-
-    return newCoords;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chart, series, positions, chartReady, candles, updateTrigger, chartHeight]);
+  }, [chart, series, positions, chartReady, candles, chartHeight]);
 
   // Don't show bubbles if market expired or no positions
   if (positions.length === 0 || marketExpired || !chartReady) return null;

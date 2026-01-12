@@ -129,6 +129,11 @@ pub const MAX_PAUSE_REASON_LEN: usize = 100;
 // ACCOUNTS
 // ============================================================================
 
+/// Minimum taker fee in USDC (6 decimals: 20000 = $0.02)
+/// This is the minimum fee relayer must charge to cover gas costs
+/// Stored as constant to avoid account migration issues
+pub const MIN_TAKER_FEE: u64 = 20_000;  // $0.02
+
 /// Global protocol configuration (singleton)
 #[account]
 pub struct GlobalState {
@@ -136,9 +141,9 @@ pub struct GlobalState {
     pub admin: Pubkey,
     /// Fee recipient treasury
     pub fee_recipient: Pubkey,
-    /// Maker fee in basis points (0 = 0.00%)
+    /// Maker fee in basis points (0 = 0.00%) - currently unused
     pub maker_fee_bps: u16,
-    /// Taker fee in basis points (10 = 0.10%)
+    /// Taker fee in basis points (10 = 0.10%) - used as max fee cap for validation
     pub taker_fee_bps: u16,
     /// Protocol paused flag
     pub paused: bool,

@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
-use crate::state::{GlobalState, Market, UserPosition, Side, Outcome, MarketStatus, TradeType, USDC_MULTIPLIER, SHARE_MULTIPLIER, MAX_POSITION_SIZE, MIN_PRICE, MAX_PRICE, MIN_ORDER_SIZE, MAX_ORDER_SIZE};
+use crate::state::{GlobalState, Market, UserPosition, Side, Outcome, MarketStatus, TradeType, USDC_MULTIPLIER, SHARE_MULTIPLIER, MAX_POSITION_SIZE, MIN_PRICE, MAX_PRICE, MIN_ORDER_SIZE, MAX_ORDER_SIZE, MIN_TAKER_FEE};
 use crate::errors::DegenError;
 
 /// Arguments for execute_close instruction
@@ -9,6 +9,7 @@ pub struct CloseTradeArgs {
     pub outcome: Outcome,      // YES or NO being sold
     pub price: u64,            // Execution price (6 decimals)
     pub size: u64,             // Number of shares (6 decimals)
+    pub taker_fee: u64,        // Fee specified by relayer (validated against min/max)
 }
 
 #[derive(Accounts)]
@@ -113,11 +114,15 @@ pub fn execute_close(
         .checked_add(SHARE_MULTIPLIER - 1).ok_or(DegenError::MathOverflow)?
         .checked_div(SHARE_MULTIPLIER).ok_or(DegenError::DivisionByZero)?;
     
-    // Calculate fee (taker fee on buyer)
-    let fee = transfer_amount
+    // Validate relayer-specified fee
+    let max_fee = transfer_amount
         .checked_mul(global_state.taker_fee_bps as u64).ok_or(DegenError::MathOverflow)?
         .checked_div(10_000).ok_or(DegenError::DivisionByZero)?;
     
+    require!(args.taker_fee >= MIN_TAKER_FEE, DegenError::FeeTooLow);
+    require!(args.taker_fee <= max_fee.max(MIN_TAKER_FEE), DegenError::FeeTooHigh);
+    
+    let fee = args.taker_fee;
     let seller_receives = transfer_amount.saturating_sub(fee);
     
     // Transfer USDC from buyer to seller (using relayer as delegate)

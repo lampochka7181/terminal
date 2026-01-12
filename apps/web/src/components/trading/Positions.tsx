@@ -28,6 +28,11 @@ interface UnifiedTrade {
   pnlPercent?: number;
   status: string;
   createdAt: number;
+  // Leverage fields
+  leverage?: number;
+  liquidationPrice?: number;
+  marginDeposited?: number;
+  loanAmount?: number;
 }
 
 interface PositionsProps {
@@ -98,7 +103,12 @@ export function Positions({ onSell, currentMarketAddress, currentYesPrice, curre
         
         if (p.yesShares > 0) {
           const pnl = (yesPrice - p.avgEntryPrice) * p.yesShares;
-          const pnlPercent = p.avgEntryPrice > 0 ? ((yesPrice - p.avgEntryPrice) / p.avgEntryPrice) * 100 : 0;
+          // For leveraged positions, P&L% is relative to margin deposited, not entry price
+          // This shows the true return on invested capital (e.g., 10x leverage × 100% gain = 1000% return)
+          const isLeveraged = p.leverage && p.leverage > 1 && p.marginDeposited && p.marginDeposited > 0;
+          const pnlPercent = isLeveraged
+            ? (pnl / p.marginDeposited) * 100
+            : (p.avgEntryPrice > 0 ? ((yesPrice - p.avgEntryPrice) / p.avgEntryPrice) * 100 : 0);
           results.push({
             id: `pos-${p.marketAddress}-yes`,
             type: 'position',
@@ -116,13 +126,21 @@ export function Positions({ onSell, currentMarketAddress, currentYesPrice, curre
             pnlPercent,
             status: p.status.toUpperCase(),
             createdAt: p.createdAt || 0, 
+            leverage: p.leverage,
+            liquidationPrice: p.liquidationPrice,
+            marginDeposited: p.marginDeposited,
+            loanAmount: p.loanAmount,
           });
         }
         
         if (p.noShares > 0) {
           const noAvgEntry = p.avgEntryPrice;
           const pnl = (noPrice - noAvgEntry) * p.noShares;
-          const pnlPercent = noAvgEntry > 0 ? ((noPrice - noAvgEntry) / noAvgEntry) * 100 : 0;
+          // For leveraged positions, P&L% is relative to margin deposited
+          const isLeveraged = p.leverage && p.leverage > 1 && p.marginDeposited && p.marginDeposited > 0;
+          const pnlPercent = isLeveraged
+            ? (pnl / p.marginDeposited) * 100
+            : (noAvgEntry > 0 ? ((noPrice - noAvgEntry) / noAvgEntry) * 100 : 0);
           results.push({
             id: `pos-${p.marketAddress}-no`,
             type: 'position',
@@ -140,6 +158,10 @@ export function Positions({ onSell, currentMarketAddress, currentYesPrice, curre
             pnlPercent,
             status: p.status.toUpperCase(),
             createdAt: p.createdAt || 0,
+            leverage: p.leverage,
+            liquidationPrice: p.liquidationPrice,
+            marginDeposited: p.marginDeposited,
+            loanAmount: p.loanAmount,
           });
         }
         
@@ -402,6 +424,9 @@ function UnifiedTable({
   }
 
   if (compact) {
+    // Check if any position has leverage
+    const hasLeveragedPositions = trades.some(t => t.leverage && t.leverage > 1);
+    
     return (
       <div className="w-full">
         <table className="w-full text-left border-collapse">
@@ -412,6 +437,9 @@ function UnifiedTable({
               <th className="px-2 py-2.5 font-bold text-right">Size</th>
               <th className="px-2 py-2.5 font-bold text-right">Avg</th>
               <th className="px-2 py-2.5 font-bold text-right">Now</th>
+              {hasLeveragedPositions && (
+                <th className="px-2 py-2.5 font-bold text-right">Lev/Liq</th>
+              )}
               <th className="px-2 py-2.5 font-bold text-right">P&L</th>
               <th className="px-3 py-2.5 font-bold text-right"></th>
             </tr>
@@ -424,6 +452,7 @@ function UnifiedTable({
                 onSell={onSell} 
                 onCancel={onCancel}
                 isCancelling={isCancelling}
+                showLeverage={hasLeveragedPositions}
               />
             ))}
           </tbody>
@@ -628,20 +657,29 @@ function CompactTradeRow({
   trade, 
   onSell,
   onCancel,
-  isCancelling
+  isCancelling,
+  showLeverage = false
 }: { 
   trade: UnifiedTrade;
   onSell?: (marketAddress: string, outcome: 'YES' | 'NO', shares: number, avgEntry: number, price: number, timeframe: any, expiry: number) => void;
   onCancel: (id: string) => void;
   isCancelling: boolean;
+  showLeverage?: boolean;
 }) {
   const timeframe = trade.market.split('-')[1];
   const isOrder = trade.type === 'order';
+  const isLeveraged = trade.leverage && trade.leverage > 1;
+  
+  // Check if position is near liquidation (within 20% of liquidation price)
+  const isNearLiquidation = isLeveraged && trade.liquidationPrice && (
+    Math.abs(trade.currentPrice - trade.liquidationPrice) / trade.currentPrice < 0.2
+  );
 
   return (
     <tr className={cn(
       "hover:bg-surface-light/30 transition-colors",
-      isOrder && "bg-accent/5"
+      isOrder && "bg-accent/5",
+      isNearLiquidation && "bg-short/5"
     )}>
       {/* Market */}
       <td className="px-3 py-3">
@@ -677,6 +715,27 @@ function CompactTradeRow({
           ${trade.currentPrice.toFixed(2)}
         </span>
       </td>
+      
+      {/* Leverage / Liquidation Price */}
+      {showLeverage && (
+        <td className="px-2 py-3 text-right">
+          {isLeveraged ? (
+            <div className="flex flex-col items-end">
+              <span className="font-mono text-sm font-bold text-warning">
+                {trade.leverage}x
+              </span>
+              <span className={cn(
+                'font-mono text-xs',
+                isNearLiquidation ? 'text-short animate-pulse' : 'text-text-muted'
+              )}>
+                Liq ${trade.liquidationPrice?.toFixed(2)}
+              </span>
+            </div>
+          ) : (
+            <span className="text-text-muted text-sm">1x</span>
+          )}
+        </td>
+      )}
       
       {/* P&L with % */}
       <td className="px-2 py-3 text-right">

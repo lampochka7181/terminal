@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
-use crate::state::{GlobalState, Market, UserPosition, Order, OrderStatus, Side, Outcome, MarketStatus, TradeType, USDC_MULTIPLIER, SHARE_MULTIPLIER, MAX_POSITION_SIZE, MIN_PRICE, MAX_PRICE, MIN_ORDER_SIZE, MAX_ORDER_SIZE};
+use crate::state::{GlobalState, Market, UserPosition, Order, OrderStatus, Side, Outcome, MarketStatus, TradeType, USDC_MULTIPLIER, SHARE_MULTIPLIER, MAX_POSITION_SIZE, MIN_PRICE, MAX_PRICE, MIN_ORDER_SIZE, MAX_ORDER_SIZE, MIN_TAKER_FEE};
 use crate::instructions::PlaceOrderArgs;
 use crate::errors::DegenError;
 
@@ -99,6 +99,7 @@ pub fn execute_match(
     maker_args: PlaceOrderArgs,
     taker_args: PlaceOrderArgs,
     match_size: u64,
+    taker_fee: u64,  // Fee specified by relayer (validated against min/max)
 ) -> Result<()> {
     let global_state = &ctx.accounts.global_state;
     let market_info = ctx.accounts.market.to_account_info();
@@ -199,14 +200,16 @@ pub fn execute_match(
         );
     }
     
-    // Calculate fees
-    let taker_fee = if is_maker_yes_buyer {
-        no_cost.checked_mul(global_state.taker_fee_bps as u64).ok_or(DegenError::MathOverflow)?
-            .checked_div(10_000).ok_or(DegenError::DivisionByZero)?
-    } else {
-        yes_cost.checked_mul(global_state.taker_fee_bps as u64).ok_or(DegenError::MathOverflow)?
-            .checked_div(10_000).ok_or(DegenError::DivisionByZero)?
-    };
+    // Validate relayer-specified fee
+    // Fee must be at least MIN_TAKER_FEE (prevents relayer from under-charging)
+    // Fee must be at most taker_fee_bps% of notional (prevents relayer from over-charging)
+    let taker_notional = if is_maker_yes_buyer { no_cost } else { yes_cost };
+    let max_fee = taker_notional
+        .checked_mul(global_state.taker_fee_bps as u64).ok_or(DegenError::MathOverflow)?
+        .checked_div(10_000).ok_or(DegenError::DivisionByZero)?;
+    
+    require!(taker_fee >= MIN_TAKER_FEE, DegenError::FeeTooLow);
+    require!(taker_fee <= max_fee.max(MIN_TAKER_FEE), DegenError::FeeTooHigh);
     
     // Calculate costs
     let (maker_cost, taker_cost) = if is_maker_yes_buyer {

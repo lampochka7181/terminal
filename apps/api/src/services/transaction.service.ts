@@ -1,10 +1,11 @@
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey, Keypair } from '@solana/web3.js';
 import { BN } from '@coral-xyz/anchor';
 import { config } from '../config.js';
 import { logger } from '../lib/logger.js';
 import { anchorClient, PlaceOrderArgs } from '../lib/anchor-client.js';
 import { orderService } from './order.service.js';
 import { userService } from './user.service.js';
+import { lendingService } from './lending.service.js';
 import { db, trades } from '../db/index.js';
 import { eq } from 'drizzle-orm';
 
@@ -36,6 +37,7 @@ export interface MatchParams {
   takerUserId?: string;
   price: number;
   matchSize: number;
+  takerFee: number;  // Fee in USD calculated by fee.service.ts
   makerSide: 'BID' | 'ASK';
   takerSide: 'BID' | 'ASK';
   outcome: 'YES' | 'NO';
@@ -69,9 +71,33 @@ export interface CloseParams {
   outcome: 'YES' | 'NO';
   price: number;
   matchSize: number;
+  takerFee: number;  // Fee in USD calculated by fee.service.ts
   tradeId?: string;  // Optional trade ID to update with tx signature
   makerOrderId?: string;  // For updating trade by order IDs
   takerOrderId?: string;  // For updating trade by order IDs
+}
+
+// Leveraged match params - Lending Pool executes on behalf of user
+export interface LeveragedMatchParams {
+  marketPubkey: string;
+  makerOrderId: string;
+  takerOrderId: string;
+  makerWallet: string;        // MM wallet (selling)
+  userWallet: string;         // User wallet (for tracking, receives position in DB)
+  price: number;
+  matchSize: number;
+  takerFee: number;
+  makerSide: 'BID' | 'ASK';
+  takerSide: 'BID' | 'ASK';
+  outcome: 'YES' | 'NO';
+  makerClientOrderId: number;
+  takerClientOrderId: number;
+  makerExpiryTs?: number;
+  takerExpiryTs?: number;
+  // Leverage info
+  leverage: number;
+  marginAmount: number;
+  loanAmount: number;
 }
 
 interface TransactionResult {
@@ -123,6 +149,7 @@ class TransactionService {
           outcome: params.outcome,
           price: params.price,
           matchSize: params.matchSize,
+          takerFee: params.takerFee,  // Tiered fee from fee.service.ts
           makerClientOrderId: params.makerClientOrderId,
           takerClientOrderId: params.takerClientOrderId,
           makerExpiryTs: params.makerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
@@ -169,6 +196,133 @@ class TransactionService {
   }
 
   /**
+   * Execute a LEVERAGED match transaction on Solana
+   * 
+   * Key difference: The Lending Pool wallet executes the trade on-chain,
+   * using its own funds. The position is owned by Lending Pool on-chain,
+   * but tracked to the user in the database.
+   * 
+   * PREREQUISITE: The Lending Pool must have delegation set up to the relayer.
+   * Run: npx ts-node apps/api/src/scripts/setup-lending-delegation.ts
+   */
+  async executeLeveragedMatch(params: LeveragedMatchParams): Promise<TransactionResult> {
+    // Get lending pool wallet address
+    const lendingWalletPubkey = lendingService.getLendingWalletPubkey();
+    if (!lendingWalletPubkey) {
+      return {
+        success: false,
+        error: 'Lending pool not configured',
+        errorCode: 'LENDING_NOT_CONFIGURED',
+      };
+    }
+
+    const lendingPoolWallet = lendingWalletPubkey.toBase58();
+
+    if (!anchorClient.isReady()) {
+      // Simulation mode
+      const simSignature = `sim_leveraged_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      logger.debug(`[SIMULATION] Leveraged Match: LendingPool ${lendingPoolWallet.slice(0,8)} buying for user ${params.userWallet.slice(0,8)} - ${params.matchSize} @ ${params.price}`);
+      
+      await this.updateTradeStatus(params.makerOrderId, params.takerOrderId, simSignature);
+      
+      return {
+        success: true,
+        signature: simSignature,
+      };
+    }
+
+    // STEP 1: Collect user's margin and lock it in Lending Pool
+    // This ensures we have the user's collateral BEFORE executing the leveraged trade
+    const relayerKeypair = anchorClient.getRelayerKeypair();
+    if (!relayerKeypair) {
+      return {
+        success: false,
+        error: 'Relayer not configured',
+        errorCode: 'RELAYER_NOT_CONFIGURED',
+      };
+    }
+    
+    logger.info(`[Leveraged] Step 1: Collecting $${params.marginAmount.toFixed(2)} margin from user ${params.userWallet.slice(0,8)} → Lending Pool`);
+    
+    const marginTxSig = await lendingService.collectMarginFromUser(
+      params.userWallet,
+      params.marginAmount,
+      relayerKeypair
+    );
+    
+    if (!marginTxSig) {
+      return {
+        success: false,
+        error: 'Failed to collect user margin - check delegation is set up',
+        errorCode: 'MARGIN_COLLECTION_FAILED',
+      };
+    }
+    
+    logger.info(`[Leveraged] Margin collected: ${marginTxSig}`);
+
+    // STEP 2: Execute the leveraged trade
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        logger.info(`[Leveraged] Step 2: Lending Pool ${lendingPoolWallet.slice(0,8)} executing trade for user ${params.userWallet.slice(0,8)}`);
+        logger.info(`[Leveraged] ${params.matchSize.toFixed(2)} shares @ $${params.price} (${params.leverage}x leverage, margin: $${params.marginAmount}, loan: $${params.loanAmount})`);
+
+        // Execute the leveraged match - Lending Pool wallet is the taker (buyer)
+        // The relayer has delegation authority over Lending Pool's USDC (same as MM)
+        const signature = await anchorClient.executeLeveragedMatch({
+          marketPubkey: params.marketPubkey,
+          makerWallet: params.makerWallet,
+          lendingPoolWallet: lendingPoolWallet,
+          userWallet: params.userWallet,
+          makerSide: params.makerSide,
+          takerSide: params.takerSide,
+          outcome: params.outcome,
+          price: params.price,
+          matchSize: params.matchSize,
+          takerFee: params.takerFee,
+          makerClientOrderId: params.makerClientOrderId,
+          takerClientOrderId: params.takerClientOrderId,
+          makerExpiryTs: params.makerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
+          takerExpiryTs: params.takerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
+        });
+
+        // Update database on success
+        await this.updateTradeStatus(params.makerOrderId, params.takerOrderId, signature);
+        
+        logger.info(`[Leveraged] Match success: ${signature}`);
+
+        return { success: true, signature };
+      } catch (err: any) {
+        lastError = err;
+        logger.warn(`Leveraged match tx attempt ${attempt} failed: ${err.message}`);
+
+        // Check if this is a permanent failure
+        const permanentError = this.isPermanentError(err);
+        if (permanentError) {
+          return {
+            success: false,
+            error: err.message,
+            errorCode: permanentError,
+          };
+        }
+
+        // Wait before retry
+        if (attempt < MAX_RETRIES) {
+          const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+          await this.sleep(delay);
+        }
+      }
+    }
+
+    return {
+      success: false,
+      error: lastError?.message || 'Max retries exceeded',
+      errorCode: 'MAX_RETRIES',
+    };
+  }
+
+  /**
    * Execute a closing trade on Solana
    * (seller sells existing shares to buyer)
    */
@@ -197,6 +351,7 @@ class TransactionService {
           outcome: params.outcome,
           price: params.price,
           matchSize: params.matchSize,
+          takerFee: params.takerFee,  // Tiered fee from fee.service.ts
         });
 
         logger.debug(`Close trade executed on-chain: ${signature}`);
@@ -375,6 +530,12 @@ class TransactionService {
 
     if (message.includes('insufficient funds') || message.includes('insufficient balance')) {
       return 'INSUFFICIENT_FUNDS';
+    }
+    if (message.includes('insufficientshares') || message.includes('insufficient shares') || message.includes('0x178d')) {
+      return 'INSUFFICIENT_SHARES';
+    }
+    if (message.includes('feetoolow') || message.includes('fee too low') || message.includes('0x1773')) {
+      return 'FEE_TOO_LOW';
     }
     if (message.includes('position limit')) {
       return 'POSITION_LIMIT';

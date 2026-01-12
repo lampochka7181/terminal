@@ -90,12 +90,56 @@ export const config = {
   // Only enable for testing when no MM is running.
   devAlwaysFillMarketOrders: process.env.DEV_ALWAYS_FILL_MARKET_ORDERS === 'true' && process.env.MM_ENABLED !== 'true',
   
-  // Fees
-  makerFeeBps: 0,    // 0.00%
-  takerFeeBps: 20,   // 0.20%
+  // Fees - Maker orders (limit orders adding liquidity)
+  makerFeeBps: 0,    // 0.00% - free to encourage liquidity
   
-  // Profitability
-  minNotionalValue: 10.0, // Minimum $10.00 notional to ensure fee > gas
+  // Fees - Tiered Taker Fee Structure (charged per fill, not per order)
+  // Tier 1: $0 to tier1Max → flat fee
+  // Tier 2: tier1Max to tier2Max → tier2Bps
+  // Tier 3: tier2Max to tier3Max → tier3Bps
+  // Tier 4: tier3Max+ → tier4Bps
+  fees: {
+    flatFeeUsd: parseFloat(process.env.FEE_FLAT_USD || '0.02'),
+    tier1Max: parseFloat(process.env.FEE_TIER1_MAX || '50'),      // $0 - $50: flat fee
+    tier2Max: parseFloat(process.env.FEE_TIER2_MAX || '500'),     // $50 - $500
+    tier2Bps: parseInt(process.env.FEE_TIER2_BPS || '5'),         // 5 bps = 0.05%
+    tier3Max: parseFloat(process.env.FEE_TIER3_MAX || '2000'),    // $500 - $2000
+    tier3Bps: parseInt(process.env.FEE_TIER3_BPS || '4'),         // 4 bps = 0.04%
+    tier4Bps: parseInt(process.env.FEE_TIER4_BPS || '3'),         // $2000+: 3 bps = 0.03%
+  },
+  
+  // Order Minimums
+  minBuyNotional: parseFloat(process.env.MIN_BUY_NOTIONAL || '5.0'),   // $5.00 minimum buy
+  minSellNotional: parseFloat(process.env.MIN_SELL_NOTIONAL || '0.02'), // $0.02 minimum sell (= flat fee)
+  
+  // Gas Cost (for reference/monitoring - actual cost ~$0.00135 at current settings)
+  gasCostUsd: parseFloat(process.env.GAS_COST_USD || '0.00135'),
+  
+  // Legacy - kept for backward compatibility, use fees.* instead
+  takerFeeBps: 20,   // 0.20% - legacy flat rate (replaced by tiered structure)
+  minNotionalValue: 10.0, // Legacy - use minBuyNotional/minSellNotional instead
+  
+  // ============================================================================
+  // LEVERAGE CONFIGURATION
+  // ============================================================================
+  
+  // Lending Pool Wallet - provides USDC loans for leveraged positions
+  lendingWalletPrivateKey: process.env.LENDING_WALLET_PRIVATE_KEY || process.env.LENDING_WALLET || '',
+  
+  // Insurance Fund Wallet - receives liquidation penalties, covers bad debt
+  insuranceWalletPrivateKey: process.env.INSURANCE_WALLET_PRIVATE_KEY || process.env.INSURANCE_WALLET || '',
+  
+  // Leverage Settings
+  leverage: {
+    maxLeverage: parseFloat(process.env.MAX_LEVERAGE || '10'),           // Maximum 10x leverage
+    minLeverage: 1.0,                                                     // Minimum (no leverage)
+    maintenanceMarginPct: parseFloat(process.env.MAINTENANCE_MARGIN_PCT || '3') / 100,  // 3% = 0.03 (liquidate later, ~35% returned)
+    liquidationPenaltyPct: parseFloat(process.env.LIQUIDATION_PENALTY_PCT || '2') / 100, // 2% = 0.02
+    minMarginUsd: parseFloat(process.env.MIN_MARGIN_USD || '5'),          // Minimum $5 margin
+    maxSingleLoanPct: parseFloat(process.env.MAX_SINGLE_LOAN_PCT || '10') / 100,  // Max 10% of pool per loan
+    maxUserExposurePct: parseFloat(process.env.MAX_USER_EXPOSURE_PCT || '20') / 100, // Max 20% of pool per user
+    minPoolReservePct: parseFloat(process.env.MIN_POOL_RESERVE_PCT || '10') / 100,   // Keep 10% always available
+  },
 };
 
 

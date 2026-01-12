@@ -55,6 +55,12 @@ export interface Position {
   unrealizedPnL: number;
   status: 'open' | 'settled';
   createdAt?: number;
+  // Leverage fields (only present if position is leveraged)
+  leverage?: number;
+  marginDeposited?: number;
+  loanAmount?: number;
+  liquidationPrice?: number;
+  marginAccountId?: string;
 }
 
 export interface MarketPosition {
@@ -274,6 +280,41 @@ export async function logout(): Promise<{ success: boolean }> {
   }
 }
 
+// ============================================
+// SESSION KEY API (for one-click trading)
+// ============================================
+
+export interface CreateSessionParams {
+  sessionPublicKey: string;
+  walletAddress: string;
+  expiresAt: number;
+  signature: string;
+  message: string;
+}
+
+export interface SessionStatus {
+  active: boolean;
+  sessionPublicKey?: string;
+  expiresAt?: number;
+}
+
+export async function createSession(params: CreateSessionParams): Promise<{ success: boolean }> {
+  return apiFetch<{ success: boolean }>('/auth/session', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
+export async function revokeSession(sessionPublicKey: string): Promise<{ success: boolean }> {
+  return apiFetch<{ success: boolean }>(`/auth/session/${sessionPublicKey}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function getSessionStatus(): Promise<SessionStatus> {
+  return apiFetch<SessionStatus>('/auth/session/status');
+}
+
 // ===================
 // Market Data
 // ===================
@@ -445,6 +486,10 @@ export interface NotifyOrderPlacedParams {
   maxPrice?: number;          // Price protection limit
   signature?: string;         // User's signature for authorization
   binaryMessage?: string;     // Binary message that was signed
+  sessionPublicKey?: string;  // Session key public key (for session-signed orders)
+  // Leverage (optional)
+  leverage?: number;          // 1-10, default 1 (no leverage)
+  marginAmount?: number;      // User's margin (required if leverage > 1)
 }
 
 export async function notifyOrderPlaced(
@@ -613,6 +658,10 @@ export const api = {
   logout,
   setAuthToken,
   getAuthToken,
+  // Session Keys (one-click trading)
+  createSession,
+  revokeSession,
+  getSessionStatus,
   // Markets
   getMarkets,
   getMarket,

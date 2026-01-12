@@ -389,6 +389,7 @@ export class AnchorClient {
     makerArgs: PlaceOrderArgs;
     takerArgs: PlaceOrderArgs;
     matchSize: number;
+    takerFee: number;  // Fee in USDC (6 decimals) - calculated by relayer
     makerOrderPda?: PublicKey | null;  // Order PDA if user order
     takerOrderPda?: PublicKey | null;  // Order PDA if user order
   }): Promise<TransactionInstruction> {
@@ -425,8 +426,10 @@ export class AnchorClient {
     const takerArgsBuffer = this.encodePlaceOrderArgs(params.takerArgs);
     const matchSizeBuffer = Buffer.alloc(8);
     matchSizeBuffer.writeBigUInt64LE(BigInt(params.matchSize), 0);
+    const takerFeeBuffer = Buffer.alloc(8);
+    takerFeeBuffer.writeBigUInt64LE(BigInt(params.takerFee), 0);
 
-    const data = Buffer.concat([discriminator, makerArgsBuffer, takerArgsBuffer, matchSizeBuffer]);
+    const data = Buffer.concat([discriminator, makerArgsBuffer, takerArgsBuffer, matchSizeBuffer, takerFeeBuffer]);
 
     // Build accounts list
     // Note: Order PDAs are optional (None = no account, Some = account present)
@@ -505,6 +508,7 @@ export class AnchorClient {
     );
 
     // Build execute_match instruction
+    // Note: This legacy function is for Ed25519 signed orders - fee defaults to flat minimum
     const executeMatchIx = await this.buildExecuteMatchInstruction({
       marketPubkey: params.marketPubkey,
       makerWallet: params.makerWallet,
@@ -512,6 +516,7 @@ export class AnchorClient {
       makerArgs: params.makerArgs,
       takerArgs: params.takerArgs,
       matchSize: params.matchSize,
+      takerFee: 20_000,  // Default $0.02 flat fee for legacy signed orders
     });
 
     // Order matters: Ed25519 verifications must come before execute_match
@@ -661,6 +666,7 @@ export class AnchorClient {
     outcome: 'YES' | 'NO';
     price: number;
     matchSize: number;
+    takerFee: number;  // Fee in USD (will be converted to 6 decimals)
     makerClientOrderId: number;
     takerClientOrderId: number;
     makerExpiryTs: number;
@@ -685,8 +691,10 @@ export class AnchorClient {
     // Convert to instruction format
     // Price: 6 decimals (0.52 -> 520_000)
     // Size: 6 decimals for fractional contracts (1.5 contracts -> 1_500_000)
+    // Fee: 6 decimals ($0.02 -> 20_000)
     const priceU64 = Math.floor(params.price * 1_000_000);
     const sizeU64 = Math.floor(params.matchSize * 1_000_000);
+    const feeU64 = Math.floor(params.takerFee * 1_000_000);
 
     const makerArgs: PlaceOrderArgs = {
       side: params.makerSide,
@@ -722,12 +730,105 @@ export class AnchorClient {
       makerArgs,
       takerArgs,
       matchSize: sizeU64,  // Fractional: 6 decimals
+      takerFee: feeU64,    // Tiered fee calculated by relayer
       makerOrderPda,
       takerOrderPda,
     });
 
     const signature = await this.submitTransaction([ix], [], `Match ${params.matchSize} shares`);
     logger.debug(`Match executed on-chain: ${signature}`);
+    
+    return signature;
+  }
+
+  /**
+   * Execute a LEVERAGED match on-chain
+   * 
+   * Key difference from executeMatch: The Lending Pool wallet acts as the taker (buyer),
+   * executing the trade from its funds. The position is owned by Lending Pool on-chain,
+   * but tracked to the user in the database.
+   * 
+   * NOTE: The Lending Pool must have delegation set up to the relayer (just like MM).
+   * Run: npx ts-node apps/api/src/scripts/setup-lending-delegation.ts
+   * 
+   * @param params Match parameters
+   * @returns Transaction signature
+   */
+  async executeLeveragedMatch(params: {
+    marketPubkey: string;
+    makerWallet: string;       // MM wallet (selling)
+    lendingPoolWallet: string; // Lending pool wallet (buying on behalf of user)
+    userWallet: string;        // User wallet (for tracking only - not used on-chain)
+    makerSide: 'BID' | 'ASK';
+    takerSide: 'BID' | 'ASK';
+    outcome: 'YES' | 'NO';
+    price: number;
+    matchSize: number;
+    takerFee: number;
+    makerClientOrderId: number;
+    takerClientOrderId: number;
+    makerExpiryTs: number;
+    takerExpiryTs: number;
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const makerWallet = new PublicKey(params.makerWallet);
+    const lendingPoolWalletPubkey = new PublicKey(params.lendingPoolWallet);
+
+    // Convert to instruction format (6 decimals)
+    const priceU64 = Math.floor(params.price * 1_000_000);
+    const sizeU64 = Math.floor(params.matchSize * 1_000_000);
+    const feeU64 = Math.floor(params.takerFee * 1_000_000);
+
+    const makerArgs: PlaceOrderArgs = {
+      side: params.makerSide,
+      outcome: params.outcome,
+      orderType: 'LIMIT',
+      price: priceU64,
+      size: sizeU64,
+      expiryTs: params.makerExpiryTs,
+      clientOrderId: params.makerClientOrderId,
+    };
+
+    const takerArgs: PlaceOrderArgs = {
+      side: params.takerSide,
+      outcome: params.outcome,
+      orderType: 'LIMIT',
+      price: priceU64,
+      size: sizeU64,
+      expiryTs: params.takerExpiryTs,
+      clientOrderId: params.takerClientOrderId,
+    };
+
+    logger.info(`executeLeveragedMatch: Lending Pool ${lendingPoolWalletPubkey.toBase58().slice(0,8)} buying on behalf of user ${params.userWallet.slice(0,8)}`);
+    logger.info(`executeLeveragedMatch: ${params.matchSize} shares @ ${params.price}`);
+
+    // Build execute_match instruction with Lending Pool as taker (buyer)
+    // The relayer has delegation authority over Lending Pool's USDC (same as MM)
+    const ix = await this.buildExecuteMatchInstruction({
+      marketPubkey: market,
+      makerWallet,
+      takerWallet: lendingPoolWalletPubkey, // Lending pool is the taker!
+      makerArgs,
+      takerArgs,
+      matchSize: sizeU64,
+      takerFee: feeU64,
+      makerOrderPda: null,  // MM orders don't have PDAs
+      takerOrderPda: null,  // Lending pool doesn't use order PDAs
+    });
+
+    // Submit transaction - relayer signs and uses delegation for Lending Pool transfer
+    // (no additional signer needed since relayer has delegation authority)
+    const signature = await this.submitTransaction(
+      [ix], 
+      [], // No additional signers - relayer has delegation authority
+      `Leveraged Match ${params.matchSize} shares for user ${params.userWallet.slice(0,8)}`
+    );
+    
+    logger.info(`Leveraged match executed on-chain: ${signature}`);
     
     return signature;
   }
@@ -741,8 +842,9 @@ export class AnchorClient {
     buyerWallet: PublicKey;
     sellerWallet: PublicKey;
     outcome: 'YES' | 'NO';
-    price: number;  // In 6 decimals
-    size: number;   // In 6 decimals
+    price: number;    // In 6 decimals
+    size: number;     // In 6 decimals
+    takerFee: number; // In 6 decimals
   }): Promise<TransactionInstruction> {
     if (!this.relayerKeypair) {
       throw new Error('Relayer not initialized');
@@ -769,11 +871,12 @@ export class AnchorClient {
     // Anchor discriminator = sha256("global:execute_close")[0:8]
     const discriminator = computeDiscriminator('execute_close');
     
-    // CloseTradeArgs: outcome (u8) + price (u64) + size (u64)
-    const argsBuffer = Buffer.alloc(17);
+    // CloseTradeArgs: outcome (u8) + price (u64) + size (u64) + taker_fee (u64)
+    const argsBuffer = Buffer.alloc(25);
     argsBuffer.writeUInt8(params.outcome === 'YES' ? 0 : 1, 0);  // outcome: 0=Yes, 1=No
     argsBuffer.writeBigUInt64LE(BigInt(params.price), 1);
     argsBuffer.writeBigUInt64LE(BigInt(params.size), 9);
+    argsBuffer.writeBigUInt64LE(BigInt(params.takerFee), 17);
 
     const data = Buffer.concat([discriminator, argsBuffer]);
 
@@ -818,6 +921,7 @@ export class AnchorClient {
     outcome: 'YES' | 'NO';
     price: number;      // Price in dollars (e.g., 0.52)
     matchSize: number;  // Number of contracts (e.g., 100)
+    takerFee: number;   // Fee in USD (e.g., 0.02)
   }): Promise<string> {
     if (!this.isReady()) {
       throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
@@ -830,8 +934,10 @@ export class AnchorClient {
     // Convert to instruction format
     // Price: 6 decimals (0.52 -> 520_000)
     // Size: 6 decimals for fractional contracts (1.5 contracts -> 1_500_000)
+    // Fee: 6 decimals ($0.02 -> 20_000)
     const priceU64 = Math.floor(params.price * 1_000_000);
     const sizeU64 = Math.floor(params.matchSize * 1_000_000);
+    const feeU64 = Math.floor(params.takerFee * 1_000_000);
 
     const ix = await this.buildExecuteCloseInstruction({
       marketPubkey: market,
@@ -840,6 +946,7 @@ export class AnchorClient {
       outcome: params.outcome,
       price: priceU64,
       size: sizeU64,
+      takerFee: feeU64,
     });
 
     const signature = await this.submitTransaction([ix], [], `Close Position ${params.matchSize} shares`);

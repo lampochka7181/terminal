@@ -1,9 +1,10 @@
 import { eq, and, inArray } from 'drizzle-orm';
-import { db, markets, positions, settlements, users } from '../db/index.js';
+import { db, markets, positions, settlements, users, marginAccounts } from '../db/index.js';
 import { positionService } from '../services/position.service.js';
 import { marketService } from '../services/market.service.js';
 import { transactionService } from '../services/transaction.service.js';
 import { userService } from '../services/user.service.js';
+import { lendingService } from '../services/lending.service.js';
 import { logger, positionLogger, marketLogger, logEvents } from '../lib/logger.js';
 import { broadcastUserSettlement } from '../lib/broadcasts.js';
 import { anchorClient } from '../lib/anchor-client.js';
@@ -20,6 +21,11 @@ interface SettlementBatchItem {
   userWallet: string | null;
   settlementId: string;
   needsOnChainSettlement: boolean;
+  // Leverage fields
+  isLeveraged: boolean;
+  settlementWallet: string | null; // Lending Pool wallet for leveraged, user wallet otherwise
+  loanAmount?: number;             // Loan to repay (if leveraged)
+  userPayout?: number;             // What user actually receives after loan repayment
 }
 
 /**
@@ -311,6 +317,22 @@ async function prepareSettlementBatch(
 ): Promise<SettlementBatchItem[]> {
   const batch: SettlementBatchItem[] = [];
   
+  // Get lending pool wallet for leveraged settlements
+  const lendingPoolWallet = lendingService.getLendingWalletPubkey()?.toBase58() || null;
+  
+  // Pre-fetch all margin accounts for these positions
+  const positionIds = openPositions.map(p => p.id);
+  const marginAccountsList = positionIds.length > 0 
+    ? await db
+        .select()
+        .from(marginAccounts)
+        .where(and(
+          inArray(marginAccounts.positionId, positionIds),
+          eq(marginAccounts.status, 'OPEN')
+        ))
+    : [];
+  const marginAccountMap = new Map(marginAccountsList.map(ma => [ma.positionId, ma]));
+  
   for (const position of openPositions) {
     // Skip already settled/pending positions
     const existing = settlementMap.get(position.id);
@@ -328,6 +350,23 @@ async function prepareSettlementBatch(
     const payout = winningShares * 1.0;
     const profit = payout - totalCost;
     const userWallet = position.userId ? walletMap.get(position.userId) || null : null;
+    
+    // Check if this is a leveraged position
+    const marginAccount = marginAccountMap.get(position.id);
+    const isLeveraged = !!marginAccount;
+    const loanAmount = marginAccount ? parseFloat(marginAccount.loanAmount) : 0;
+    
+    // For leveraged positions:
+    // - On-chain settlement goes to Lending Pool (which owns the position on-chain)
+    // - User payout = payout - loan repayment
+    // For regular positions:
+    // - On-chain settlement goes to user wallet
+    const settlementWallet = isLeveraged ? lendingPoolWallet : userWallet;
+    const userPayout = isLeveraged ? Math.max(0, payout - loanAmount) : payout;
+    
+    if (isLeveraged) {
+      logger.info(`Leveraged settlement: position ${position.id}, payout $${payout.toFixed(2)}, loan $${loanAmount.toFixed(2)}, user receives $${userPayout.toFixed(2)}`);
+    }
     
     // Create settlement record (PENDING)
     const [settlement] = await db
@@ -352,7 +391,11 @@ async function prepareSettlementBatch(
       profit,
       userWallet,
       settlementId: settlement.id,
-      needsOnChainSettlement: !!userWallet, // Include losers so their PDAs are closed and market settled
+      needsOnChainSettlement: !!settlementWallet, // Use settlement wallet (lending pool or user)
+      isLeveraged,
+      settlementWallet,
+      loanAmount: isLeveraged ? loanAmount : undefined,
+      userPayout: isLeveraged ? userPayout : undefined,
     });
   }
   
@@ -361,6 +404,9 @@ async function prepareSettlementBatch(
 
 /**
  * Execute batch settlement - all positions in ONE on-chain transaction
+ * 
+ * For leveraged positions, the Lending Pool wallet receives the payout on-chain,
+ * then distributes: loan repayment stays in pool, user's share is transferred.
  */
 async function executeBatchSettlement(
   batch: SettlementBatchItem[],
@@ -374,16 +420,23 @@ async function executeBatchSettlement(
     return null;
   }
   
-  logger.info(`Executing batch settlement: ${onChainItems.length} positions in 1 transaction`);
+  // Separate regular and leveraged settlements
+  const regularItems = onChainItems.filter(item => !item.isLeveraged);
+  const leveragedItems = onChainItems.filter(item => item.isLeveraged);
+  
+  logger.info(`Executing batch settlement: ${regularItems.length} regular + ${leveragedItems.length} leveraged positions`);
   
   try {
     // Build all settle instructions
-    const userWallets = onChainItems.map(item => item.userWallet!);
+    // Use settlementWallet which is:
+    // - User wallet for regular positions
+    // - Lending Pool wallet for leveraged positions
+    const wallets = onChainItems.map(item => item.settlementWallet!);
     
     // Execute batch settlement (all in one transaction)
     const signature = await anchorClient.settlePositionsBatch({
       marketPubkey: market.pubkey,
-      userWallets,
+      userWallets: wallets,
     });
     
     logger.info(`✅ Batch settlement executed: ${signature} (${onChainItems.length} positions)`);
@@ -422,6 +475,11 @@ async function executeBatchSettlement(
 
 /**
  * Finalize settlement - update position status, notify user, log
+ * 
+ * For leveraged positions:
+ * - On-chain settlement went to Lending Pool
+ * - positionService.settlePosition handles loan repayment in DB
+ * - User receives: payout - loanAmount (transferred from Lending Pool to User)
  */
 async function finalizeSettlement(
   item: SettlementBatchItem,
@@ -439,15 +497,35 @@ async function finalizeSettlement(
   
   // Only finalize if confirmed or no on-chain needed
   if (txStatus === 'CONFIRMED' || !item.needsOnChainSettlement) {
+    // positionService.settlePosition handles:
+    // - Marking position as SETTLED
+    // - Repaying loan (if leveraged)
+    // - Closing margin account (if leveraged)
     await positionService.settlePosition(item.position.id, item.payout);
     
+    // For leveraged positions: transfer user's share from Lending Pool
+    if (item.isLeveraged && item.loanAmount !== undefined && item.userPayout !== undefined && item.userWallet) {
+      logger.info(`Leveraged settlement: position ${item.position.id}, gross payout $${item.payout.toFixed(2)}, loan repaid $${item.loanAmount.toFixed(2)}, user net $${item.userPayout.toFixed(2)}`);
+      
+      // Transfer user's share (payout - loan) from Lending Pool to User
+      if (item.userPayout > 0) {
+        const transferSig = await lendingService.transferToUser(item.userWallet, item.userPayout);
+        if (transferSig) {
+          logger.info(`✅ Transferred $${item.userPayout.toFixed(2)} to user ${item.userWallet.slice(0, 8)}: ${transferSig}`);
+        } else {
+          logger.error(`❌ Failed to transfer $${item.userPayout.toFixed(2)} to user ${item.userWallet.slice(0, 8)}`);
+        }
+      }
+    }
+    
     // Notify user via WebSocket
+    // For leveraged positions, show what user actually receives (after loan repayment)
     if (item.position.userId) {
       broadcastUserSettlement(item.position.userId, {
         marketId: market.id,
         outcome: item.outcome,
         size: item.winningShares,
-        payout: item.payout,
+        payout: item.isLeveraged ? (item.userPayout || 0) : item.payout,
       });
     }
     
@@ -460,7 +538,7 @@ async function finalizeSettlement(
       timeframe: market.timeframe,
       outcome: item.outcome,
       winningShares: item.winningShares,
-      payout: item.payout,
+      payout: item.isLeveraged ? (item.userPayout || 0) : item.payout,
       profit: item.profit,
     });
   } else {

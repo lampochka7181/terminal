@@ -7,8 +7,9 @@ import { Header } from '@/components/layout/Header';
 import { usePrices } from '@/hooks/usePrices';
 import { useMarkets } from '@/hooks/useMarkets';
 import { useAuth } from '@/hooks/useAuth';
-import { useQuickOrder } from '@/hooks/useOrder';
+import { useQuickOrder, type SessionSigner } from '@/hooks/useOrder';
 import { useDelegation } from '@/hooks/useDelegation';
+import { useSessionKey } from '@/hooks/useSessionKey';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { cn } from '@/lib/utils';
 import { 
@@ -21,7 +22,8 @@ import {
   AlertCircle, 
   Clock, 
   Smartphone,
-  Zap
+  Zap,
+  TrendingUp
 } from 'lucide-react';
 import type { Asset, Timeframe } from '@degen/types';
 import { ChartV2 } from '@/components/trading/ChartV2';
@@ -46,7 +48,29 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   const { isAuthenticated, signIn, isAuthenticating } = useAuth();
   const { selectedTimeframe, setTimeframe, setAsset } = useMarketStore();
   const { isApproved: isDelegationApproved, isApproving, approve: approveDelegation, delegatedAmount } = useDelegation();
-  const { oneClickEnabled, oneClickAmount, confirmTrades, soundEnabled } = useSettingsStore();
+  const { oneClickEnabled, oneClickAmount, soundEnabled, setOneClickAmount } = useSettingsStore();
+  
+  // Session key for instant trading (no wallet popups)
+  const { isActive: isSessionActive, publicKey: sessionPublicKey, signOrder, createSession, revokeSession, isCreating: isCreatingSession, getTimeRemaining } = useSessionKey();
+  
+  // Create session signer if session is active
+  const sessionSigner: SessionSigner | undefined = useMemo(() => {
+    console.log('[DesktopView] Creating sessionSigner:', { isSessionActive, sessionPublicKey: sessionPublicKey?.slice(0, 8), hasSignOrder: !!signOrder });
+    if (!isSessionActive || !sessionPublicKey) return undefined;
+    return {
+      publicKey: sessionPublicKey,
+      sign: signOrder,
+    };
+  }, [isSessionActive, sessionPublicKey, signOrder]);
+  
+  // Debug: Log when sessionSigner changes
+  useEffect(() => {
+    console.log('[DesktopView] sessionSigner updated:', { hasSessionSigner: !!sessionSigner, pubkey: sessionSigner?.publicKey?.slice(0, 8) });
+  }, [sessionSigner]);
+  
+  // One-click amount popup state
+  const [showAmountPopup, setShowAmountPopup] = useState(false);
+  const [pendingOneClickOutcome, setPendingOneClickOutcome] = useState<{ outcome: 'YES' | 'NO'; price: number } | null>(null);
 
   // Ensure store matches URL asset
   useEffect(() => {
@@ -92,6 +116,10 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   const [orderType, setOrderType] = useState<'market' | 'limit'>('market');
   const [limitPrice, setLimitPrice] = useState('');
   
+  // Leverage state
+  const [leverage, setLeverage] = useState(1);
+  const [showLeverage, setShowLeverage] = useState(false);
+  
   // Trade mode: 'buy' or 'sell'
   const [tradeMode, setTradeMode] = useState<'buy' | 'sell'>('buy');
   
@@ -104,8 +132,8 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   } | null>(null);
   const [sellSize, setSellSize] = useState('');
 
-  // Use the order hook
-  const { placeOrder, isPlacing, error: orderError, clearError } = useQuickOrder();
+  // Use the order hook - pass session signer for instant trading
+  const { placeOrder, isPlacing, error: orderError, clearError } = useQuickOrder(sessionSigner);
 
   // Calculate estimates using REAL-TIME orderbook prices directly from store
   // SINGLE ORDERBOOK MODEL: Prices reflect ACTUAL execution cost
@@ -124,9 +152,54 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   const limitPriceNum = parseFloat(limitPrice) || 0;
   const selectedPrice = orderType === 'limit' && limitPriceNum > 0 ? limitPriceNum : marketPrice;
   const dollarAmountNum = parseFloat(dollarAmount) || 0;
-  const estimatedContracts = dollarAmountNum > 0 && selectedPrice > 0 ? Math.floor(dollarAmountNum / selectedPrice) : 0;
+  
+  // Leverage calculations - dollarAmount is the user's MARGIN when leveraged
+  const leverageStats = useMemo(() => {
+    const isLeveraged = leverage > 1;
+    const price = selectedPrice;
+    
+    if (price === 0 || dollarAmountNum === 0) {
+      return { 
+        isLeveraged: false, 
+        marginRequired: dollarAmountNum, 
+        loanAmount: 0, 
+        liquidationPrice: 0,
+        buyingPower: dollarAmountNum,
+        contracts: 0
+      };
+    }
+    
+    // With leverage: dollarAmount = margin, buyingPower = margin * leverage
+    const marginRequired = dollarAmountNum;
+    const buyingPower = isLeveraged ? marginRequired * leverage : marginRequired;
+    const loanAmount = buyingPower - marginRequired;
+    const contracts = Math.floor(buyingPower / price);
+    
+    // Liquidation price calculation (3% maintenance margin for leverage)
+    // At 10x leverage, initial margin is 10%. Lower maintenance = liquidate later, return ~35% of margin.
+    // Formula: liq_price = loan / (shares * (1 - maintenance_margin))
+    const maintenanceMarginPct = 0.03; // 3% maintenance = liquidate later, return ~35% of collateral
+    let liquidationPrice = 0;
+    
+    if (isLeveraged && contracts > 0 && loanAmount > 0) {
+      // Same formula for both YES and NO:
+      // liq_price = loan / (shares × (1 - maintenance_margin))
+      // For YES: liquidation when YES price drops to this level
+      // For NO: liquidation when NO price drops to this level
+      liquidationPrice = loanAmount / (contracts * (1 - maintenanceMarginPct));
+      
+      // Clamp to valid price range
+      liquidationPrice = Math.max(0.01, Math.min(0.99, liquidationPrice));
+    }
+    
+    return { isLeveraged, marginRequired, loanAmount, liquidationPrice, buyingPower, contracts };
+  }, [leverage, dollarAmountNum, selectedPrice, selectedOutcome]);
+
+  // Contracts: use leveraged contracts if leverage > 1, otherwise normal calculation
+  const estimatedContracts = leverageStats.contracts > 0 ? leverageStats.contracts : 
+    (dollarAmountNum > 0 && selectedPrice > 0 ? Math.floor(dollarAmountNum / selectedPrice) : 0);
   const estimatedPayout = estimatedContracts * 1.0;
-  const estimatedProfit = estimatedPayout - dollarAmountNum;
+  const estimatedProfit = estimatedPayout - (leverage > 1 ? leverageStats.marginRequired : dollarAmountNum);
   
   // Sell calculations
   const sellSizeNum = parseFloat(sellSize) || 0;
@@ -161,14 +234,9 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   // One-click trading state
   const [oneClickOutcome, setOneClickOutcome] = useState<'YES' | 'NO' | null>(null);
 
-  // One-click trading handler
+  // One-click trading handler - no confirmation needed since user explicitly enabled one-click mode
   const handleOneClickTrade = useCallback(async (outcome: 'YES' | 'NO', price: number) => {
     if (!connected || !activeMarket || !isDelegationApproved || !oneClickEnabled) return;
-    
-    // Optional confirmation
-    if (confirmTrades && !window.confirm(`Quick trade: Buy $${oneClickAmount} of ${outcome === 'YES' ? 'ABOVE' : 'BELOW'} @ $${price.toFixed(2)}?`)) {
-      return;
-    }
 
     setOneClickOutcome(outcome);
     clearError();
@@ -226,7 +294,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
         setOneClickOutcome(null);
       }, 3000);
     }
-  }, [connected, activeMarket, isDelegationApproved, oneClickEnabled, oneClickAmount, confirmTrades, soundEnabled, placeOrder, clearError]);
+  }, [connected, activeMarket, isDelegationApproved, oneClickEnabled, oneClickAmount, soundEnabled, placeOrder, clearError]);
 
   const handleQuickTrade = async () => {
     // Sell mode
@@ -299,6 +367,17 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
       ? Math.min(0.99, marketPrice * (1 + SLIPPAGE_TOLERANCE))
       : limitPriceNum;
 
+    // DEBUG: Log leverage state before placing order
+    console.log('[Trade] Placing order with leverage:', {
+      leverage,
+      isLeveraged: leverage > 1,
+      dollarAmountInput: dollarAmountNum,
+      buyingPower: leverageStats.buyingPower,
+      marginRequired: leverageStats.marginRequired,
+      contracts: estimatedContracts,
+      outcome: selectedOutcome,
+    });
+    
     const result = await placeOrder({
       marketAddress: activeMarket.address,
       side: 'bid',
@@ -307,8 +386,11 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
       price: orderType === 'limit' ? limitPriceNum : marketPrice,
       size: estimatedContracts,
       expiryTimestamp,
-      dollarAmount: dollarAmountNum,
+      // With leverage: dollarAmount is buying power, marginAmount is user's collateral
+      dollarAmount: leverage > 1 ? leverageStats.buyingPower : dollarAmountNum,
       maxPrice,
+      leverage: leverage > 1 ? leverage : undefined,
+      marginAmount: leverage > 1 ? dollarAmountNum : undefined, // User's margin (their input)
     });
 
     // Check if order was actually successful (not cancelled or failed)
@@ -386,6 +468,102 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
             >
               <XCircle className="w-4 h-4" />
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* One-Click Amount Popup */}
+      {showAmountPopup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm animate-fade-in">
+          <div className="bg-surface border border-border rounded-xl shadow-2xl w-80 overflow-hidden animate-fade-in-scale">
+            {/* Header */}
+            <div className="flex items-center justify-between px-4 py-3 bg-surface-light/50 border-b border-border">
+              <div className="flex items-center gap-2">
+                <Zap className="w-4 h-4 text-warning" />
+                <span className="font-bold text-sm">One-Click Amount</span>
+              </div>
+              <button
+                onClick={() => {
+                  setShowAmountPopup(false);
+                  setPendingOneClickOutcome(null);
+                }}
+                className="p-1 hover:bg-surface-light rounded transition-colors"
+              >
+                <XCircle className="w-4 h-4 text-text-muted" />
+              </button>
+            </div>
+            
+            {/* Current Amount Display */}
+            <div className="p-4">
+              <div className="flex items-center justify-center mb-4">
+                <span className="text-3xl font-black font-mono text-warning">${oneClickAmount}</span>
+              </div>
+              
+              {/* Quick Amount Presets */}
+              <div className="grid grid-cols-4 gap-2 mb-4">
+                {[25, 50, 100, 250].map((amt) => (
+                  <button
+                    key={amt}
+                    onClick={() => setOneClickAmount(amt)}
+                    className={cn(
+                      'py-2 text-sm font-bold rounded-lg transition-all btn-press',
+                      oneClickAmount === amt
+                        ? 'bg-warning text-background'
+                        : 'bg-surface-light hover:bg-border text-text-primary'
+                    )}
+                  >
+                    ${amt}
+                  </button>
+                ))}
+              </div>
+              
+              {/* Custom Amount Input */}
+              <div className="flex items-center gap-2 mb-4">
+                <span className="text-text-muted text-sm">Custom:</span>
+                <div className="flex-1 relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted">$</span>
+                  <input
+                    type="number"
+                    value={oneClickAmount}
+                    onChange={(e) => setOneClickAmount(Math.max(1, Number(e.target.value) || 1))}
+                    className="w-full pl-7 pr-3 py-2 bg-surface-light border border-border rounded-lg text-text-primary font-mono text-center focus:border-warning outline-none transition-colors"
+                    min="1"
+                    step="1"
+                  />
+                </div>
+              </div>
+              
+              {/* Action Buttons */}
+              <div className="flex gap-2">
+                <button
+                  onClick={() => {
+                    setShowAmountPopup(false);
+                    setPendingOneClickOutcome(null);
+                  }}
+                  className="flex-1 py-2.5 rounded-lg bg-surface-light hover:bg-border text-text-primary font-bold transition-all btn-press"
+                >
+                  Cancel
+                </button>
+                {pendingOneClickOutcome && (
+                  <button
+                    onClick={() => {
+                      setShowAmountPopup(false);
+                      handleOneClickTrade(pendingOneClickOutcome.outcome, pendingOneClickOutcome.price);
+                      setPendingOneClickOutcome(null);
+                    }}
+                    className={cn(
+                      'flex-1 py-2.5 rounded-lg font-bold transition-all btn-press flex items-center justify-center gap-1.5',
+                      pendingOneClickOutcome.outcome === 'YES'
+                        ? 'bg-long hover:bg-long/80 text-background'
+                        : 'bg-short hover:bg-short/80 text-white'
+                    )}
+                  >
+                    <Zap className="w-4 h-4" />
+                    Trade {pendingOneClickOutcome.outcome === 'YES' ? 'ABOVE' : 'BELOW'}
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -535,6 +713,10 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                     oneClickAmount={oneClickAmount}
                     isLoading={orderStatus === 'placing' && oneClickOutcome === 'YES'}
                     isActivating={isActivating}
+                    onAmountClick={() => {
+                      setPendingOneClickOutcome({ outcome: 'YES', price: yesPrice });
+                      setShowAmountPopup(true);
+                    }}
                   />
                   
                   {/* Simple divider between ABOVE/BELOW */}
@@ -559,6 +741,10 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                     oneClickAmount={oneClickAmount}
                     isLoading={orderStatus === 'placing' && oneClickOutcome === 'NO'}
                     isActivating={isActivating}
+                    onAmountClick={() => {
+                      setPendingOneClickOutcome({ outcome: 'NO', price: noPrice });
+                      setShowAmountPopup(true);
+                    }}
                   />
                 </div>
                 
@@ -573,18 +759,11 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                 {/* BOTTOM HALF: Trade Panel - fills space below strike line */}
                 <div className="flex-1 flex flex-col overflow-hidden min-h-0 border-t border-border">
                   {selectedOutcome ? (
-                    <div className="p-3 flex flex-col h-full">
-                      {/* Header with Buy/Sell toggle */}
-                      <div className="flex items-center justify-between mb-2">
-                        <h3 className="text-base font-bold flex items-center gap-2">
-                          <Zap className={cn(
-                            'w-4 h-4',
-                            tradeMode === 'sell' ? 'text-warning' : selectedOutcome === 'YES' ? 'text-long' : 'text-short'
-                          )} />
-                          {tradeMode === 'sell' ? 'Sell' : 'Trade'}
-                        </h3>
-                        <div className="flex items-center gap-2">
+                    <div className="p-2.5 pt-2 flex flex-col h-full">
+                      {/* Minimal header - only show when in sell mode */}
                           {tradeMode === 'sell' && (
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm font-bold text-warning">Sell Position</span>
                             <button
                               onClick={() => {
                                 setTradeMode('buy');
@@ -595,15 +774,8 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                             >
                               Cancel
                             </button>
-                          )}
-                          <span className={cn(
-                            'px-2 py-0.5 rounded text-xs font-bold',
-                            selectedOutcome === 'YES' ? 'bg-long/20 text-long' : 'bg-short/20 text-short'
-                          )}>
-                            {selectedOutcome === 'YES' ? 'ABOVE' : 'BELOW'}
-                          </span>
                         </div>
-                      </div>
+                      )}
 
                       {/* SELL MODE UI */}
                       {tradeMode === 'sell' && sellData ? (
@@ -696,7 +868,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                               )}
                             </button>
                           ) : (
-                            <WalletButton className="!w-full !justify-center !bg-accent !text-background hover:!bg-accent-dim !rounded-lg !font-bold !h-11 !text-base" />
+                            <WalletButton className="!w-full !justify-center !bg-accent !text-background hover:!bg-accent-dim !rounded-lg !font-bold !h-10 !text-sm" />
                           )}
                         </>
                       ) : (
@@ -707,7 +879,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                             <button
                               onClick={() => setOrderType('market')}
                               className={cn(
-                                'flex-1 py-2 text-sm font-bold rounded-md transition-all',
+                                'flex-1 py-1.5 text-sm font-bold rounded-md transition-all',
                                 orderType === 'market'
                                   ? 'bg-accent text-background'
                                   : 'text-text-muted hover:text-text-primary'
@@ -721,7 +893,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                                 if (!limitPrice) setLimitPrice(marketPrice.toFixed(2));
                               }}
                               className={cn(
-                                'flex-1 py-2 text-sm font-bold rounded-md transition-all',
+                                'flex-1 py-1.5 text-sm font-bold rounded-md transition-all',
                                 orderType === 'limit'
                                   ? 'bg-accent text-background'
                                   : 'text-text-muted hover:text-text-primary'
@@ -744,10 +916,10 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                                   max="0.99"
                                   step="0.01"
                                   placeholder="0.50"
-                                  className="w-full bg-surface-light border border-border rounded-lg pl-8 pr-3 py-2.5 font-mono text-lg text-right focus:border-accent focus:ring-1 focus:ring-accent"
+                                  className="w-full bg-surface-light border border-border rounded-lg pl-8 pr-3 py-2 font-mono text-lg text-right focus:border-accent focus:ring-1 focus:ring-accent"
                                 />
                               </div>
-                              <div className="flex gap-1 mt-1.5">
+                              <div className="flex gap-1 mt-1">
                                 {[
                                   { label: '-5¢', delta: -0.05 },
                                   { label: '-1¢', delta: -0.01 },
@@ -765,7 +937,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                                         setLimitPrice(newPrice.toFixed(2));
                                       }
                                     }}
-                                    className="flex-1 py-1.5 text-xs rounded-md bg-surface text-text-muted hover:text-text-primary hover:bg-surface-light transition-colors font-medium"
+                                    className="flex-1 py-1 text-xs rounded-md bg-surface text-text-muted hover:text-text-primary hover:bg-surface-light transition-colors font-medium"
                                   >
                                     {label}
                                   </button>
@@ -774,7 +946,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                             </div>
                           )}
 
-                          {/* Amount Input - No label */}
+                          {/* Amount Input */}
                           <div className="mb-2">
                             <div className="relative">
                               <span className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted text-sm">$</span>
@@ -783,7 +955,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                                 value={dollarAmount}
                                 onChange={(e) => setDollarAmount(e.target.value)}
                                 min="1"
-                                className="w-full bg-surface-light border border-border rounded-lg pl-8 pr-3 py-2.5 font-mono text-lg text-right focus:border-accent focus:ring-1 focus:ring-accent"
+                                className="w-full bg-surface-light border border-border rounded-lg pl-8 pr-3 py-2 font-mono text-lg text-right focus:border-accent focus:ring-1 focus:ring-accent"
                               />
                             </div>
                             <div className="flex gap-1 mt-1.5">
@@ -792,7 +964,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                                   key={preset}
                                   onClick={() => setDollarAmount(preset.toString())}
                                   className={cn(
-                                    'flex-1 py-1.5 text-xs rounded-lg transition-colors font-bold',
+                                    'flex-1 py-1 text-xs rounded-lg transition-colors font-bold',
                                     parseFloat(dollarAmount) === preset
                                       ? 'bg-accent/20 text-accent'
                                       : 'bg-surface-light text-text-muted hover:text-text-primary'
@@ -804,13 +976,19 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                             </div>
                           </div>
 
-                          {/* Summary - Compact */}
+                          {/* Summary */}
                           <div className="bg-surface-light rounded-lg p-2.5 mb-2 text-sm">
                             <div className="space-y-1">
                               <div className="flex justify-between">
                                 <span className="text-text-muted">Price</span>
                                 <span className="font-mono font-bold">${selectedPrice.toFixed(2)}</span>
                               </div>
+                              {leverage > 1 && (
+                                <div className="flex justify-between">
+                                  <span className="text-text-muted">Buying Power</span>
+                                  <span className="font-mono font-bold text-accent">${leverageStats.buyingPower.toFixed(2)}</span>
+                                </div>
+                              )}
                               <div className="flex justify-between">
                                 <span className="text-text-muted">Contracts</span>
                                 <span className="font-mono font-bold">{estimatedContracts.toLocaleString()}</span>
@@ -822,11 +1000,139 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                               <div className="border-t border-border pt-1 mt-1">
                                 <div className="flex justify-between">
                                   <span className="text-text-muted font-medium">Profit</span>
-                                  <span className="font-mono font-bold text-long text-base">+${estimatedProfit.toFixed(2)}</span>
+                                  <span className="font-mono font-bold text-long">+${estimatedProfit.toFixed(2)}</span>
                                 </div>
+                              </div>
+                              {/* Leverage Button */}
+                              <div className="border-t border-border pt-1 mt-1">
+                                <button 
+                                  onClick={() => setShowLeverage(true)}
+                                  className={cn(
+                                    'flex items-center justify-between w-full text-xs transition-colors',
+                                    leverage > 1 ? 'text-accent' : 'text-text-muted hover:text-text-primary'
+                                  )}
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <TrendingUp className="w-3 h-3" />
+                                    <span>Leverage</span>
+                                  </div>
+                                  <span className={cn('font-bold', leverage > 1 && 'text-accent')}>
+                                    {leverage}x {leverage > 1 && `• Liq $${leverageStats.liquidationPrice.toFixed(2)}`}
+                                  </span>
+                                </button>
                               </div>
                             </div>
                           </div>
+
+                          {/* Leverage Popup Modal */}
+                          {showLeverage && (
+                            <div className="fixed inset-0 z-50 flex items-center justify-center">
+                              {/* Backdrop */}
+                              <div 
+                                className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+                                onClick={() => setShowLeverage(false)}
+                              />
+                              {/* Modal */}
+                              <div className="relative bg-surface border border-border rounded-xl p-4 w-72 shadow-2xl animate-in fade-in zoom-in-95 duration-200">
+                                <div className="flex items-center justify-between mb-4">
+                                  <div className="flex items-center gap-2">
+                                    <TrendingUp className="w-5 h-5 text-accent" />
+                                    <h3 className="font-bold text-lg">Leverage</h3>
+                                  </div>
+                                  <button 
+                                    onClick={() => setShowLeverage(false)}
+                                    className="text-text-muted hover:text-text-primary"
+                                  >
+                                    <XCircle className="w-5 h-5" />
+                                  </button>
+                                </div>
+
+                                {/* Current leverage display */}
+                                <div className="text-center mb-4">
+                                  <span className="text-4xl font-bold text-accent">{leverage}x</span>
+                                </div>
+
+                                {/* Slider */}
+                                <input
+                                  type="range"
+                                  value={leverage}
+                                  onChange={(e) => setLeverage(parseInt(e.target.value))}
+                                  min="1"
+                                  max="10"
+                                  step="1"
+                                  className="w-full accent-accent h-2 mb-1"
+                                />
+                                <div className="flex justify-between text-xs text-text-muted mb-3">
+                                  <span>1x (No leverage)</span>
+                                  <span>10x (Max)</span>
+                                </div>
+
+                                {/* Quick buttons */}
+                                <div className="flex gap-1.5 mb-4">
+                                  {[1, 2, 3, 5, 10].map((lev) => (
+                                    <button
+                                      key={lev}
+                                      onClick={() => setLeverage(lev)}
+                                      className={cn(
+                                        'flex-1 py-2 text-sm rounded-lg font-bold transition-all',
+                                        leverage === lev
+                                          ? 'bg-accent text-background shadow-lg shadow-accent/30'
+                                          : 'bg-surface-light text-text-muted hover:text-text-primary hover:bg-surface'
+                                      )}
+                                    >
+                                      {lev}x
+                                    </button>
+                                  ))}
+                                </div>
+
+                                {/* Stats when leveraged */}
+                                {leverage > 1 && (
+                                  <div className="bg-surface-light rounded-lg p-3 space-y-2 text-sm mb-4">
+                                    <div className="flex justify-between">
+                                      <span className="text-text-muted">Your Margin</span>
+                                      <span className="font-mono font-bold">${dollarAmountNum.toFixed(2)}</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                      <span className="text-text-muted">Borrowed</span>
+                                      <span className="font-mono">${leverageStats.loanAmount.toFixed(2)}</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                      <span className="text-text-muted">Buying Power</span>
+                                      <span className="font-mono font-bold text-accent">${leverageStats.buyingPower.toFixed(2)}</span>
+                                    </div>
+                                    <div className="flex justify-between items-center pt-2 border-t border-border">
+                                      <span className="text-warning flex items-center gap-1">
+                                        <AlertCircle className="w-3.5 h-3.5" />
+                                        Liquidation
+                                      </span>
+                                      <span className={cn(
+                                        'font-mono font-bold',
+                                        selectedOutcome === 'YES' ? 'text-short' : 'text-long'
+                                      )}>
+                                        ${leverageStats.liquidationPrice.toFixed(3)}
+                                      </span>
+                                    </div>
+                                  </div>
+                                )}
+
+                                {/* Warning */}
+                                {leverage > 1 && (
+                                  <p className="text-[10px] text-text-muted text-center mb-3">
+                                    {leverage}x leverage means {leverage}x gains <em>and</em> {leverage}x losses.
+                                    Position liquidates at ${leverageStats.liquidationPrice.toFixed(2)}.
+                                  </p>
+                                )}
+
+                                {/* Confirm button */}
+                                <button
+                                  onClick={() => setShowLeverage(false)}
+                                  className="w-full py-2.5 bg-accent text-background rounded-lg font-bold hover:shadow-lg hover:shadow-accent/30 transition-all"
+                                >
+                                  {leverage > 1 ? `Use ${leverage}x Leverage` : 'No Leverage'}
+                                </button>
+                              </div>
+                            </div>
+                          )}
 
                           {/* Trade Button */}
                           {connected ? (
@@ -834,7 +1140,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                               <button
                                 onClick={() => approveDelegation()}
                                 disabled={isApproving}
-                                className="w-full py-2.5 rounded-lg font-bold text-base bg-accent text-background hover:shadow-md hover:shadow-accent/30 transition-all flex items-center justify-center gap-2"
+                                className="w-full py-2.5 rounded-lg font-bold text-sm bg-accent text-background hover:shadow-md hover:shadow-accent/30 transition-all flex items-center justify-center gap-2"
                               >
                                 {isApproving ? (
                                   <>
@@ -853,7 +1159,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                                 onClick={handleQuickTrade}
                                 disabled={isPlacing || orderStatus === 'success' || estimatedContracts <= 0 || (orderType === 'limit' && (limitPriceNum <= 0 || limitPriceNum >= 1))}
                                 className={cn(
-                                  'w-full py-2.5 rounded-lg font-bold text-base transition-all flex items-center justify-center gap-2',
+                                  'w-full py-2.5 rounded-lg font-bold text-sm transition-all flex items-center justify-center gap-2',
                                   selectedOutcome === 'YES'
                                     ? 'bg-long text-background hover:shadow-md hover:shadow-long/30'
                                     : 'bg-short text-background hover:shadow-md hover:shadow-short/30',
@@ -878,7 +1184,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                               </button>
                             )
                           ) : (
-                            <WalletButton className="!w-full !justify-center !bg-accent !text-background hover:!bg-accent-dim !rounded-lg !font-bold !h-11 !text-base" />
+                            <WalletButton className="!w-full !justify-center !bg-accent !text-background hover:!bg-accent-dim !rounded-lg !font-bold !h-10 !text-sm" />
                           )}
                         </>
                       )}
@@ -945,6 +1251,7 @@ function PriceSelectorBox({
   oneClickAmount = 0,
   isLoading = false,
   isActivating = false,
+  onAmountClick,
 }: {
   label: string;
   price: number;
@@ -956,6 +1263,7 @@ function PriceSelectorBox({
   oneClickAmount?: number;
   isLoading?: boolean;
   isActivating?: boolean;
+  onAmountClick?: () => void;
 }) {
   const isDisabled = isLoading || isActivating;
   
@@ -1015,7 +1323,13 @@ function PriceSelectorBox({
       {/* Right: Label */}
       <div className="flex items-center gap-2">
         {oneClickEnabled && !isActivating && (
-          <span className="text-[10px] text-warning font-medium px-1.5 py-0.5 bg-warning/10 rounded">
+          <span 
+            onClick={(e) => {
+              e.stopPropagation();
+              onAmountClick?.();
+            }}
+            className="text-[10px] text-warning font-medium px-1.5 py-0.5 bg-warning/10 rounded cursor-pointer hover:bg-warning/20 transition-colors"
+          >
             ⚡ ${oneClickAmount}
           </span>
         )}

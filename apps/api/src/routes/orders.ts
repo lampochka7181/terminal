@@ -8,6 +8,10 @@ import { marketService } from '../services/market.service.js';
 import { userService } from '../services/user.service.js';
 import { positionService } from '../services/position.service.js';
 import { matchingService } from '../services/matching.service.js';
+import { feeService, calculateTakerFee } from '../services/fee.service.js';
+import { sessionService } from '../services/session.service.js';
+import { marginService, leverageCalc } from '../services/margin.service.js';
+import { lendingService } from '../services/lending.service.js';
 import { logger, orderLogger, logEvents } from '../lib/logger.js';
 import { config } from '../config.js';
 
@@ -55,10 +59,14 @@ export async function orderRoutes(app: FastifyInstance) {
     size: z.number().min(0.001).max(100000),
     expiry: z.number(),
     clientOrderId: z.number(),
-    dollarAmount: z.number().min(1).max(1000000).optional(),
+    dollarAmount: z.number().min(0.02).max(1000000).optional(), // Min $0.02 for sells
     maxPrice: z.number().min(0.01).max(0.99).optional(),
     signature: z.string(),
     binaryMessage: z.string(),
+    sessionPublicKey: z.string().min(32).max(64).optional(), // For session-signed orders
+    // Leverage parameters
+    leverage: z.number().min(1).max(config.leverage.maxLeverage).optional().default(1), // 1x = no leverage
+    marginAmount: z.number().min(0).optional(), // User's margin (required if leverage > 1)
   });
 
   app.post('/notify', async (request: FastifyRequest, reply: FastifyReply) => {
@@ -79,6 +87,47 @@ export async function orderRoutes(app: FastifyInstance) {
     }
 
     const data = body.data;
+    
+    // ========================================
+    // SIGNATURE VERIFICATION
+    // ========================================
+    // If sessionPublicKey is provided, verify against session service
+    // Otherwise, the signature was from the wallet directly (verified by JWT auth)
+    if (data.sessionPublicKey) {
+      // Decode the order data from binaryMessage
+      let orderData: Record<string, unknown>;
+      try {
+        const messageJson = Buffer.from(data.binaryMessage, 'base64').toString('utf-8');
+        orderData = JSON.parse(messageJson);
+      } catch {
+        return reply.code(400).send({
+          error: { code: 'INVALID_MESSAGE', message: 'Invalid order message format' },
+        });
+      }
+      
+      // Verify session signature
+      const sessionVerify = sessionService.verifySessionSignature(
+        data.sessionPublicKey,
+        orderData,
+        data.signature
+      );
+      
+      if (!sessionVerify.valid) {
+        return reply.code(401).send({
+          error: { code: 'INVALID_SESSION', message: sessionVerify.error || 'Session signature verification failed' },
+        });
+      }
+      
+      // Verify session belongs to the authenticated user
+      if (sessionVerify.walletAddress !== wallet) {
+        return reply.code(403).send({
+          error: { code: 'SESSION_MISMATCH', message: 'Session does not belong to authenticated user' },
+        });
+      }
+      
+      logger.debug(`[Orders] Session-signed order from ${wallet.slice(0, 8)}... (session: ${data.sessionPublicKey.slice(0, 8)}...)`);
+    }
+    
     const market = await marketService.getByPubkey(data.marketAddress);
     if (!market) {
       return reply.code(404).send({
@@ -86,7 +135,7 @@ export async function orderRoutes(app: FastifyInstance) {
       });
     }
 
-    // Profitability check
+    // Calculate notional value for validation
     let notionalValue = data.price * data.size;
     if (data.type.toUpperCase() === 'MARKET') {
       if (data.dollarAmount && data.dollarAmount > 0) {
@@ -99,11 +148,15 @@ export async function orderRoutes(app: FastifyInstance) {
       }
     }
 
-    if (notionalValue < config.minNotionalValue) {
+    // Minimum order validation (different for buy vs sell)
+    // bid = buying contracts, ask = selling contracts
+    const orderSide = data.side === 'bid' ? 'buy' : 'sell';
+    const minValidation = feeService.validateOrderMinimum(notionalValue, orderSide);
+    if (!minValidation.valid) {
       return reply.code(400).send({
         error: { 
           code: 'ORDER_TOO_SMALL', 
-          message: `Minimum order value is $${config.minNotionalValue.toFixed(2)}. Your order is only $${notionalValue.toFixed(2)}.`,
+          message: minValidation.message || `Minimum ${orderSide} order is $${minValidation.minimum.toFixed(2)}. Your order is only $${notionalValue.toFixed(2)}.`,
         },
       });
     }
@@ -161,8 +214,72 @@ export async function orderRoutes(app: FastifyInstance) {
     }
     
     // 2. BUY order logic (Limit or Dollar-based Market)
-    const feeMultiplier = 1 + (config.takerFeeBps / 10000);
-    const requiredAmount = (data.dollarAmount || (data.price * data.size)) * feeMultiplier;
+    // Calculate fee using tiered fee structure
+    const orderNotional = data.dollarAmount || (data.price * data.size);
+    const feeCalc = calculateTakerFee(orderNotional);
+    
+    // ========================================
+    // LEVERAGE VALIDATION
+    // ========================================
+    const leverage = data.leverage || 1;
+    const isLeveraged = leverage > 1;
+    
+    // DEBUG: Log leverage info for all orders
+    logger.info(`[Orders] Leverage check: received=${data.leverage}, using=${leverage}, isLeveraged=${isLeveraged}, marginAmount=${data.marginAmount}`);
+    let loanAmount = 0;
+    let marginRequired = 0;
+    
+    if (isLeveraged) {
+      // Check if leverage is enabled
+      if (!lendingService.isEnabled()) {
+        return reply.code(503).send({
+          error: { code: 'LEVERAGE_DISABLED', message: 'Leverage trading is not enabled' },
+        });
+      }
+      
+      // Calculate margin and loan amounts
+      marginRequired = leverageCalc.initialMarginRequired(orderNotional, leverage);
+      loanAmount = leverageCalc.loanAmount(orderNotional, leverage);
+      
+      // Validate minimum margin
+      if (marginRequired < config.leverage.minMarginUsd) {
+        return reply.code(400).send({
+          error: { 
+            code: 'MARGIN_TOO_SMALL', 
+            message: `Minimum margin is $${config.leverage.minMarginUsd}. Your margin ($${marginRequired.toFixed(2)}) is too small for ${leverage}x leverage.`,
+          },
+        });
+      }
+      
+      // Validate margin amount provided matches required
+      if (data.marginAmount !== undefined && Math.abs(data.marginAmount - marginRequired) > 0.01) {
+        return reply.code(400).send({
+          error: { 
+            code: 'MARGIN_MISMATCH', 
+            message: `Provided margin ($${data.marginAmount.toFixed(2)}) doesn't match required margin ($${marginRequired.toFixed(2)}) for ${leverage}x leverage.`,
+          },
+        });
+      }
+      
+      // Check if lending pool can provide the loan
+      const loanCheck = await lendingService.canMakeLoan(loanAmount, userId);
+      if (!loanCheck.canLoan) {
+        return reply.code(400).send({
+          error: { 
+            code: 'LOAN_UNAVAILABLE', 
+            message: loanCheck.reason || `Cannot borrow $${loanAmount.toFixed(2)} - max available: $${loanCheck.maxLoan.toFixed(2)}`,
+          },
+        });
+      }
+      
+      logger.info(`[Orders] Leveraged order: ${leverage}x, margin=$${marginRequired.toFixed(2)}, loan=$${loanAmount.toFixed(2)}`);
+    }
+    
+    // For leveraged orders, user only needs to have margin + fees (loan covers the rest)
+    const requiredAmount = isLeveraged 
+      ? marginRequired + feeCalc.fee 
+      : orderNotional + feeCalc.fee;
+    
     const delCheck = await matchingService.checkDelegation(userId, requiredAmount);
     
     if (!delCheck.isApproved || delCheck.error) {
@@ -181,6 +298,10 @@ export async function orderRoutes(app: FastifyInstance) {
         expiresAt: data.expiry * 1000,
         signature: data.signature,
         binaryMessage: data.binaryMessage,
+        // Leverage fields (for on-chain execution through Lending Pool)
+        leverage: isLeveraged ? leverage : undefined,
+        marginAmount: isLeveraged ? marginRequired : undefined,
+        loanAmount: isLeveraged ? loanAmount : undefined,
       });
       
       logEvents.orderPlaced({
@@ -189,12 +310,45 @@ export async function orderRoutes(app: FastifyInstance) {
         side: 'BID', outcome: outcomeUpper, price: data.price, size: data.size, orderType: 'LIMIT',
       });
       
+      // Create margin account if leveraged and order filled
+      let marginAccountId: string | null = null;
+      if (isLeveraged && result.filledSize > 0) {
+        try {
+          // Get the position that was created/updated
+          const position = await positionService.getPosition(userId, market.id);
+          if (position) {
+            const filledNotional = result.filledSize * data.price;
+            const actualMargin = leverageCalc.initialMarginRequired(filledNotional, leverage);
+            const actualLoan = leverageCalc.loanAmount(filledNotional, leverage);
+            
+            const marginAccount = await marginService.createMarginAccount({
+              userId,
+              positionId: position.id,
+              marketId: market.id,
+              side: outcomeUpper,
+              shares: result.filledSize,
+              entryPrice: data.price,
+              leverage,
+              marginDeposited: actualMargin,
+              loanAmount: actualLoan,
+            });
+            marginAccountId = marginAccount.id;
+            logger.info(`[Orders] Created margin account ${marginAccountId} for ${leverage}x leveraged position`);
+          }
+        } catch (err: any) {
+          logger.error(`[Orders] Failed to create margin account for leveraged order: ${err.message}`);
+          // Don't fail the order - margin account can be created manually
+        }
+      }
+      
       return {
         orderId: result.orderId,
         status: result.status,
         fills: result.fills.length,
         filledSize: result.filledSize,
         createdAt: Date.now(),
+        leverage: isLeveraged ? leverage : undefined,
+        marginAccountId: marginAccountId || undefined,
       };
     } else if (isMarketOrder && data.dollarAmount) {
       const result = await matchingService.processMarketOrderByDollar({
@@ -208,6 +362,10 @@ export async function orderRoutes(app: FastifyInstance) {
         expiresAt: data.expiry * 1000,
         signature: data.signature,
         binaryMessage: data.binaryMessage,
+        // Leverage fields (for on-chain execution through Lending Pool)
+        leverage: isLeveraged ? leverage : undefined,
+        marginAmount: isLeveraged ? marginRequired : undefined,
+        loanAmount: isLeveraged ? loanAmount : undefined,
       });
       
       logEvents.orderPlaced({
@@ -216,6 +374,35 @@ export async function orderRoutes(app: FastifyInstance) {
         side: 'BID', outcome: outcomeUpper, price: result.avgPrice, size: result.totalContracts, orderType: 'MARKET',
       });
       
+      // Create margin account if leveraged and order filled
+      let marginAccountId: string | null = null;
+      if (isLeveraged && result.totalContracts > 0) {
+        try {
+          const position = await positionService.getPosition(userId, market.id);
+          if (position) {
+            const filledNotional = result.totalSpent; // Total spent (not including fee)
+            const actualMargin = leverageCalc.initialMarginRequired(filledNotional, leverage);
+            const actualLoan = leverageCalc.loanAmount(filledNotional, leverage);
+            
+            const marginAccount = await marginService.createMarginAccount({
+              userId,
+              positionId: position.id,
+              marketId: market.id,
+              side: outcomeUpper,
+              shares: result.totalContracts,
+              entryPrice: result.avgPrice,
+              leverage,
+              marginDeposited: actualMargin,
+              loanAmount: actualLoan,
+            });
+            marginAccountId = marginAccount.id;
+            logger.info(`[Orders] Created margin account ${marginAccountId} for ${leverage}x leveraged market order`);
+          }
+        } catch (err: any) {
+          logger.error(`[Orders] Failed to create margin account for leveraged market order: ${err.message}`);
+        }
+      }
+      
       return {
         orderId: result.orderId,
         status: result.totalContracts > 0 ? (result.unfilledDollars > 0.01 ? 'partial' : 'filled') : 'cancelled',
@@ -223,6 +410,8 @@ export async function orderRoutes(app: FastifyInstance) {
         filledSize: result.totalContracts,
         avgPrice: result.avgPrice,
         createdAt: Date.now(),
+        leverage: isLeveraged ? leverage : undefined,
+        marginAccountId: marginAccountId || undefined,
       };
     }
 

@@ -228,6 +228,28 @@ export function broadcastUserSettlement(
 }
 
 /**
+ * Broadcast liquidation event to the user
+ * This triggers the frontend to refresh their positions
+ */
+export function broadcastUserLiquidation(
+  userId: string,
+  liquidation: {
+    marketId: string;
+    marketAddress: string;
+    side: 'YES' | 'NO';
+    shares: number;
+    entryPrice: number;
+    liquidationPrice: number;
+    executionPrice: number;
+    proceeds: number;
+    returnedToUser: number;
+    leverage: number;
+  }
+): void {
+  broadcastToUser(userId, 'liquidation', liquidation);
+}
+
+/**
  * Broadcast market activation (strike price set, trading now enabled)
  * This allows frontends to immediately update without waiting for polling
  */

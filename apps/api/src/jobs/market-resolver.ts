@@ -1,7 +1,6 @@
 import { marketService } from '../services/market.service.js';
 import { orderbookService } from '../services/orderbook.service.js';
 import { orderService } from '../services/order.service.js';
-import { positionService } from '../services/position.service.js';
 import { priceFeedService } from '../services/price-feed.service.js';
 import { logger, marketLogger, logEvents } from '../lib/logger.js';
 import { broadcastMarketResolved } from '../lib/broadcasts.js';
@@ -155,77 +154,6 @@ async function resolveMarket(
   
   // Determine outcome: YES if price > strike, NO if price <= strike
   const outcome: 'YES' | 'NO' = finalPrice > strike ? 'YES' : 'NO';
-
-  // OPTIMIZATION: Check if any positions actually exist
-  const positions = await positionService.getPositionsForSettlement(marketId);
-  const hasActivity = positions.length > 0;
-
-  if (!hasActivity) {
-    logger.info(`Market ${marketId} (${market.asset}-${market.timeframe}) has 0 positions. Skipping on-chain resolution to save gas.`);
-    
-    // Update market with outcome in database only
-    await marketService.resolve(marketId, outcome, finalPrice.toString());
-    
-    // Mark as settled immediately since there's nothing to settle
-    await marketService.markSettled(marketId);
-    
-    // Broadcast resolution event for UI consistency
-    broadcastMarketResolved(marketPubkey, outcome, finalPrice, strike);
-
-    // Recover relayer-paid rent for empty/no-trade markets immediately.
-    // This closes the on-chain market + vault (if they exist) and returns rent to the relayer.
-    if (anchorClient.isReady()) {
-      try {
-        // Diagnostic: verify the market account exists on-chain before attempting close.
-        // This helps distinguish "DB-only market / wrong cluster" from "close_market failed".
-        try {
-          const conn = anchorClient.getConnection();
-          const pk = new (await import('@solana/web3.js')).PublicKey(market.pubkey);
-          const info = await conn.getAccountInfo(pk, 'confirmed');
-          if (!info) {
-            logger.warn(`Empty market ${marketId} market PDA not found on RPC at close time: ${market.pubkey}`);
-          } else {
-            logger.info(
-              `Empty market ${marketId} market PDA exists on-chain: lamports=${info.lamports} owner=${info.owner.toBase58()} dataLen=${info.data.length}`
-            );
-          }
-        } catch (diagErr: any) {
-          logger.debug(`Empty market ${marketId} on-chain existence check failed: ${diagErr?.message || diagErr}`);
-        }
-
-        const sig = await anchorClient.closeMarket({ marketPubkey: market.pubkey });
-        logger.info(`🧹 Empty market rent recovered on-chain: ${sig}`);
-        await marketService.markArchived(marketId);
-      } catch (err: any) {
-        const errorMsg = err?.message || '';
-        // If the market account doesn't exist on-chain, archive it to stop retry loops.
-        // NOTE: 0xbc4 / AccountNotInitialized can also be thrown for *other* accounts
-        // (e.g. relayer_usdc). Only treat as "missing market" if the message indicates that,
-        // otherwise keep it for retry.
-        const isMissingMarketAccount =
-          errorMsg.includes('AccountNotFound') ||
-          (errorMsg.includes('AccountNotInitialized') && errorMsg.toLowerCase().includes('market')) ||
-          (errorMsg.includes('0xbc4') && errorMsg.toLowerCase().includes('market'));
-
-        const isRelayerUsdcMissing =
-          errorMsg.includes('AccountNotInitialized') && errorMsg.includes('relayer_usdc');
-
-        if (isMissingMarketAccount) {
-          logger.warn(`Empty market ${marketId} (${market.pubkey}) missing on-chain; archiving in DB (err=${errorMsg})`);
-          await marketService.markArchived(marketId);
-        } else if (isRelayerUsdcMissing) {
-          logger.warn(`Empty market ${marketId} close_market blocked (relayer_usdc ATA missing). Will retry after ATA creation: ${errorMsg}`);
-        } else if (errorMsg.includes('VaultNotEmpty') || errorMsg.includes('0x17c8')) {
-          // Safety: do not close if there are still escrowed funds; leave for investigation.
-          logger.warn(`Empty market ${marketId} close_market blocked (vault not empty). Leaving unarchived: ${errorMsg}`);
-        } else {
-          logger.warn(`Empty market ${marketId} close_market failed (will retry via Market Closer): ${errorMsg}`);
-        }
-      }
-    }
-
-    return;
-  }
 
   // PIPELINED: Start on-chain resolve AND fetch settlement data in parallel
   let onChainResolvePending: Promise<string | null> | null = null;

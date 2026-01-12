@@ -15,6 +15,12 @@ pub enum DegenError {
     #[msg("Invalid fee configuration")]
     InvalidFeeConfig,
     
+    #[msg("Fee too low - below minimum required")]
+    FeeTooLow,
+    
+    #[msg("Fee too high - exceeds maximum allowed")]
+    FeeTooHigh,
+    
     // =========================================================================
     // Market Errors (6010-6029)
     // =========================================================================

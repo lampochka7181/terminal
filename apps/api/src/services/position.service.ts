@@ -1,6 +1,7 @@
 import { eq, and, sql } from 'drizzle-orm';
-import { db, positions, markets, settlements, type Position, type NewPosition } from '../db/index.js';
+import { db, positions, markets, settlements, marginAccounts, type Position, type NewPosition } from '../db/index.js';
 import { logger } from '../lib/logger.js';
+import { lendingService } from './lending.service.js';
 
 export interface PositionWithMarket extends Position {
   market?: {
@@ -189,11 +190,45 @@ export class PositionService {
 
   /**
    * Settle a position
+   * Also handles margin accounts - repays loans when leveraged positions settle
    */
   async settlePosition(
     positionId: string,
     payout: number
   ): Promise<void> {
+    // Check if this position has a margin account (leveraged position)
+    const [marginAccount] = await db
+      .select()
+      .from(marginAccounts)
+      .where(and(
+        eq(marginAccounts.positionId, positionId),
+        eq(marginAccounts.status, 'OPEN')
+      ))
+      .limit(1);
+    
+    // If there's an open margin account, repay the loan
+    if (marginAccount) {
+      const loanAmount = parseFloat(marginAccount.loanAmount);
+      
+      if (loanAmount > 0) {
+        // Repay the loan from the payout
+        await lendingService.recordRepayment(loanAmount);
+        logger.info(`Loan repaid on settlement: $${loanAmount.toFixed(2)} for position ${positionId}`);
+      }
+      
+      // Close the margin account
+      await db
+        .update(marginAccounts)
+        .set({
+          status: 'CLOSED',
+          updatedAt: new Date(),
+        })
+        .where(eq(marginAccounts.id, marginAccount.id));
+      
+      logger.info(`Closed margin account ${marginAccount.id} on position settlement`);
+    }
+    
+    // Mark position as settled
     await db
       .update(positions)
       .set({

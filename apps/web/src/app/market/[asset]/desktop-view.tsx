@@ -7,8 +7,9 @@ import { Header } from '@/components/layout/Header';
 import { usePrices } from '@/hooks/usePrices';
 import { useMarkets } from '@/hooks/useMarkets';
 import { useAuth } from '@/hooks/useAuth';
-import { useQuickOrder } from '@/hooks/useOrder';
+import { useQuickOrder, type SessionSigner } from '@/hooks/useOrder';
 import { useDelegation } from '@/hooks/useDelegation';
+import { useSessionKey } from '@/hooks/useSessionKey';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { cn } from '@/lib/utils';
 import { 
@@ -46,7 +47,19 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   const { isAuthenticated, signIn, isAuthenticating } = useAuth();
   const { selectedTimeframe, setTimeframe, setAsset } = useMarketStore();
   const { isApproved: isDelegationApproved, isApproving, approve: approveDelegation, delegatedAmount } = useDelegation();
-  const { oneClickEnabled, oneClickAmount, confirmTrades, soundEnabled } = useSettingsStore();
+  const { oneClickEnabled, oneClickAmount, soundEnabled } = useSettingsStore();
+  
+  // Session key for instant trading (no wallet popups)
+  const { isActive: isSessionActive, publicKey: sessionPublicKey, signOrder, createSession, revokeSession, isCreating: isCreatingSession, getTimeRemaining } = useSessionKey();
+  
+  // Create session signer if session is active
+  const sessionSigner: SessionSigner | undefined = useMemo(() => {
+    if (!isSessionActive || !sessionPublicKey) return undefined;
+    return {
+      publicKey: sessionPublicKey,
+      sign: signOrder,
+    };
+  }, [isSessionActive, sessionPublicKey, signOrder]);
 
   // Ensure store matches URL asset
   useEffect(() => {
@@ -104,8 +117,8 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   } | null>(null);
   const [sellSize, setSellSize] = useState('');
 
-  // Use the order hook
-  const { placeOrder, isPlacing, error: orderError, clearError } = useQuickOrder();
+  // Use the order hook - pass session signer for instant trading
+  const { placeOrder, isPlacing, error: orderError, clearError } = useQuickOrder(sessionSigner);
 
   // Calculate estimates using REAL-TIME orderbook prices directly from store
   // SINGLE ORDERBOOK MODEL: Prices reflect ACTUAL execution cost
@@ -150,14 +163,9 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   // One-click trading state
   const [oneClickOutcome, setOneClickOutcome] = useState<'YES' | 'NO' | null>(null);
 
-  // One-click trading handler
+  // One-click trading handler - no confirmation needed since user explicitly enabled one-click mode
   const handleOneClickTrade = useCallback(async (outcome: 'YES' | 'NO', price: number) => {
     if (!connected || !activeMarket || !isDelegationApproved || !oneClickEnabled) return;
-    
-    // Optional confirmation
-    if (confirmTrades && !window.confirm(`Quick trade: Buy $${oneClickAmount} of ${outcome === 'YES' ? 'ABOVE' : 'BELOW'} @ $${price.toFixed(2)}?`)) {
-      return;
-    }
 
     setOneClickOutcome(outcome);
     clearError();
@@ -214,7 +222,7 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
         setOneClickOutcome(null);
       }, 3000);
     }
-  }, [connected, activeMarket, isDelegationApproved, oneClickEnabled, oneClickAmount, confirmTrades, soundEnabled, placeOrder, clearError]);
+  }, [connected, activeMarket, isDelegationApproved, oneClickEnabled, oneClickAmount, soundEnabled, placeOrder, clearError]);
 
   const handleQuickTrade = async () => {
     // Sell mode

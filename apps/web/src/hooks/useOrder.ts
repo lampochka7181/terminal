@@ -1,20 +1,18 @@
 /**
  * useOrder Hook
- * Handles on-chain order placement with transaction signing
+ * Handles order placement with wallet or session key signing
  * 
- * This hook implements the trustless order flow where users sign
- * real Solana transactions that create Order PDAs on-chain.
+ * Supports two signing modes:
+ * 1. Wallet signing - user signs each order (popup per order)
+ * 2. Session key signing - ephemeral key signs orders (no popup, instant)
  */
 
 import { useState, useCallback } from 'react';
 import { useWallet, useConnection } from '@solana/wallet-adapter-react';
-import { PublicKey } from '@solana/web3.js';
 import { useAuthStore } from '@/stores/authStore';
 import { useUserStore } from '@/stores/userStore';
 import { api, ApiError } from '@/lib/api';
-import {
-  submitCancelOrder,
-} from '@/lib/order-builder';
+import { submitCancelOrder } from '@/lib/order-builder';
 import { validatePrice, validateSize } from '@/lib/solana';
 
 export interface PlaceOrderParams {
@@ -22,14 +20,21 @@ export interface PlaceOrderParams {
   side: 'bid' | 'ask';
   outcome: 'yes' | 'no';
   orderType: 'limit' | 'market';
-  price: number;  // For LIMIT: exact price. For MARKET: max price willing to pay
-  size: number;   // For LIMIT: exact contracts. For MARKET: estimated contracts
+  price: number;
+  size: number;
   expiryTimestamp?: number;
-  // MARKET order specific
-  dollarAmount?: number;  // Total USD to spend (MARKET orders)
-  maxPrice?: number;      // Price protection limit (MARKET orders)
-  // Delegation mode (skip on-chain order, use relayer delegation)
+  dollarAmount?: number;
+  maxPrice?: number;
   useDelegation?: boolean;
+  // Leverage params
+  leverage?: number; // 1-10, default 1 (no leverage)
+  marginAmount?: number; // User's margin (required if leverage > 1)
+}
+
+// Session signer interface - allows session key to sign orders
+export interface SessionSigner {
+  publicKey: string;
+  sign: (orderData: Record<string, unknown>) => string | null;
 }
 
 export interface OrderResult {
@@ -39,27 +44,23 @@ export interface OrderResult {
   status: 'open' | 'partial' | 'filled' | 'cancelled';
   fills: number;
   filledSize: number;
-  // MARKET order specific results
   totalSpent?: number;
   avgPrice?: number;
   unfilledDollars?: number;
 }
 
 export interface UseOrderReturn {
-  // State
   isPlacing: boolean;
   isCancelling: boolean;
   error: string | null;
   lastOrder: OrderResult | null;
-  
-  // Actions
   placeOrder: (params: PlaceOrderParams) => Promise<OrderResult | null>;
   cancelOrder: (orderId: string, orderPda?: string) => Promise<boolean>;
   cancelAllOrders: (marketAddress?: string) => Promise<number>;
   clearError: () => void;
 }
 
-export function useOrder(): UseOrderReturn {
+export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
   const { publicKey, signTransaction, signMessage, connected } = useWallet();
   const { connection } = useConnection();
   const { isAuthenticated, token } = useAuthStore();
@@ -70,10 +71,10 @@ export function useOrder(): UseOrderReturn {
   const [lastOrder, setLastOrder] = useState<OrderResult | null>(null);
 
   /**
-   * Place a new order (on-chain transaction)
+   * Place a new order
+   * Uses session key if available (no popup), otherwise wallet signing (popup)
    */
   const placeOrder = useCallback(async (params: PlaceOrderParams): Promise<OrderResult | null> => {
-    // Validate wallet connection
     if (!connected || !publicKey) {
       setError('Please connect your wallet');
       return null;
@@ -84,20 +85,17 @@ export function useOrder(): UseOrderReturn {
       return null;
     }
 
-    // Validate authentication
     if (!isAuthenticated || !token) {
       setError('Please sign in to place orders');
       return null;
     }
 
-    // Validate price
     const priceValidation = validatePrice(params.price);
     if (!priceValidation.valid) {
       setError(priceValidation.error || 'Invalid price');
       return null;
     }
 
-    // Validate size
     const sizeValidation = validateSize(params.size);
     if (!sizeValidation.valid) {
       setError(sizeValidation.error || 'Invalid size');
@@ -108,39 +106,17 @@ export function useOrder(): UseOrderReturn {
     setError(null);
 
     try {
-      // Set expiry to market close or 1 hour from now (whichever is sooner)
       const expiryTimestamp = params.expiryTimestamp || Math.floor(Date.now() / 1000) + 3600;
       const clientOrderId = Date.now();
-
-      // ========================================
-      // DELEGATED ORDER (Fast Mode)
-      // ========================================
       const isSellOrder = params.side === 'ask';
       const isMarketOrder = params.orderType === 'market';
-      
-      const orderTypeLabel = isSellOrder ? 'SELL' : isMarketOrder ? 'MARKET BUY' : 'LIMIT BUY';
-      console.log('[Order] Using fast mode for', orderTypeLabel, 'order');
-
-      // Sign authorization message
-      if (!signMessage) {
-        setError('Wallet does not support message signing');
-        return null;
-      }
-
-      // Create human-readable message for wallet display
       const outcomeLabel = params.outcome.toUpperCase();
-      let humanMessage: string;
+      
+      // Build order data
       let orderData: Record<string, unknown>;
-
+      const isLeveraged = params.leverage && params.leverage > 1;
+      
       if (isSellOrder) {
-        humanMessage = `Degen Terminal - MARKET SELL
-
-Sell ${params.size.toFixed(2)} ${outcomeLabel} Contracts
-Type: Market Order (best available price)
-
-Market: ${params.marketAddress.slice(0, 8)}...
-Order ID: ${clientOrderId}
-Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         orderData = {
           action: 'sell_order',
           market: params.marketAddress,
@@ -153,15 +129,6 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
           timestamp: Date.now(),
         };
       } else if (isMarketOrder && params.dollarAmount) {
-        humanMessage = `Degen Terminal - MARKET Order
-
-Buy ${outcomeLabel} Contracts
-Amount: $${params.dollarAmount} USDC
-Max Price: $${params.maxPrice?.toFixed(2) || '0.99'}
-
-Market: ${params.marketAddress.slice(0, 8)}...
-Order ID: ${clientOrderId}
-Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         orderData = {
           action: 'market_order',
           market: params.marketAddress,
@@ -172,17 +139,9 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
           expiry: expiryTimestamp,
           clientOrderId,
           timestamp: Date.now(),
+          ...(isLeveraged && { leverage: params.leverage, marginAmount: params.marginAmount }),
         };
       } else {
-        // LIMIT order
-        humanMessage = `Degen Terminal - LIMIT Order
-
-Buy ${params.size.toFixed(2)} ${outcomeLabel} Contracts
-Limit Price: $${params.price.toFixed(2)}
-
-Market: ${params.marketAddress.slice(0, 8)}...
-Order ID: ${clientOrderId}
-Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         orderData = {
           action: 'limit_order',
           market: params.marketAddress,
@@ -193,19 +152,104 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
           expiry: expiryTimestamp,
           clientOrderId,
           timestamp: Date.now(),
+          ...(isLeveraged && { leverage: params.leverage, marginAmount: params.marginAmount }),
         };
       }
 
-      // Combine human + machine readable
-      const fullMessage = `${humanMessage}\n\n---\n${JSON.stringify(orderData)}`;
+      let signature: string;
+      let binaryMessage: string;
+      let sessionPublicKey: string | undefined;
+      let useSessionSigning = false;
 
-      const messageBytes = new TextEncoder().encode(fullMessage);
-      const signatureBytes = await signMessage(messageBytes);
-      const signature = Buffer.from(signatureBytes).toString('base64');
+      // ========================================
+      // TRY SESSION KEY SIGNING (No popup - instant!)
+      // ========================================
+      console.log('[Order] Session signer check:', { 
+        hasSessionSigner: !!sessionSigner, 
+        sessionPubkey: sessionSigner?.publicKey?.slice(0, 8) 
+      });
+      
+      if (sessionSigner) {
+        const sessionSignature = sessionSigner.sign(orderData);
+        console.log('[Order] Session signature result:', !!sessionSignature);
+        
+        if (sessionSignature) {
+          signature = sessionSignature;
+          binaryMessage = Buffer.from(JSON.stringify(orderData)).toString('base64');
+          sessionPublicKey = sessionSigner.publicKey;
+          useSessionSigning = true;
+          
+          const orderTypeLabel = isSellOrder ? 'SELL' : isMarketOrder ? 'MARKET BUY' : 'LIMIT BUY';
+          console.log('[Order] ✅ Session key signed', orderTypeLabel, 'order (no popup)');
+        } else {
+          console.warn('[Order] Session sign returned null, falling back to wallet signing');
+        }
+      }
+      
+      // ========================================
+      // WALLET SIGNING (Popup per order) - fallback
+      // ========================================
+      if (!useSessionSigning) {
+        if (!signMessage) {
+          setError('Wallet does not support message signing');
+          return null;
+        }
 
-      console.log('[Order] Signed authorization message');
+        const orderTypeLabel = isSellOrder ? 'SELL' : isMarketOrder ? 'MARKET BUY' : 'LIMIT BUY';
+        console.log('[Order] Wallet signing', orderTypeLabel, 'order (popup)');
 
-      // Notify backend
+        // Create human-readable message for wallet display
+        let humanMessage: string;
+        
+        if (isSellOrder) {
+          humanMessage = `Degen Terminal - MARKET SELL
+
+Sell ${params.size.toFixed(2)} ${outcomeLabel} Contracts
+Type: Market Order (best available price)
+
+Market: ${params.marketAddress.slice(0, 8)}...
+Order ID: ${clientOrderId}
+Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
+        } else if (isMarketOrder && params.dollarAmount) {
+          humanMessage = `Degen Terminal - MARKET Order
+
+Buy ${outcomeLabel} Contracts
+Amount: $${params.dollarAmount} USDC
+Max Price: $${params.maxPrice?.toFixed(2) || '0.99'}
+
+Market: ${params.marketAddress.slice(0, 8)}...
+Order ID: ${clientOrderId}
+Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
+        } else {
+          humanMessage = `Degen Terminal - LIMIT Order
+
+Buy ${params.size.toFixed(2)} ${outcomeLabel} Contracts
+Limit Price: $${params.price.toFixed(2)}
+
+Market: ${params.marketAddress.slice(0, 8)}...
+Order ID: ${clientOrderId}
+Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
+        }
+
+        // Combine human + machine readable
+        const fullMessage = `${humanMessage}\n\n---\n${JSON.stringify(orderData)}`;
+        const messageBytes = new TextEncoder().encode(fullMessage);
+        const signatureBytes = await signMessage(messageBytes);
+        
+        signature = Buffer.from(signatureBytes).toString('base64');
+        binaryMessage = Buffer.from(messageBytes).toString('base64');
+        
+        console.log('[Order] Signed authorization message');
+      }
+
+      // Send to backend
+      console.log('[Order] Sending with leverage:', { 
+        leverage: params.leverage, 
+        marginAmount: params.marginAmount,
+        dollarAmount: params.dollarAmount,
+        isLeveraged: params.leverage && params.leverage > 1
+      });
+      
       const response = await api.notifyOrderPlaced({
         marketAddress: params.marketAddress,
         side: params.side,
@@ -218,16 +262,19 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         dollarAmount: params.dollarAmount,
         maxPrice: params.maxPrice,
         signature,
-        binaryMessage: Buffer.from(messageBytes).toString('base64'),
+        binaryMessage,
+        sessionPublicKey, // Include session key if used
+        leverage: params.leverage,
+        marginAmount: params.marginAmount,
       });
 
       console.log('[Order] Order response:', response);
 
-      // Trigger user data refetch to update UI (positions, orders, balance)
+      // Trigger user data refetch
       useUserStore.getState().fetchAll();
 
       const result: OrderResult = {
-        orderId: response.orderId || `delegated-${clientOrderId}`,
+        orderId: response.orderId || `order-${clientOrderId}`,
         orderPda: '',
         txSignature: '',
         status: response.status as 'open' | 'partial' | 'filled' | 'cancelled' || 'filled',
@@ -249,7 +296,6 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
       if (err instanceof ApiError) {
         errorMessage = err.message;
       } else if (err instanceof Error) {
-        // Handle wallet rejection
         if (err.message.includes('User rejected') || err.message.includes('rejected')) {
           errorMessage = 'Transaction was rejected';
         } else if (err.message.includes('insufficient')) {
@@ -267,13 +313,10 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
     } finally {
       setIsPlacing(false);
     }
-  }, [connected, publicKey, signTransaction, connection, isAuthenticated, token]);
+  }, [connected, publicKey, signTransaction, signMessage, isAuthenticated, token, sessionSigner]);
 
   /**
-   * Cancel an existing order (on-chain transaction)
-   * @param orderId - Database order ID
-   * @param orderPda - On-chain Order PDA address (if on-chain order)
-   * @param marketAddress - Market address (required for on-chain cancellation)
+   * Cancel an existing order
    */
   const cancelOrder = useCallback(async (
     orderId: string, 
@@ -299,7 +342,6 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
     setError(null);
 
     try {
-      // If orderPda is provided, cancel on-chain
       if (orderPda && marketAddress) {
         const signature = await submitCancelOrder(
           orderPda,
@@ -311,10 +353,8 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
 
         console.log('[Order] Order cancelled on-chain:', signature);
         
-        // Notify backend
         try {
           await api.cancelOrder(orderId, signature);
-          // Refresh user data after successful cancellation
           useUserStore.getState().fetchAll();
         } catch (apiErr) {
           console.warn('[Order] Backend notification failed, but order cancelled on-chain');
@@ -322,7 +362,6 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
 
         return true;
       } else {
-        // Fallback: use message signing for off-chain orders
         if (!signMessage) {
           setError('Wallet does not support message signing');
           return false;
@@ -331,12 +370,11 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         const message = `Cancel order: ${orderId}`;
         const messageBytes = new TextEncoder().encode(message);
         const signatureBytes = await signMessage(messageBytes);
-        const signature = require('bs58').encode(signatureBytes);
+        const bs58 = await import('bs58');
+        const signature = bs58.default.encode(signatureBytes);
 
         await api.cancelOrder(orderId, signature);
         console.log('[Order] Order cancelled:', orderId);
-        
-        // Refresh user data after successful cancellation
         useUserStore.getState().fetchAll();
         
         return true;
@@ -387,20 +425,17 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
     setError(null);
 
     try {
-      // Sign cancel all message
       const message = marketAddress
         ? `Cancel all orders for market: ${marketAddress}`
         : 'Cancel all orders';
       const messageBytes = new TextEncoder().encode(message);
       const signatureBytes = await signMessage(messageBytes);
-      const signature = require('bs58').encode(signatureBytes);
+      const bs58 = await import('bs58');
+      const signature = bs58.default.encode(signatureBytes);
 
-      // Submit cancellation
       const result = await api.cancelAllOrders(signature, marketAddress);
       
       console.log('[Order] Cancelled orders:', result.cancelledCount);
-      
-      // Refresh user data after successful cancellation
       useUserStore.getState().fetchAll();
       
       return result.cancelledCount;
@@ -440,10 +475,10 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
 }
 
 /**
- * Simple order placement hook with auto sign-in
+ * Quick order hook with auto sign-in and optional session key support
  */
-export function useQuickOrder() {
-  const { placeOrder, isPlacing, error, clearError } = useOrder();
+export function useQuickOrder(sessionSigner?: SessionSigner) {
+  const { placeOrder, isPlacing, error, clearError } = useOrder(sessionSigner);
   const { isAuthenticated, signIn, isAuthenticating } = useAuthStore();
   const { signMessage, publicKey, connected } = useWallet();
 

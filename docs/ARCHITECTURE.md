@@ -380,6 +380,56 @@ Since this is a centralized order book, we need to authenticate users to the API
 
 *Note: Placing an order is different. It requires signing a specific **Transaction Instruction**, not just a login message.*
 
+### Session-Based Trading (One-Click Mode)
+
+For professional traders who want instant order execution without wallet popups for each trade, we support **session-based signing**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      SESSION-BASED TRADING FLOW                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. SESSION SETUP (One-time wallet popup)                                   │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  [Browser] → Generate ephemeral Ed25519 keypair                       │  │
+│  │       │                                                                │  │
+│  │       ▼                                                                │  │
+│  │  [Wallet] → User signs: "I authorize [session_pubkey] until [expiry]" │  │
+│  │       │                                                                │  │
+│  │       ▼                                                                │  │
+│  │  [Backend] → Stores session authorization (maps session → wallet)     │  │
+│  │       │                                                                │  │
+│  │       ▼                                                                │  │
+│  │  [Browser] → Stores session private key in memory/localStorage        │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  2. TRADING (No popups!)                                                    │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  [User] → Clicks "Buy"                                                 │  │
+│  │       │                                                                │  │
+│  │       ▼                                                                │  │
+│  │  [Session Key] → Signs order data instantly (no popup)                │  │
+│  │       │                                                                │  │
+│  │       ▼                                                                │  │
+│  │  [Backend] → Verifies: session authorized by wallet + valid signature │  │
+│  │       │                                                                │  │
+│  │       ▼                                                                │  │
+│  │  [Matching Engine] → Processes order normally                          │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  Session durations: 1 hour, 4 hours (default), or 24 hours                 │
+│  User can revoke session at any time                                        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Security:**
+- Session private key stored in browser memory (or encrypted localStorage)
+- Each order is cryptographically signed (provable authorization)
+- Session can be revoked immediately by user
+- Backend validates session + signature for every order
+- Similar to how Drift, Tensor, and other pro trading platforms work
+
 ## 4. Data Flow: The Trading Lifecycle
 
 ### Order Flow Overview (Hybrid Model)
@@ -708,8 +758,10 @@ Order book entries (both active and historical).
 | `filled_size` | DECIMAL(20,6) | DEFAULT 0 | Amount executed |
 | `remaining_size` | DECIMAL(20,6) | | Computed: size - filled |
 | `status` | VARCHAR(20) | DEFAULT 'OPEN' | OPEN, PARTIAL, FILLED, CANCELLED |
-| `signature` | TEXT | NOT NULL | Ed25519 signed instruction |
-| `encoded_instruction` | TEXT | NOT NULL | Base64 Solana instruction |
+| `signature` | TEXT | | Ed25519 signed instruction (nullable for dollar-based MARKET orders) |
+| `encoded_instruction` | TEXT | | Base64 Solana instruction (nullable for MM orders) |
+| `binary_message` | TEXT | | Base64 encoded binary message for signature verification |
+| `is_mm_order` | BOOLEAN | DEFAULT FALSE | True for Market Maker bot orders |
 | `expires_at` | TIMESTAMP | | Order expiration (GTT) |
 | `created_at` | TIMESTAMP | DEFAULT NOW() | Order submission time |
 | `updated_at` | TIMESTAMP | DEFAULT NOW() | Last fill/cancel time |
@@ -727,7 +779,7 @@ Order book entries (both active and historical).
 ---
 
 ### `trades`
-Executed matches between maker and taker orders.
+Executed matches between maker and taker orders. Each record captures BOTH perspectives of the trade.
 
 | Column | Type | Constraints | Notes |
 | :--- | :--- | :--- | :--- |
@@ -737,16 +789,27 @@ Executed matches between maker and taker orders.
 | `taker_order_id` | UUID | FK → orders.id | Aggressor order |
 | `maker_user_id` | UUID | FK → users.id | Maker's user |
 | `taker_user_id` | UUID | FK → users.id | Taker's user |
-| `outcome` | VARCHAR(10) | NOT NULL | 'YES' or 'NO' |
-| `price` | DECIMAL(10,6) | NOT NULL | Execution price |
-| `size` | DECIMAL(20,6) | NOT NULL | Contracts traded |
-| `notional` | DECIMAL(20,6) | NOT NULL | price × size (USDC) |
-| `maker_fee` | DECIMAL(20,6) | DEFAULT 0 | Fee charged to maker |
+| **Taker's Perspective** | | | |
+| `taker_side` | VARCHAR(10) | NOT NULL | BID or ASK |
+| `taker_outcome` | VARCHAR(10) | NOT NULL | What taker acquired (YES or NO) |
+| `taker_price` | DECIMAL(10,6) | NOT NULL | Price taker paid per contract |
+| `taker_notional` | DECIMAL(20,6) | NOT NULL | Total taker paid |
 | `taker_fee` | DECIMAL(20,6) | NOT NULL | Fee charged to taker |
+| **Maker's Perspective** | | | |
+| `maker_outcome` | VARCHAR(10) | NOT NULL | What maker acquired (opposite of taker) |
+| `maker_price` | DECIMAL(10,6) | NOT NULL | Price maker paid per contract |
+| `maker_notional` | DECIMAL(20,6) | NOT NULL | Total maker paid |
+| `maker_fee` | DECIMAL(20,6) | DEFAULT 0 | Fee charged to maker |
+| **Common Fields** | | | |
+| `size` | DECIMAL(20,6) | NOT NULL | Number of contracts |
 | `tx_signature` | VARCHAR(88) | | Solana transaction sig |
 | `tx_status` | VARCHAR(20) | DEFAULT 'PENDING' | PENDING, CONFIRMED, FAILED |
 | `executed_at` | TIMESTAMP | DEFAULT NOW() | Match timestamp |
 | `confirmed_at` | TIMESTAMP | | On-chain confirmation |
+| **Legacy Fields (deprecated)** | | | |
+| `outcome` | VARCHAR(10) | | Use `taker_outcome` instead |
+| `price` | DECIMAL(10,6) | | Use `taker_price` instead |
+| `notional` | DECIMAL(20,6) | | Use `taker_notional` instead |
 
 **Indexes:**
 - `idx_trades_market` ON `(market_id, executed_at DESC)`
@@ -900,6 +963,8 @@ GROUP BY u.id, u.wallet_address;
 ---
 
 ### Enums
+
+**Database Enums:**
 ```sql
 CREATE TYPE order_side AS ENUM ('BID', 'ASK');
 CREATE TYPE order_outcome AS ENUM ('YES', 'NO');
@@ -909,6 +974,29 @@ CREATE TYPE market_status AS ENUM ('OPEN', 'CLOSED', 'RESOLVED', 'SETTLED');
 CREATE TYPE tx_status AS ENUM ('PENDING', 'CONFIRMED', 'FAILED');
 CREATE TYPE ledger_type AS ENUM ('DEPOSIT', 'WITHDRAW', 'TRADE', 'SETTLE', 'FEE');
 ```
+
+**On-Chain Enums (Anchor Program):**
+```rust
+// Market status includes PENDING for pre-activation
+pub enum MarketStatus {
+    Pending = 0,    // Pre-created, awaiting activation (strike not set)
+    Open = 1,       // Trading active
+    Closed = 2,     // Trading stopped, awaiting resolution
+    Resolved = 3,   // Outcome determined
+    Settled = 4,    // All positions paid out
+}
+
+// Order status includes EXPIRED
+pub enum OrderStatus {
+    Open = 0,
+    PartialFill = 1,
+    Filled = 2,
+    Cancelled = 3,
+    Expired = 4,    // Past expiry_ts
+}
+```
+
+*Note: The DB uses `strikePrice = '0'` to indicate PENDING status (avoids Supabase connection pooler enum caching issues).*
 
 ## 7. On-Chain Program Architecture (Anchor)
 
@@ -981,9 +1069,12 @@ The Solana program cannot "wake up" itself. An external agent must trigger settl
 **Keeper Responsibilities:**
 | Task | Frequency | Description |
 |------|-----------|-------------|
-| `resolve_market` | Every 10s | Check for expired markets, set outcome |
-| `settle_positions` | After resolve | Batch settle all positions (max ~20 per tx) |
-| `create_market` | Per timeframe | Create upcoming markets |
+| `market_creator` | Every 30s | Pre-creates markets with PENDING status (DB only) |
+| `market_activator` | Every 5s | Activates PENDING markets when they go live (sets strike, creates on-chain) |
+| `market_resolver` | Every 2s | Check for expired markets, set outcome |
+| `position_settler` | Every 5s | Batch settle all positions (max ~20 per tx) |
+| `order_expirer` | Every 10s | Cancels expired GTT orders and orders before market close |
+| `market_closer` | Every 20s | Closes settled markets to recover rent (~$1.20/market) |
 
 **Batched Settlement:**
 - Solana tx size limits ~20-30 position accounts per instruction
@@ -1323,23 +1414,23 @@ User places crossing ASK @ $0.50
 | Event | Time Before Expiry | Action |
 |-------|-------------------|--------|
 | Trading Open | Market creation | Orders accepted |
-| Last Trade | 30 seconds | New orders rejected |
+| Last Trade | 2 seconds | New orders rejected |
 | Market Close | 0 seconds | All open orders cancelled |
-| Resolution | +10 seconds | Final price fetched, outcome set |
-| Settlement | +60 seconds | All positions paid out |
+| Resolution | +2 seconds | Final price fetched, outcome set |
+| Settlement | +5 seconds | All positions paid out |
 
 **Example Timeline (BTC-5m-12:00):**
 ```
 11:55:00 - Market created (strike = current BTC price)
-11:59:30 - Trading closes (no new orders)
+11:59:58 - Trading closes (no new orders) - 2s buffer
 12:00:00 - Market expires (open orders auto-cancelled)
-12:00:10 - Keeper resolves (fetches final price from exchange)
-12:00:30 - Keeper settles (payouts sent)
+12:00:02 - Keeper resolves (fetches final price from exchange)
+12:00:07 - Keeper settles (payouts sent)
 ```
 
 ### 10.5 What Happens to Open Orders at Close?
 ```
-Market approaches expiry (T-30s):
+Market approaches expiry (T-2s):
 ├── New orders: REJECTED (MARKET_CLOSING)
 ├── Existing orders: Can be cancelled
 └── Matches: Still processed if both sides valid
@@ -1874,17 +1965,35 @@ pub struct MarginAccount {
 ## 13. Fee Structure
 
 ### 13.1 Trading Fees
-| Party | Fee | Notes |
-|-------|-----|-------|
-| Maker | 0.00% | Incentivize limit orders |
-| Taker | 0.10% | Charged on notional |
 
-**Example:**
+**Maker Fee:** 0.00% (free to encourage liquidity)
+
+**Taker Fee (Tiered by Notional Value):**
+| Tier | Notional Range | Fee |
+|------|----------------|-----|
+| Tier 1 | $0 - $50 | Flat $0.02 |
+| Tier 2 | $50 - $500 | 5 bps (0.05%) |
+| Tier 3 | $500 - $2,000 | 4 bps (0.04%) |
+| Tier 4 | $2,000+ | 3 bps (0.03%) |
+
+**Order Minimums:**
+- Minimum buy order: $5.00 notional
+- Minimum sell order: $0.02 notional (equals flat fee)
+
+**Example (Small Order - Flat Fee):**
+```
+Buy 10 YES @ $0.50 (Taker)
+├── Notional: 10 × $0.50 = $5.00
+├── Fee: $0.02 (flat, since notional < $50)
+└── Total Debit: $5.02 USDC
+```
+
+**Example (Large Order - Tiered):**
 ```
 Buy 100 YES @ $0.50 (Taker)
 ├── Notional: 100 × $0.50 = $50.00
-├── Fee: $50.00 × 0.10% = $0.05
-└── Total Debit: $50.05 USDC
+├── Fee: $50.00 × 0.05% = $0.025
+└── Total Debit: $50.025 USDC
 ```
 
 ### 13.2 Fee Collection (On-Chain)
@@ -1894,15 +2003,19 @@ pub struct GlobalState {
     pub admin: Pubkey,
     pub fee_recipient: Pubkey,  // Treasury PDA
     pub maker_fee_bps: u16,     // 0 = 0.00%
-    pub taker_fee_bps: u16,     // 10 = 0.10%
+    pub taker_fee_bps: u16,     // Used as max fee cap for validation
     pub protocol_paused: bool,
 }
+
+// Minimum taker fee stored as constant
+pub const MIN_TAKER_FEE: u64 = 20_000;  // $0.02
 ```
 
-Fees are deducted atomically during `execute_match` instruction:
-1. Calculate maker_fee and taker_fee
-2. Transfer fees to `fee_recipient` PDA
-3. Transfer remaining to position/counterparty
+Fees are calculated per fill (not per order) and deducted atomically:
+1. Calculate fee using tiered structure
+2. Ensure fee >= minimum ($0.02)
+3. Transfer fees to `fee_recipient` PDA
+4. Transfer remaining to position/counterparty
 
 ### 13.3 Fee Benchmarks
 | Platform | Maker | Taker | Type |
@@ -1911,89 +2024,100 @@ Fees are deducted atomically during `execute_match` instruction:
 | Binance Futures | 0.02% | 0.04% | Derivatives |
 | Coinbase Advanced | 0.40% | 0.60% | CEX |
 | Polymarket | 0% | 0% | Prediction |
-| **Degen Terminal** | **0%** | **0.10%** | Prediction |
+| **Degen Terminal** | **0%** | **$0.02-0.05%** | Prediction |
 
 ---
 
 ## 14. API Specification (Frontend <-> Relayer)
 
 ### Overview
-The API handles two types of order sources differently:
+The API handles order submission using delegation-based signing for fast mode trading:
 
 | Source | Endpoint | Flow |
 |--------|----------|------|
-| **User Orders** | On-chain tx → Event listener | Backend listens for `OrderPlaced` events |
-| **MM Bot Orders** | `POST /internal/mm-orders` | Direct API submission with Ed25519 signature |
+| **User Orders** | `POST /orders/notify` | API validates delegation, processes order off-chain |
+| **MM Bot Orders** | Internal (integrated) | MM bot runs as part of backend API |
 
-### User Order Flow (On-Chain)
+### User Order Flow (Delegation-Based)
 
-Users do NOT call the API to place orders. Instead:
+Users submit orders via the API with signed order data:
 
-1. **Frontend** builds and submits `place_order` transaction to Solana
-2. **Backend** listens for `OrderPlaced` events via WebSocket/polling
-3. **Backend** adds order to matching engine automatically
+1. **User** has USDC delegation to protocol (one-time approval)
+2. **Frontend** signs order data with wallet or session key
+3. **Backend** validates signature, checks delegation balance
+4. **Matching Engine** processes order, executes fills on-chain
 
 ```
-Frontend → Solana RPC → On-chain execution → Event emitted → Backend listener
+Frontend → POST /orders/notify → Backend validates → Match → On-chain settlement
 ```
 
-### `GET /orders/user/:walletAddress`
-**Description:** Get user's orders (reads from on-chain + database).
+**Session-Based Trading (Optional):**
+For one-click trading without wallet popups, users can create ephemeral session keys.
+
+### `POST /orders/notify`
+**Description:** Submit an order using delegated signing (fast mode).
+
+**Request Body:**
+```json
+{
+  "marketAddress": "So111...",
+      "side": "bid",
+      "outcome": "yes",
+  "type": "limit",
+      "price": 0.50,
+      "size": 100,
+  "expiry": 1709999999,
+  "clientOrderId": 123456789,
+  "signature": "base58_signature",
+  "binaryMessage": "base64_encoded_order_data",
+  "sessionPublicKey": "optional_for_session_signed_orders",
+  "dollarAmount": 50.00,
+  "maxPrice": 0.55
+}
+```
+
+**Response:**
+```json
+{
+  "orderId": "uuid",
+  "status": "open",
+  "fills": 0,
+  "filledSize": 0,
+  "avgPrice": null,
+  "createdAt": 1709999000
+}
+```
+
+### `GET /user/orders`
+**Description:** Get user's order history.
 
 **Response:**
 ```json
 {
   "orders": [
     {
-      "id": "order-pda-address",
-      "market": "BTC-5m-12:00",
+      "id": "uuid",
+      "marketAddress": "So111...",
+      "market": "BTC-5m",
       "side": "bid",
       "outcome": "yes",
       "price": 0.50,
       "size": 100,
       "filledSize": 25,
       "status": "partial",
-      "createdAt": "2024-03-10T12:00:00Z"
+      "createdAt": 1709999000
     }
-  ]
+  ],
+  "total": 150,
+  "limit": 20,
+  "offset": 0
 }
 ```
 
-### `POST /orders/cancel` (User initiated)
-**Description:** User signs a cancel_order transaction on-chain.
+### `DELETE /orders/:id`
+**Description:** Cancel a specific order.
 
-*Note: Cancellation is also on-chain. Frontend submits `cancel_order` tx.*
-
-### `POST /internal/mm-orders` (MM Bot Only)
-**Description:** Internal endpoint for MM bot to submit off-chain orders.
-
-**Request Body:**
-```json
-{
-  "marketAddress": "So111... (The specific BTC-5m Market PDA)",
-  "order": {
-    "side": "bid",
-    "outcome": "yes",
-    "type": "limit",
-    "price": 500000,
-    "size": 10000000,
-    "expiry": 1709999999,
-    "clientOrderId": 123456789
-  },
-  "signature": "Base64EncodedEd25519Signature...",
-  "signerPubkey": "MMBotWalletPubkey..."
-}
-```
-
-**Response:**
-```json
-{
-  "status": "accepted",
-  "orderId": "mm-order-uuid-123"
-}
-```
-
-**Authentication:** Internal API key or restricted to localhost/internal network.
+*Note: Requires cancel signature in request body.*
 
 ```
 

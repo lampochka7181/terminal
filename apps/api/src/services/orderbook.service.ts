@@ -28,6 +28,10 @@ export interface OrderbookOrder {
   expiresAt?: number;     // Order expiry timestamp
   signature?: string;     // Ed25519 signature for on-chain verification
   binaryMessage?: string; // Base64 encoded binary message that was signed
+  // Leverage fields (for leveraged orders)
+  leverage?: number;       // 1 = no leverage, 2-10 = leveraged
+  marginAmount?: number;   // User's margin amount
+  loanAmount?: number;     // Loan from lending pool
 }
 
 export interface OrderbookLevel {

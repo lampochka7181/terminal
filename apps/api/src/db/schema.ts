@@ -25,6 +25,10 @@ export const orderStatusEnum = pgEnum('order_status', ['OPEN', 'PARTIAL', 'FILLE
 export const txStatusEnum = pgEnum('tx_status', ['PENDING', 'CONFIRMED', 'FAILED']);
 export const ledgerTypeEnum = pgEnum('ledger_type', ['DEPOSIT', 'WITHDRAW', 'TRADE', 'SETTLE', 'FEE']);
 
+// Leverage-related enums
+export const marginAccountStatusEnum = pgEnum('margin_account_status', ['OPEN', 'LIQUIDATED', 'CLOSED']);
+export const marginTxTypeEnum = pgEnum('margin_tx_type', ['DEPOSIT', 'WITHDRAW']);
+
 // Users table
 export const users = pgTable('users', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -189,6 +193,101 @@ export const marketSnapshots = pgTable('market_snapshots', {
   trades: integer('trades').default(0),
 });
 
+// ============================================================================
+// LEVERAGE TABLES
+// ============================================================================
+
+// Lending Pool - tracks USDC available for leverage loans
+export const lendingPool = pgTable('lending_pool', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  walletAddress: varchar('wallet_address', { length: 44 }).notNull(),
+  totalDeposited: numeric('total_deposited', { precision: 20, scale: 6 }).default('0'),
+  totalLoaned: numeric('total_loaned', { precision: 20, scale: 6 }).default('0'),
+  available: numeric('available', { precision: 20, scale: 6 }).default('0'),
+  createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+// Insurance Fund - receives liquidation penalties, covers bad debt
+export const insuranceFund = pgTable('insurance_fund', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  walletAddress: varchar('wallet_address', { length: 44 }).notNull(),
+  balance: numeric('balance', { precision: 20, scale: 6 }).default('0'),
+  totalReceived: numeric('total_received', { precision: 20, scale: 6 }).default('0'),
+  totalPaidOut: numeric('total_paid_out', { precision: 20, scale: 6 }).default('0'),
+  createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+// Margin Accounts - one per leveraged position
+export const marginAccounts = pgTable('margin_accounts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull().references(() => users.id),
+  positionId: uuid('position_id').notNull().references(() => positions.id),
+  marketId: uuid('market_id').notNull().references(() => markets.id),
+  
+  // Position details
+  side: orderOutcomeEnum('side').notNull(),                    // YES or NO
+  shares: numeric('shares', { precision: 20, scale: 6 }).notNull(),
+  entryPrice: numeric('entry_price', { precision: 10, scale: 6 }).notNull(),
+  
+  // Margin & Loan
+  marginDeposited: numeric('margin_deposited', { precision: 20, scale: 6 }).notNull(),
+  loanAmount: numeric('loan_amount', { precision: 20, scale: 6 }).notNull(),
+  leverage: numeric('leverage', { precision: 4, scale: 2 }).notNull(),
+  
+  // Liquidation
+  liquidationPrice: numeric('liquidation_price', { precision: 10, scale: 6 }).notNull(),
+  
+  // Status
+  status: marginAccountStatusEnum('status').default('OPEN'),
+  
+  createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+// Liquidation History
+export const liquidations = pgTable('liquidations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  marginAccountId: uuid('margin_account_id').notNull().references(() => marginAccounts.id),
+  userId: uuid('user_id').notNull().references(() => users.id),
+  marketId: uuid('market_id').notNull().references(() => markets.id),
+  
+  // Liquidation details
+  triggerPrice: numeric('trigger_price', { precision: 10, scale: 6 }).notNull(),
+  executionPrice: numeric('execution_price', { precision: 10, scale: 6 }).notNull(),
+  sharesLiquidated: numeric('shares_liquidated', { precision: 20, scale: 6 }).notNull(),
+  
+  // Financial breakdown
+  proceeds: numeric('proceeds', { precision: 20, scale: 6 }).notNull(),
+  loanRepaid: numeric('loan_repaid', { precision: 20, scale: 6 }).notNull(),
+  penalty: numeric('penalty', { precision: 20, scale: 6 }).notNull(),
+  returnedToUser: numeric('returned_to_user', { precision: 20, scale: 6 }).notNull(),
+  badDebt: numeric('bad_debt', { precision: 20, scale: 6 }).default('0'),
+  
+  txSignature: varchar('tx_signature', { length: 88 }),
+  createdAt: timestamp('created_at').defaultNow(),
+});
+
+// Margin Transactions (deposits/withdrawals)
+export const marginTransactions = pgTable('margin_transactions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  marginAccountId: uuid('margin_account_id').notNull().references(() => marginAccounts.id),
+  userId: uuid('user_id').notNull().references(() => users.id),
+  
+  type: marginTxTypeEnum('type').notNull(),
+  amount: numeric('amount', { precision: 20, scale: 6 }).notNull(),
+  
+  // Impact
+  loanBefore: numeric('loan_before', { precision: 20, scale: 6 }).notNull(),
+  loanAfter: numeric('loan_after', { precision: 20, scale: 6 }).notNull(),
+  liqPriceBefore: numeric('liq_price_before', { precision: 10, scale: 6 }).notNull(),
+  liqPriceAfter: numeric('liq_price_after', { precision: 10, scale: 6 }).notNull(),
+  
+  txSignature: varchar('tx_signature', { length: 88 }),
+  createdAt: timestamp('created_at').defaultNow(),
+});
+
 // Relations
 export const usersRelations = relations(users, ({ many }) => ({
   orders: many(orders),
@@ -280,6 +379,50 @@ export const marketSnapshotsRelations = relations(marketSnapshots, ({ one }) => 
   }),
 }));
 
+// Leverage-related relations
+export const marginAccountsRelations = relations(marginAccounts, ({ one, many }) => ({
+  user: one(users, {
+    fields: [marginAccounts.userId],
+    references: [users.id],
+  }),
+  position: one(positions, {
+    fields: [marginAccounts.positionId],
+    references: [positions.id],
+  }),
+  market: one(markets, {
+    fields: [marginAccounts.marketId],
+    references: [markets.id],
+  }),
+  liquidations: many(liquidations),
+  transactions: many(marginTransactions),
+}));
+
+export const liquidationsRelations = relations(liquidations, ({ one }) => ({
+  marginAccount: one(marginAccounts, {
+    fields: [liquidations.marginAccountId],
+    references: [marginAccounts.id],
+  }),
+  user: one(users, {
+    fields: [liquidations.userId],
+    references: [users.id],
+  }),
+  market: one(markets, {
+    fields: [liquidations.marketId],
+    references: [markets.id],
+  }),
+}));
+
+export const marginTransactionsRelations = relations(marginTransactions, ({ one }) => ({
+  marginAccount: one(marginAccounts, {
+    fields: [marginTransactions.marginAccountId],
+    references: [marginAccounts.id],
+  }),
+  user: one(users, {
+    fields: [marginTransactions.userId],
+    references: [users.id],
+  }),
+}));
+
 // Type exports for use in application
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
@@ -297,6 +440,18 @@ export type BalanceLedgerEntry = typeof balanceLedger.$inferSelect;
 export type NewBalanceLedgerEntry = typeof balanceLedger.$inferInsert;
 export type MarketSnapshot = typeof marketSnapshots.$inferSelect;
 export type NewMarketSnapshot = typeof marketSnapshots.$inferInsert;
+
+// Leverage types
+export type LendingPool = typeof lendingPool.$inferSelect;
+export type NewLendingPool = typeof lendingPool.$inferInsert;
+export type InsuranceFund = typeof insuranceFund.$inferSelect;
+export type NewInsuranceFund = typeof insuranceFund.$inferInsert;
+export type MarginAccount = typeof marginAccounts.$inferSelect;
+export type NewMarginAccount = typeof marginAccounts.$inferInsert;
+export type Liquidation = typeof liquidations.$inferSelect;
+export type NewLiquidation = typeof liquidations.$inferInsert;
+export type MarginTransaction = typeof marginTransactions.$inferSelect;
+export type NewMarginTransaction = typeof marginTransactions.$inferInsert;
 
 
 

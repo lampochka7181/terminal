@@ -18,6 +18,7 @@ import { marketRoutes } from './routes/markets.js';
 import { orderRoutes } from './routes/orders.js';
 import { userRoutes } from './routes/user.js';
 import { tradesRoutes } from './routes/trades.js';
+import { marginRoutes } from './routes/margin.js';
 import { wsHandler } from './routes/websocket.js';
 import { apiLogger } from './lib/logger.js';
 
@@ -345,6 +346,7 @@ async function main() {
   await app.register(orderRoutes, { prefix: '/orders' });
   await app.register(userRoutes, { prefix: '/user' });
   await app.register(tradesRoutes, { prefix: '/trades' });
+  await app.register(marginRoutes, { prefix: '/margin' });
 
   // Public config endpoint (relayer address for delegation)
   app.get('/config', async () => {

@@ -82,10 +82,8 @@ export function TradeModal({
   
   // Calculate MARKET order estimates
   const dollarAmountNum = parseFloat(dollarAmount) || 0;
-  // SLIPPAGE PROTECTION: maxPrice = displayed price + 5% tolerance, capped at 0.99
-  // This ensures user gets filled close to the quoted price, not at any price
-  const SLIPPAGE_TOLERANCE = 0.05; // 5%
-  const maxPrice = Math.min(0.99, price * (1 + SLIPPAGE_TOLERANCE));
+  // Market orders fill at best available price (no slippage protection)
+  const maxPrice = 0.99;
   const estimatedContracts = dollarAmountNum > 0 ? Math.floor(dollarAmountNum / price) : 0;
   const estimatedPayout = estimatedContracts * 1.0;
   const estimatedProfit = estimatedPayout - dollarAmountNum;
@@ -97,12 +95,25 @@ export function TradeModal({
   const limitPayout = limitSizeNum * 1.0;
   const limitProfit = limitPayout - limitCost;
   
+  // Fee calculation (tiered structure)
+  // Tier 1: $0-$50 = $0.02 flat, Tier 2: $50-$500 = 4bps, Tier 3: $500-$2000 = 3bps, Tier 4: $2000+ = 2bps
+  const orderNotional = orderType === 'MARKET' ? dollarAmountNum : limitCost;
+  const calculateFee = (notional: number): number => {
+    if (notional < 50) return 0.02;  // Flat fee
+    if (notional < 500) return Math.max(notional * 0.0004, 0.02);  // 4 bps
+    if (notional < 2000) return notional * 0.0003;  // 3 bps
+    return notional * 0.0002;  // 2 bps
+  };
+  const estimatedFee = calculateFee(orderNotional);
+  const totalCostWithFee = orderNotional + estimatedFee;
+  
   // Delegation validation
   const delegatedAmountDollars = delegatedAmount / 1_000_000;
-  const takerFeeBps = 20;
-  const feeMultiplier = 1 + (takerFeeBps / 10000);
-  const totalCostWithFee = (orderType === 'MARKET' ? dollarAmountNum : limitCost) * feeMultiplier;
   const isDelegationInsufficient = isDelegationApproved && !isSellMode && totalCostWithFee > delegatedAmountDollars;
+  
+  // Order minimums: $5 for buy, $0.02 for sell
+  const MIN_BUY_NOTIONAL = 5;
+  const MIN_SELL_NOTIONAL = 0.02;
 
   // Validate limit price (must be between 0.01 and 0.99)
   const isValidLimitPrice = limitPriceNum >= 0.01 && limitPriceNum <= 0.99;
@@ -113,10 +124,12 @@ export function TradeModal({
   const sellCostBasis = sellSizeNum * (avgEntryPrice || 0);
   const sellProfit = sellProceeds - sellCostBasis;
   
-  // Validation
-  const canSubmitMarket = dollarAmountNum > 0 && estimatedContracts > 0 && orderStatus !== 'success' && !isDelegationInsufficient;
-  const canSubmitLimit = limitSizeNum > 0 && isValidLimitPrice && orderStatus !== 'success' && !isDelegationInsufficient;
-  const canSubmitSell = sellSizeNum > 0 && sellSizeNum <= maxSellSize && orderStatus !== 'success';
+  // Validation with minimum order checks
+  const isAboveMinBuy = orderType === 'MARKET' ? dollarAmountNum >= MIN_BUY_NOTIONAL : limitCost >= MIN_BUY_NOTIONAL;
+  const isAboveMinSell = sellProceeds >= MIN_SELL_NOTIONAL;
+  const canSubmitMarket = dollarAmountNum > 0 && estimatedContracts > 0 && isAboveMinBuy && orderStatus !== 'success' && !isDelegationInsufficient;
+  const canSubmitLimit = limitSizeNum > 0 && isValidLimitPrice && isAboveMinBuy && orderStatus !== 'success' && !isDelegationInsufficient;
+  const canSubmitSell = sellSizeNum > 0 && sellSizeNum <= maxSellSize && isAboveMinSell && orderStatus !== 'success';
   const canSubmit = isSellMode ? canSubmitSell : (orderType === 'MARKET' ? canSubmitMarket : canSubmitLimit);
   
   // Sync order error to local state
@@ -372,12 +385,12 @@ export function TradeModal({
                     type="number"
                     value={dollarAmount}
                     onChange={(e) => setDollarAmount(e.target.value)}
-                    min="1"
+                    min="5"
                     className="w-full bg-surface-light border border-border rounded-lg pl-8 pr-4 py-2.5 font-mono text-lg text-center focus:border-accent focus:ring-1 focus:ring-accent"
                   />
                 </div>
                 <div className="flex gap-1.5 mt-1.5">
-                  {[25, 50, 100, 250].map((preset) => (
+                  {[5, 25, 50, 100, 250].map((preset) => (
                     <button
                       key={preset}
                       onClick={() => setDollarAmount(preset.toString())}
@@ -394,6 +407,11 @@ export function TradeModal({
                 </div>
               </div>
 
+              {/* Minimum order warning */}
+              {dollarAmountNum > 0 && dollarAmountNum < MIN_BUY_NOTIONAL && (
+                <p className="text-[10px] text-short">Minimum buy order is ${MIN_BUY_NOTIONAL}</p>
+              )}
+
               {/* MARKET Summary - Compact */}
               <div className="space-y-1.5 p-3 bg-surface-light rounded-lg text-sm">
                 <div className="flex justify-between">
@@ -403,6 +421,10 @@ export function TradeModal({
                 <div className="flex justify-between">
                   <span className="text-text-muted">Contracts</span>
                   <span className="font-mono font-bold">{estimatedContracts.toLocaleString()}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-text-muted">Fee</span>
+                  <span className="font-mono text-text-muted">${estimatedFee.toFixed(2)}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-text-muted">Payout</span>

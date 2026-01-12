@@ -121,10 +121,22 @@ export async function marketCloserJob(): Promise<void> {
               innerMsg.includes('AccountNotInitialized') || 
               innerMsg.includes('0xbc4') || 
               innerMsg.includes('0x1')) {
-            logger.debug(`Market ${market.id} already closed or not found on-chain, archiving in DB`);
+            logger.debug(`Market ${market.asset}-${market.timeframe} (${market.pubkey.slice(0,8)}...) already closed or not found on-chain, archiving in DB`);
             await marketService.markArchived(market.id);
+          } else if (innerMsg.includes('MarketNotSettled') || innerMsg.includes('0x177c')) {
+            // Market still has unsettled positions (e.g., Lending Pool position from liquidation)
+            // Skip and let position-settler handle it first, then retry on next cycle
+            logger.warn(`Market ${market.asset}-${market.timeframe} (${market.pubkey.slice(0,8)}...) still has unsettled positions on-chain, will retry later`, {
+              marketId: market.id,
+              pubkey: market.pubkey,
+              asset: market.asset,
+              timeframe: market.timeframe,
+            });
           } else {
-            logger.error(`Individual closure failed for ${market.id}: ${innerMsg}`);
+            logger.error(`Failed to close market ${market.asset}-${market.timeframe} (${market.pubkey.slice(0,8)}...): ${innerMsg}`, {
+              marketId: market.id,
+              pubkey: market.pubkey,
+            });
           }
         }
       }

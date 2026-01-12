@@ -3,7 +3,8 @@ import { orderService } from './order.service.js';
 import { positionService } from './position.service.js';
 import { marketService } from './market.service.js';
 import { userService } from './user.service.js';
-import { transactionService, MatchParams, CloseParams } from './transaction.service.js';
+import { transactionService, MatchParams, CloseParams, LeveragedMatchParams } from './transaction.service.js';
+import { calculateTakerFee, calculateMakerFee } from './fee.service.js';
 import { getMarketPda, anchorClient } from '../lib/anchor-client.js';
 import { db, trades, type NewTrade } from '../db/index.js';
 import { logger, tradeLogger, orderLogger, logEvents } from '../lib/logger.js';
@@ -59,11 +60,31 @@ export interface Fill {
   takerSignature?: string;
   makerMessage?: string;
   takerMessage?: string;
+  // Leverage fields (for leveraged orders executed from Lending Pool)
+  leverage?: number;         // 1 = no leverage, 2-10 = leveraged
+  marginAmount?: number;     // User's margin amount
+  loanAmount?: number;       // Loan amount from lending pool
 }
 
-// Fee configuration (in basis points) - Moved to config.ts
+// Fee configuration - Now uses tiered fee service from fee.service.ts
+// Legacy constant kept for backward compatibility in some calculations
 const MAKER_FEE_BPS = config.makerFeeBps;
-const TAKER_FEE_BPS = config.takerFeeBps;
+
+/**
+ * Calculate fees for a fill based on notional value
+ * Uses tiered fee structure from fee.service.ts
+ */
+function calculateFillFees(notional: number): { makerFee: number; takerFee: number } {
+  const makerFeeCalc = calculateMakerFee(notional);
+  const takerFeeCalc = calculateTakerFee(notional);
+  return {
+    makerFee: makerFeeCalc.fee,
+    takerFee: takerFeeCalc.fee,
+  };
+}
+
+// Legacy helper for places still using BPS directly (to be migrated)
+const TAKER_FEE_BPS = config.fees.tier4Bps; // Use lowest tier as fallback
 
 /**
  * Parameters for dollar-based MARKET orders
@@ -81,6 +102,10 @@ export interface DollarMarketOrder {
   // For on-chain verification (user's signed authorization)
   signature?: string;
   binaryMessage?: string;
+  // Leverage fields (for leveraged orders)
+  leverage?: number;       // 1 = no leverage, 2-10 = leveraged
+  marginAmount?: number;   // User's margin amount
+  loanAmount?: number;     // Loan from lending pool
 }
 
 export interface DollarMatchResult {
@@ -132,6 +157,10 @@ export interface LimitOrder {
   // For on-chain verification (user's signed authorization)
   signature?: string;
   binaryMessage?: string;
+  // Leverage fields (for leveraged orders)
+  leverage?: number;       // 1 = no leverage, 2-10 = leveraged
+  marginAmount?: number;   // User's margin amount
+  loanAmount?: number;     // Loan from lending pool
 }
 
 export interface LimitMatchResult {
@@ -351,10 +380,9 @@ export class MatchingService {
       // Execute at user's effective price
       const fillPrice = userEffectivePrice;
       
-      // Calculate fees based on user's cost
+      // Calculate fees based on user's cost (tiered fee structure)
       const notional = fillPrice * fillSize;
-      const makerFee = (notional * MAKER_FEE_BPS) / 10000;
-      const takerFee = (notional * TAKER_FEE_BPS) / 10000;
+      const { makerFee, takerFee } = calculateFillFees(notional);
       
       // Create fill record with order PDAs for on-chain verification
       const fill: Fill = {
@@ -379,6 +407,10 @@ export class MatchingService {
         takerSignature: takerOrder.signature,
         makerMessage: bestOrder.binaryMessage,
         takerMessage: takerOrder.binaryMessage,
+        // Leverage fields (for on-chain execution routing)
+        leverage: takerOrder.leverage,
+        marginAmount: takerOrder.marginAmount,
+        loanAmount: takerOrder.loanAmount,
       };
       
       fills.push(fill);
@@ -477,8 +509,7 @@ export class MatchingService {
 
           const fillSize = remainingDollars / price;
           const fillCost = fillSize * price;
-          const makerFee = (fillCost * MAKER_FEE_BPS) / 10000;
-          const takerFee = (fillCost * TAKER_FEE_BPS) / 10000;
+          const { makerFee, takerFee } = calculateFillFees(fillCost);
 
           const fill: Fill = {
             makerOrderId: `mm_synth_${Date.now()}`,
@@ -494,6 +525,10 @@ export class MatchingService {
             takerSide: order.side,
             makerClientOrderId: Date.now(),
             takerClientOrderId: order.clientOrderId || Date.now(),
+            // Leverage fields
+            leverage: order.leverage,
+            marginAmount: order.marginAmount,
+            loanAmount: order.loanAmount,
           };
 
           fills.push(fill);
@@ -502,7 +537,8 @@ export class MatchingService {
           remainingDollars -= fillCost;
 
           logger.info(
-            `DEV fill: synthetic MM liquidity ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for ${order.side} ${order.outcome}`
+            `DEV fill: synthetic MM liquidity ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for ${order.side} ${order.outcome}` +
+            (order.leverage && order.leverage > 1 ? ` (${order.leverage}x leverage)` : '')
           );
         }
         break;
@@ -537,10 +573,8 @@ export class MatchingService {
       const fillPrice = userEffectivePrice;  // User sees their effective price
       const fillCost = fillSize * fillPrice;
       
-      // Calculate fees based on user's cost
-      const notional = fillCost;
-      const makerFee = (notional * MAKER_FEE_BPS) / 10000;
-      const takerFee = (notional * TAKER_FEE_BPS) / 10000;
+      // Calculate fees based on user's cost (tiered fee structure)
+      const { makerFee, takerFee } = calculateFillFees(fillCost);
       
       // Placeholder for taker order ID - will be replaced after order is created
       const takerOrderId = 'pending';
@@ -566,6 +600,10 @@ export class MatchingService {
         makerMessage: bestOrder.binaryMessage,
         takerSignature: order.signature,
         takerMessage: order.binaryMessage,
+        // Leverage fields (for on-chain execution routing)
+        leverage: order.leverage,
+        marginAmount: order.marginAmount,
+        loanAmount: order.loanAmount,
       };
       
       fills.push(fill);
@@ -704,8 +742,7 @@ export class MatchingService {
 
           const fillSize = remainingSize;
           const fillProceeds = fillSize * price;
-          const makerFee = (fillProceeds * MAKER_FEE_BPS) / 10000;
-          const takerFee = (fillProceeds * TAKER_FEE_BPS) / 10000;
+          const { makerFee, takerFee } = calculateFillFees(fillProceeds);
 
           const fill: Fill = {
             makerOrderId: `mm_synth_${Date.now()}`,
@@ -750,8 +787,7 @@ export class MatchingService {
             const fillSize = remainingSize;
             const price = order.minPrice;
             const fillProceeds = fillSize * price;
-            const makerFee = (fillProceeds * MAKER_FEE_BPS) / 10000;
-            const takerFee = (fillProceeds * TAKER_FEE_BPS) / 10000;
+            const { makerFee, takerFee } = calculateFillFees(fillProceeds);
 
             const fill: Fill = {
               makerOrderId: `mm_synth_${Date.now()}`,
@@ -795,9 +831,8 @@ export class MatchingService {
       const fillPrice = userEffectivePrice;  // User sees their effective price
       const fillProceeds = fillSize * fillPrice;
       
-      // Calculate fees
-      const makerFee = (fillProceeds * MAKER_FEE_BPS) / 10000;
-      const takerFee = (fillProceeds * TAKER_FEE_BPS) / 10000;
+      // Calculate fees (tiered fee structure)
+      const { makerFee, takerFee } = calculateFillFees(fillProceeds);
       
       // Create fill record (seller is taker, buyer is maker)
       const fill: Fill = {
@@ -966,6 +1001,10 @@ export class MatchingService {
       expiresAt: order.expiresAt,
       signature: order.signature,
       binaryMessage: order.binaryMessage,
+      // Leverage fields
+      leverage: order.leverage,
+      marginAmount: order.marginAmount,
+      loanAmount: order.loanAmount,
     };
 
     // Process through standard matching engine
@@ -1200,9 +1239,10 @@ export class MatchingService {
           outcome: takerOutcome,
           price: fill.price,
           matchSize: fill.size,
+          takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
           tradeId: trade.id,  // Pass trade ID to update with tx signature
         };
-        logger.info(`Executing on-chain CLOSE: ${fill.size} ${takerOutcome} @ ${fill.price} (seller=${takerWallet}, buyer=${makerWallet})`);
+        logger.info(`Executing on-chain CLOSE: ${fill.size} ${takerOutcome} @ ${fill.price} fee=${fill.takerFee} (seller=${takerWallet}, buyer=${makerWallet})`);
         transactionService.executeClose(closeParams).catch(err => 
           logger.error(`On-chain close failed: ${err.message}`)
         );
@@ -1220,6 +1260,7 @@ export class MatchingService {
           outcome: fill.outcome,
           price: fill.price,
           matchSize: fill.size,
+          takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
           makerClientOrderId: fill.makerClientOrderId,
           takerClientOrderId: fill.takerClientOrderId,
           makerOrderPda: fill.makerOrderPda,
@@ -1229,8 +1270,30 @@ export class MatchingService {
           makerMessage: fill.makerMessage,
           takerMessage: fill.takerMessage,
         }).catch(err => logger.error(`On-chain match failed: ${err.message}`));
+      } else if (fill.leverage && fill.leverage > 1 && fill.marginAmount && fill.loanAmount) {
+        // LEVERAGED opening trade - use Lending Pool wallet
+        // Position is owned by Lending Pool on-chain, tracked to user in DB
+        logger.info(`Executing LEVERAGED on-chain: ${fill.size} ${fill.outcome} @ ${fill.price} (${fill.leverage}x) - Lending Pool buying for user ${takerWallet.slice(0,8)}`);
+        transactionService.executeLeveragedMatch({
+          marketPubkey: onChainMarketPubkey,
+          makerOrderId: fill.makerOrderId,
+          takerOrderId: fill.takerOrderId,
+          makerWallet,
+          userWallet: takerWallet,  // User wallet for tracking (NOT used on-chain)
+          makerSide: fill.makerSide,
+          takerSide: fill.takerSide,
+          outcome: fill.outcome,
+          price: fill.price,
+          matchSize: fill.size,
+          takerFee: fill.takerFee,
+          makerClientOrderId: fill.makerClientOrderId,
+          takerClientOrderId: fill.takerClientOrderId,
+          leverage: fill.leverage,
+          marginAmount: fill.marginAmount,
+          loanAmount: fill.loanAmount,
+        }).catch(err => logger.error(`On-chain leveraged match failed: ${err.message}`));
       } else {
-        // Opening trade - use execute_match instruction
+        // Regular opening trade - use execute_match instruction
         transactionService.executeMatch({
           marketPubkey: onChainMarketPubkey,
           makerOrderId: fill.makerOrderId,
@@ -1242,6 +1305,7 @@ export class MatchingService {
           outcome: fill.outcome,
           price: fill.price,
           matchSize: fill.size,
+          takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
           makerClientOrderId: fill.makerClientOrderId,
           takerClientOrderId: fill.takerClientOrderId,
           makerOrderPda: fill.makerOrderPda,
@@ -1327,7 +1391,7 @@ export class MatchingService {
     // For sell orders (forceClose=true), ALWAYS use execute_close
     // This transfers USDC from buyer to seller, not the other way around!
     if (forceClose && isClosingTrade) {
-      logger.info(`Executing CLOSE (sell) on-chain: seller=${takerWallet.slice(0,8)}, buyer=${makerWallet.slice(0,8)}, ${fill.size} @ ${fill.price}`);
+      logger.info(`Executing CLOSE (sell) on-chain: seller=${takerWallet.slice(0,8)}, buyer=${makerWallet.slice(0,8)}, ${fill.size} @ ${fill.price} fee=${fill.takerFee}`);
       const closeParams: CloseParams = {
         marketPubkey: marketPubkey,
         buyerWallet: makerWallet,  // Maker is buying (MM)
@@ -1335,6 +1399,7 @@ export class MatchingService {
         outcome: fill.outcome,
         price: fill.price,
         matchSize: fill.size,
+        takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
         makerOrderId: fill.makerOrderId,  // For updating trade with tx signature
         takerOrderId: fill.takerOrderId,  // For updating trade with tx signature
       };
@@ -1367,6 +1432,7 @@ export class MatchingService {
           outcome: fill.outcome,
           price: fill.price,
           matchSize: fill.size,
+          takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
           makerOrderId: fill.makerOrderId,  // For updating trade with tx signature
           takerOrderId: fill.takerOrderId,  // For updating trade with tx signature
         };
@@ -1382,7 +1448,37 @@ export class MatchingService {
       }
     }
     
-    // Opening trade (or fallback) - use execute_match instruction
+    // Check for leveraged opening trade - use Lending Pool wallet instead of user
+    if (fill.leverage && fill.leverage > 1 && fill.marginAmount && fill.loanAmount) {
+      logger.info(`Executing LEVERAGED on-chain: ${fill.size} ${fill.outcome} @ ${fill.price} (${fill.leverage}x) - Lending Pool buying for user ${takerWallet.slice(0,8)}`);
+      transactionService.executeLeveragedMatch({
+        marketPubkey: marketPubkey,
+        makerOrderId: fill.makerOrderId,
+        takerOrderId: fill.takerOrderId,
+        makerWallet,
+        userWallet: takerWallet,  // User wallet for tracking (NOT used on-chain)
+        makerSide: fill.makerSide,
+        takerSide: fill.takerSide,
+        outcome: fill.outcome,
+        price: fill.price,
+        matchSize: fill.size,
+        takerFee: fill.takerFee,
+        makerClientOrderId: fill.makerClientOrderId,
+        takerClientOrderId: fill.takerClientOrderId,
+        leverage: fill.leverage,
+        marginAmount: fill.marginAmount,
+        loanAmount: fill.loanAmount,
+      }).then(result => {
+        if (!result.success) {
+          logger.error(`On-chain leveraged match failed: ${result.error}`);
+        } else {
+          logger.info(`On-chain leveraged match success: ${result.signature}`);
+        }
+      }).catch(err => logger.error(`On-chain leveraged match failed: ${err.message}`));
+      return;
+    }
+    
+    // Regular opening trade (or fallback) - use execute_match instruction
     this.executeMatchOnChain(fill, marketPubkey, makerWallet, takerWallet, 'aggregated');
   }
 
@@ -1455,6 +1551,7 @@ export class MatchingService {
       outcome: fill.outcome,
       price: fill.price,
       matchSize: fill.size,
+      takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
       makerClientOrderId: fill.makerClientOrderId,
       takerClientOrderId: fill.takerClientOrderId,
       makerOrderPda: fill.makerOrderPda,
@@ -1714,6 +1811,7 @@ export class MatchingService {
               outcome: fill.outcome,
               price: fill.price,
               matchSize: fill.size,
+              takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
               tradeId: trade.id,  // Pass trade ID to update with tx signature
             };
             
@@ -1729,11 +1827,11 @@ export class MatchingService {
           } else {
             // Seller doesn't have enough shares - use opening trade
             logger.debug(`Taker selling but insufficient shares (${sellerShares} < ${fill.size}), using execute_match`);
-            this.executeMatchOnChain(fill, onChainMarketPda, makerWallet, takerWallet, trade.id);
+            this.executeMatchOnChain(fill, onChainMarketPda.toBase58(), makerWallet, takerWallet, trade.id);
           }
         } else {
           // Opening trade - use execute_match instruction
-          this.executeMatchOnChain(fill, onChainMarketPda, makerWallet, takerWallet, trade.id);
+          this.executeMatchOnChain(fill, onChainMarketPda.toBase58(), makerWallet, takerWallet, trade.id);
         }
       } catch (err: any) {
         logger.error(`Failed to initiate on-chain transaction: ${err.message}`);

@@ -5,7 +5,7 @@ import { WalletButton } from '@/components/WalletButton';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { usePriceStore } from '@/stores/priceStore';
 import { cn } from '@/lib/utils';
-import { TrendingUp, TrendingDown, Activity, Wallet, User, Zap, Settings, X, RefreshCw, ChevronDown } from 'lucide-react';
+import { TrendingUp, TrendingDown, Activity, Wallet, User, Zap, Settings, X, RefreshCw, ChevronDown, Clock } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useBalance } from '@/hooks/useUser';
@@ -13,6 +13,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { useAuthStore } from '@/stores/authStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useDelegation } from '@/hooks/useDelegation';
+import { useSessionKey, SESSION_DURATIONS } from '@/hooks/useSessionKey';
 
 export function Header() {
   const { connected, publicKey } = useWallet();
@@ -21,25 +22,49 @@ export function Header() {
   const { balance } = useBalance();
   const { isAuthenticated, isAuthenticating, signIn, signOut } = useAuth();
   const authedWalletAddress = useAuthStore((s) => s.walletAddress);
-  const { oneClickEnabled, oneClickAmount } = useSettingsStore();
+  const { oneClickEnabled, oneClickAmount, setOneClickAmount } = useSettingsStore();
   const { isApproved: isDelegationApproved, delegatedAmount, approve: approveDelegation, revoke: revokeDelegation, isApproving } = useDelegation();
+  const { isActive: isSessionActive, isCreating: isCreatingSession, createSession, revokeSession, getTimeRemaining, expiresAt } = useSessionKey();
   
   const [showDelegationDropdown, setShowDelegationDropdown] = useState(false);
   const [delegationInput, setDelegationInput] = useState('');
   const delegationDropdownRef = useRef<HTMLDivElement>(null);
+  
+  const [showSessionDropdown, setShowSessionDropdown] = useState(false);
+  const sessionDropdownRef = useRef<HTMLDivElement>(null);
+  
+  const [showOneClickDropdown, setShowOneClickDropdown] = useState(false);
+  const [oneClickInput, setOneClickInput] = useState('');
+  const oneClickDropdownRef = useRef<HTMLDivElement>(null);
 
   const lastAttemptRef = useRef<{ wallet: string | null; at: number }>({ wallet: null, at: 0 });
   
-  // Close dropdown when clicking outside
+  // Close dropdowns when clicking outside
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (delegationDropdownRef.current && !delegationDropdownRef.current.contains(event.target as Node)) {
         setShowDelegationDropdown(false);
       }
+      if (oneClickDropdownRef.current && !oneClickDropdownRef.current.contains(event.target as Node)) {
+        setShowOneClickDropdown(false);
+      }
+      if (sessionDropdownRef.current && !sessionDropdownRef.current.contains(event.target as Node)) {
+        setShowSessionDropdown(false);
+      }
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
+  
+  // Format session time remaining
+  const formatTimeRemaining = () => {
+    const seconds = getTimeRemaining();
+    if (seconds <= 0) return 'Expired';
+    const hours = Math.floor(seconds / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
+    if (hours > 0) return `${hours}h ${mins}m`;
+    return `${mins}m`;
+  };
 
   // Ensure SIWS runs from any page:
   // - When wallet connects and we're not authenticated -> prompt sign message
@@ -236,16 +261,205 @@ export function Header() {
             </div>
           )}
           
+          {/* Session Trading Button */}
+          {connected && isDelegationApproved && (
+            <div className="relative" ref={sessionDropdownRef}>
+              {isSessionActive ? (
+                <button
+                  onClick={() => setShowSessionDropdown(!showSessionDropdown)}
+                  className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 bg-accent/10 border border-accent/30 rounded-lg text-accent text-xs font-bold hover:bg-accent/20 transition-colors btn-press"
+                  title="Session Active - No popups for orders"
+                >
+                  <Activity className="w-3.5 h-3.5" />
+                  <span>{formatTimeRemaining()}</span>
+                  <ChevronDown className="w-3 h-3" />
+                </button>
+              ) : (
+                <button
+                  onClick={() => setShowSessionDropdown(!showSessionDropdown)}
+                  disabled={isCreatingSession}
+                  className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 bg-surface-light border border-border/50 rounded-lg text-text-muted text-xs font-bold hover:border-accent/50 hover:text-accent transition-colors btn-press"
+                  title="Start session for instant trading"
+                >
+                  {isCreatingSession ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>Starting...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Activity className="w-3.5 h-3.5" />
+                      <span>Session</span>
+                    </>
+                  )}
+                </button>
+              )}
+              
+              {/* Session Dropdown */}
+              {showSessionDropdown && (
+                <div className="absolute right-0 top-full mt-2 w-72 bg-surface border border-border rounded-xl shadow-xl z-50 overflow-hidden animate-fade-in">
+                  <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-surface-light/30">
+                    <div className="flex items-center gap-2">
+                      <Activity className="w-4 h-4 text-accent" />
+                      <span className="font-bold text-sm">Trading Session</span>
+                    </div>
+                    <button
+                      onClick={() => setShowSessionDropdown(false)}
+                      className="p-1 hover:bg-surface-light rounded transition-colors"
+                    >
+                      <X className="w-4 h-4 text-text-muted" />
+                    </button>
+                  </div>
+                  
+                  <div className="p-4 space-y-4">
+                    {isSessionActive ? (
+                      <>
+                        <div className="flex items-center justify-between p-3 bg-accent/10 rounded-lg border border-accent/20">
+                          <span className="text-xs text-text-muted">Session active</span>
+                          <span className="font-mono text-sm font-bold text-accent">{formatTimeRemaining()} left</span>
+                        </div>
+                        <p className="text-xs text-text-muted">
+                          Orders are signed instantly without wallet popups.
+                        </p>
+                        <button
+                          onClick={async () => {
+                            await revokeSession();
+                            setShowSessionDropdown(false);
+                          }}
+                          className="w-full px-3 py-2 rounded-lg border border-short/30 text-short text-xs font-bold hover:bg-short/10 transition-colors btn-press"
+                        >
+                          End Session
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <p className="text-xs text-text-muted">
+                          Start a trading session to sign orders instantly without wallet popups. You&apos;ll sign once to authorize, then trade freely.
+                        </p>
+                        <div className="space-y-2">
+                          <button
+                            onClick={async () => {
+                              await createSession(SESSION_DURATIONS.SHORT);
+                              setShowSessionDropdown(false);
+                            }}
+                            disabled={isCreatingSession}
+                            className="w-full px-3 py-2 rounded-lg bg-surface-light border border-border text-text-primary text-xs font-bold hover:border-accent/50 transition-colors btn-press flex items-center justify-center gap-2"
+                          >
+                            <Clock className="w-3.5 h-3.5" />
+                            1 Hour Session
+                          </button>
+                          <button
+                            onClick={async () => {
+                              await createSession(SESSION_DURATIONS.MEDIUM);
+                              setShowSessionDropdown(false);
+                            }}
+                            disabled={isCreatingSession}
+                            className="w-full px-3 py-2 rounded-lg bg-accent text-background text-xs font-bold hover:bg-accent-dim transition-all btn-press flex items-center justify-center gap-2"
+                          >
+                            <Clock className="w-3.5 h-3.5" />
+                            4 Hour Session (Recommended)
+                          </button>
+                          <button
+                            onClick={async () => {
+                              await createSession(SESSION_DURATIONS.LONG);
+                              setShowSessionDropdown(false);
+                            }}
+                            disabled={isCreatingSession}
+                            className="w-full px-3 py-2 rounded-lg bg-surface-light border border-border text-text-primary text-xs font-bold hover:border-accent/50 transition-colors btn-press flex items-center justify-center gap-2"
+                          >
+                            <Clock className="w-3.5 h-3.5" />
+                            24 Hour Session
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          
           {/* One-Click Mode Indicator */}
           {connected && oneClickEnabled && (
-            <Link
-              href="/profile"
-              className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 bg-warning/10 border border-warning/30 rounded-lg text-warning text-xs font-bold hover:bg-warning/20 transition-colors btn-press"
-              title="One-Click Trading Active"
-            >
-              <Zap className="w-3.5 h-3.5" />
-              <span className="font-mono">${oneClickAmount}</span>
-            </Link>
+            <div className="relative" ref={oneClickDropdownRef}>
+              <button
+                onClick={() => {
+                  setOneClickInput(oneClickAmount.toString());
+                  setShowOneClickDropdown(!showOneClickDropdown);
+                }}
+                className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 bg-warning/10 border border-warning/30 rounded-lg text-warning text-xs font-bold hover:bg-warning/20 transition-colors btn-press"
+                title="One-Click Trading - Click to adjust amount"
+              >
+                <Zap className="w-3.5 h-3.5" />
+                <span className="font-mono">${oneClickAmount}</span>
+                <ChevronDown className="w-3 h-3" />
+              </button>
+              
+              {/* One-Click Amount Dropdown */}
+              {showOneClickDropdown && (
+                <div className="absolute right-0 top-full mt-2 w-64 bg-surface border border-border rounded-xl shadow-xl z-50 overflow-hidden animate-fade-in">
+                  <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-surface-light/30">
+                    <div className="flex items-center gap-2">
+                      <Zap className="w-4 h-4 text-warning" />
+                      <span className="font-bold text-sm">Quick Trade Amount</span>
+                    </div>
+                    <button
+                      onClick={() => setShowOneClickDropdown(false)}
+                      className="p-1 hover:bg-surface-light rounded transition-colors"
+                    >
+                      <X className="w-4 h-4 text-text-muted" />
+                    </button>
+                  </div>
+                  
+                  <div className="p-4 space-y-4">
+                    <div className="flex items-center justify-between p-3 bg-surface-light/50 rounded-lg">
+                      <span className="text-xs text-text-muted">Current amount</span>
+                      <span className="font-mono text-lg font-bold text-warning">${oneClickAmount}</span>
+                    </div>
+                    
+                    <div className="space-y-2">
+                      <label className="text-xs font-medium text-text-muted">Adjust amount (USDC)</label>
+                      <input
+                        value={oneClickInput}
+                        onChange={(e) => setOneClickInput(e.target.value)}
+                        inputMode="decimal"
+                        placeholder="e.g. 100"
+                        className="w-full px-3 py-2 rounded-lg bg-surface-light border border-border text-text-primary font-mono text-sm outline-none focus:border-warning transition-colors"
+                      />
+                      <div className="grid grid-cols-4 gap-1">
+                        {[25, 50, 100, 250].map((amt) => (
+                          <button
+                            key={amt}
+                            onClick={() => setOneClickInput(amt.toString())}
+                            className={cn(
+                              "py-1.5 text-[10px] font-mono font-bold rounded border transition-all",
+                              oneClickInput === amt.toString()
+                                ? "bg-warning/20 border-warning/50 text-warning"
+                                : "bg-surface-light border-border/50 text-text-muted hover:text-text-primary hover:bg-border"
+                            )}
+                          >
+                            ${amt}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    
+                    <button
+                      onClick={() => {
+                        const parsed = Number(oneClickInput);
+                        if (Number.isFinite(parsed) && parsed > 0) {
+                          setOneClickAmount(parsed);
+                        }
+                        setShowOneClickDropdown(false);
+                      }}
+                      className="w-full px-3 py-2 rounded-lg bg-warning text-background text-xs font-bold hover:bg-warning/80 transition-all btn-press"
+                    >
+                      Update Amount
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           )}
           
           {connected && balance && typeof balance.total === 'number' && (

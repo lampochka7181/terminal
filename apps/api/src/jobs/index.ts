@@ -5,7 +5,9 @@ import { marketResolverJob } from './market-resolver.js';
 import { positionSettlerJob } from './position-settler.js';
 import { orderExpirerJob } from './order-expirer.js';
 import { marketCloserJob } from './market-closer.js';
+import { liquidationCheckerJob, lendingPoolSyncJob } from './liquidation-checker.js';
 import { db, pool } from '../db/index.js'; // To check pool load directly
+import { config } from '../config.js';
 
 /**
  * Keeper Jobs Manager
@@ -62,6 +64,18 @@ const jobs: JobConfig[] = [
     intervalMs: 20 * 1000, // Every 20 seconds (recover rent faster)
     job: marketCloserJob,
     enabled: true,
+  },
+  {
+    name: 'Liquidation Checker',
+    intervalMs: 1 * 1000, // Every 1 second (fast liquidations to prevent bad debt)
+    job: liquidationCheckerJob,
+    enabled: !!config.lendingWalletPrivateKey, // Only enable if leverage is configured
+  },
+  {
+    name: 'Lending Pool Sync',
+    intervalMs: 60 * 1000, // Every 60 seconds (sync lending pool balance from on-chain)
+    job: lendingPoolSyncJob,
+    enabled: !!config.lendingWalletPrivateKey, // Only enable if leverage is configured
   },
 ];
 

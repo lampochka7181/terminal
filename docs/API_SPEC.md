@@ -85,6 +85,48 @@ Invalidate current session.
 }
 ```
 
+### `POST /auth/session`
+Create a trading session with an ephemeral session key. Allows instant order signing without wallet popups.
+- **Headers:** `Authorization: Bearer <token>`
+- **Body:**
+```json
+{
+  "sessionPublicKey": "7x9K...abc",
+  "walletAddress": "4NbQ...xyz",
+  "expiresAt": 1710172799,
+  "signature": "base58-encoded-wallet-signature",
+  "message": "Degen Terminal - Trading Session\n\nI authorize this session key..."
+}
+```
+- **Response:**
+```json
+{
+  "success": true
+}
+```
+
+### `DELETE /auth/session/:sessionPublicKey`
+Revoke a trading session.
+- **Headers:** `Authorization: Bearer <token>`
+- **Response:**
+```json
+{
+  "success": true
+}
+```
+
+### `GET /auth/session/status`
+Get current session status for authenticated user.
+- **Headers:** `Authorization: Bearer <token>`
+- **Response:**
+```json
+{
+  "active": true,
+  "sessionPublicKey": "7x9K...abc",
+  "expiresAt": 1710172799
+}
+```
+
 ---
 
 ## 2. Market Data (Snapshots)
@@ -199,6 +241,24 @@ Get platform-wide statistics.
 }
 ```
 
+### `GET /markets/candles`
+Get aggregated price candles for charting. Uses Redis tick history with Coinbase REST backfill.
+- **Query Params:**
+  - `asset` (required): BTC, ETH, SOL
+  - `intervalSec` (optional): Candle interval in seconds (1-60, default: 5)
+  - `lookbackSec` (optional): Lookback period in seconds (60-21600, default: 3600)
+- **Response:**
+```json
+{
+  "asset": "BTC",
+  "intervalSec": 5,
+  "candles": [
+    { "time": 1709999000, "open": 95432.50, "high": 95445.00, "low": 95420.00, "close": 95440.00 },
+    { "time": 1709999005, "open": 95440.00, "high": 95450.00, "low": 95435.00, "close": 95448.00 }
+  ]
+}
+```
+
 ---
 
 ## 3. WebSocket Feed (Real-time)
@@ -212,9 +272,14 @@ Get platform-wide statistics.
 { "op": "subscribe", "channel": "orderbook", "market": "So111..." }
 ```
 
-**Subscribe to Trades:**
+**Subscribe to Trades (Market-specific):**
 ```json
 { "op": "subscribe", "channel": "trades", "market": "So111..." }
+```
+
+**Subscribe to Global Trades (All Markets):**
+```json
+{ "op": "subscribe", "channel": "trades:global" }
 ```
 
 **Subscribe to Prices:**
@@ -348,8 +413,8 @@ Response:
 
 ## 4. Trading (Authenticated)
 
-### `POST /orders`
-Place a signed order.
+### `POST /orders/notify`
+Place an order using delegated signing (fast mode). Supports session keys for one-click trading.
 - **Headers:** `Authorization: Bearer <token>`
 - **Body:**
 ```json
@@ -358,21 +423,55 @@ Place a signed order.
   "side": "bid",
   "outcome": "yes",
   "type": "limit",
-  "price": 400000,
-  "size": 1000000,
-  "expiry": 1790000,
-  "signature": "base58_signature_of_instruction",
-  "encodedInstruction": "base64_instruction_data"
+  "price": 0.50,
+  "size": 100,
+  "expiry": 1709999999,
+  "clientOrderId": 123456789,
+  "signature": "base58_signature",
+  "binaryMessage": "base64_encoded_order_data",
+  "sessionPublicKey": "optional_session_key_for_one_click_trading",
+  "dollarAmount": 50.00,
+  "maxPrice": 0.55
 }
 ```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `marketAddress` | string | Yes | Market PDA address |
+| `side` | "bid" \| "ask" | Yes | Bid = buy, Ask = sell |
+| `outcome` | "yes" \| "no" | Yes | Which outcome to trade |
+| `type` | "limit" \| "market" | Yes | Order type |
+| `price` | number | Yes | Price in dollars ($0.01-$0.99) |
+| `size` | number | Yes* | Number of contracts |
+| `expiry` | number | Yes | Unix timestamp when order expires |
+| `clientOrderId` | number | Yes | Client-provided ID for tracking |
+| `signature` | string | Yes | Ed25519 signature of order data |
+| `binaryMessage` | string | Yes | Base64 encoded order data (for verification) |
+| `sessionPublicKey` | string | No | Session key for one-click trading |
+| `dollarAmount` | number | No* | Dollar amount for market orders |
+| `maxPrice` | number | No | Max price for market orders (slippage protection) |
+| `leverage` | number | No | Leverage multiplier (1-10x, default: 1) |
+| `marginAmount` | number | No | User's margin amount (required if leverage > 1) |
+
+*For market orders, use `dollarAmount` instead of `size` for dollar-based execution.
+
 - **Response:**
 ```json
 {
   "orderId": "uuid",
   "status": "open",
-  "createdAt": 1709999000
+  "fills": 0,
+  "filledSize": 0,
+  "avgPrice": null,
+  "createdAt": 1709999000,
+  "leverage": 5,
+  "marginAccountId": "uuid"
 }
 ```
+
+**Leverage Fields (only present for leveraged orders):**
+- `leverage`: The leverage multiplier used (2x-10x)
+- `marginAccountId`: ID of the created margin account (track liquidation risk)
 
 ### `DELETE /orders/:id`
 Cancel an open order.
@@ -457,14 +556,39 @@ Get all open positions (on-chain + unsettled matches).
   {
     "marketAddress": "So111...",
     "market": "BTC-5m-1709999999",
+    "asset": "BTC",
+    "expiryAt": 1709999999000,
     "yesShares": 100,
     "noShares": 0,
     "avgEntryPrice": 0.45,
     "currentPrice": 0.52,
     "unrealizedPnL": 7.00,
+    "totalCost": 45.00,
     "status": "open"
   }
 ]
+```
+
+### `GET /user/positions/:marketAddress`
+Get user's position for a specific market.
+- **Headers:** `Authorization: Bearer <token>`
+- **Response:**
+```json
+{
+  "marketAddress": "So111...",
+  "market": "BTC-5m",
+  "yesShares": 100,
+  "noShares": 0,
+  "avgEntryYes": 0.45,
+  "avgEntryNo": 0,
+  "totalCost": 45.00,
+  "realizedPnl": 0,
+  "unrealizedYesPnl": 7.00,
+  "unrealizedNoPnl": 0,
+  "currentYesPrice": 0.52,
+  "currentNoPrice": 0.48,
+  "status": "open"
+}
 ```
 
 ### `GET /user/orders`
@@ -548,18 +672,201 @@ Get history of auto-settled positions.
 
 *Note: Settlements are automatic. When a market resolves, winnings are instantly transferred to your wallet. No claim action required.*
 
+### `GET /user/stats`
+Get user's trading statistics.
+- **Headers:** `Authorization: Bearer <token>`
+- **Response:**
+```json
+{
+  "totalVolume": 125000.00,
+  "totalTrades": 342,
+  "feeTier": 0,
+  "memberSince": 1709999000
+}
+```
+
 ---
 
-## 6. Fee Schedule
+## 6. Margin & Leverage (Authenticated)
+
+### `GET /margin/config`
+Get leverage configuration.
+- **Response:**
+```json
+{
+  "enabled": true,
+  "maxLeverage": 10,
+  "minLeverage": 1,
+  "maintenanceMarginPct": 10,
+  "liquidationPenaltyPct": 2,
+  "minMarginUsd": 5.00
+}
+```
+
+### `GET /margin/pool`
+Get lending pool and insurance fund status.
+- **Response:**
+```json
+{
+  "lendingPool": {
+    "totalDeposited": 100000.00,
+    "totalLoaned": 45000.00,
+    "available": 55000.00,
+    "utilizationPct": 45.0
+  },
+  "insuranceFund": {
+    "balance": 5000.00,
+    "totalReceived": 7500.00,
+    "totalPaidOut": 2500.00
+  }
+}
+```
+
+### `GET /margin/accounts`
+Get all margin accounts for the authenticated user.
+- **Headers:** `Authorization: Bearer <token>`
+- **Response:**
+```json
+{
+  "accounts": [
+    {
+      "id": "uuid",
+      "positionId": "uuid",
+      "marketId": "uuid",
+      "market": {
+        "pubkey": "So111...",
+        "asset": "BTC",
+        "timeframe": "5m"
+      },
+      "side": "YES",
+      "shares": 100,
+      "entryPrice": 0.50,
+      "marginDeposited": 10.00,
+      "loanAmount": 40.00,
+      "leverage": 5.0,
+      "liquidationPrice": 0.44,
+      "currentPrice": 0.52,
+      "status": "OPEN",
+      "health": {
+        "equity": 12.00,
+        "marginRatio": 24.0,
+        "distanceToLiq": 0.08,
+        "distanceToLiqPct": 15.38,
+        "isAtRisk": true
+      },
+      "createdAt": 1709999000
+    }
+  ],
+  "total": 1
+}
+```
+
+### `GET /margin/accounts/:id`
+Get a specific margin account.
+- **Headers:** `Authorization: Bearer <token>`
+- **Response:** Same as individual account in `/margin/accounts`
+
+### `POST /margin/add`
+Add margin to an existing leveraged position.
+- **Headers:** `Authorization: Bearer <token>`
+- **Body:**
+```json
+{
+  "marginAccountId": "uuid",
+  "amount": 5.00
+}
+```
+- **Response:**
+```json
+{
+  "success": true,
+  "marginAccountId": "uuid",
+  "amountAdded": 5.00,
+  "newLoanAmount": 35.00,
+  "newLiquidationPrice": 0.39
+}
+```
+
+### `POST /margin/calculate`
+Calculate leverage parameters before placing an order.
+- **Headers:** `Authorization: Bearer <token>`
+- **Body:**
+```json
+{
+  "side": "YES",
+  "price": 0.50,
+  "size": 100,
+  "leverage": 5
+}
+```
+- **Response:**
+```json
+{
+  "side": "YES",
+  "entryPrice": 0.50,
+  "shares": 100,
+  "leverage": 5,
+  "totalPosition": 50.00,
+  "marginRequired": 10.00,
+  "loanAmount": 40.00,
+  "liquidationPrice": 0.44,
+  "maintenanceMarginPct": 10,
+  "canBorrow": true,
+  "maxAvailableLoan": 55000.00,
+  "borrowError": null
+}
+```
+
+### `GET /margin/liquidations`
+Get liquidation history for the authenticated user.
+- **Headers:** `Authorization: Bearer <token>`
+- **Response:**
+```json
+{
+  "liquidations": [
+    {
+      "id": "uuid",
+      "marginAccountId": "uuid",
+      "marketId": "uuid",
+      "triggerPrice": 0.44,
+      "executionPrice": 0.43,
+      "sharesLiquidated": 100,
+      "proceeds": 43.00,
+      "loanRepaid": 40.00,
+      "penalty": 1.00,
+      "returnedToUser": 2.00,
+      "badDebt": 0,
+      "txSignature": "5K2x...",
+      "createdAt": 1709999000
+    }
+  ],
+  "total": 1
+}
+```
+
+---
+
+## 7. Fee Schedule
 
 ### Current Fee Structure
 
-| Action | Maker Fee | Taker Fee |
-|--------|-----------|-----------|
-| Trade  | 0.00%     | 0.10%     |
+**Maker Fee:** 0.00% (free to encourage liquidity)
+
+**Taker Fee (Tiered by Notional Value):**
+
+| Tier | Notional Range | Fee |
+|------|----------------|-----|
+| Tier 1 | $0 - $50 | Flat $0.02 |
+| Tier 2 | $50 - $500 | 5 bps (0.05%) |
+| Tier 3 | $500 - $2,000 | 4 bps (0.04%) |
+| Tier 4 | $2,000+ | 3 bps (0.03%) |
+
+**Order Minimums:**
+- Minimum buy order: $5.00 notional
+- Minimum sell order: $0.02 notional
 
 **Notes:**
-- Fees are charged on the notional value of the trade
+- Fees are charged per fill (not per order)
 - Maker = adds liquidity (limit order that rests on book)
 - Taker = removes liquidity (market order or crossing limit)
 - Settlement/claim is free (no fee on winnings)
@@ -569,26 +876,47 @@ Get current fee schedule.
 - **Response:**
 ```json
 {
-  "trading": {
-    "makerFee": 0.0000,
-    "takerFee": 0.0010
-  },
-  "settlement": {
-    "claimFee": 0.0000
-  },
-  "discounts": {
-    "volumeTiers": [
-      { "minVolume": 0, "makerDiscount": 0, "takerDiscount": 0 },
-      { "minVolume": 100000, "makerDiscount": 0, "takerDiscount": 0.10 },
-      { "minVolume": 1000000, "makerDiscount": 0, "takerDiscount": 0.25 }
-    ]
+  "makerFeeBps": 0,
+  "tiers": [
+    { 
+      "minNotional": 0, 
+      "maxNotional": 50, 
+      "type": "flat",
+      "flatFee": 0.02,
+      "bps": null
+    },
+    { 
+      "minNotional": 50, 
+      "maxNotional": 500, 
+      "type": "percentage",
+      "flatFee": null,
+      "bps": 5
+    },
+    { 
+      "minNotional": 500, 
+      "maxNotional": 2000, 
+      "type": "percentage",
+      "flatFee": null,
+      "bps": 4
+    },
+    { 
+      "minNotional": 2000, 
+      "maxNotional": null, 
+      "type": "percentage",
+      "flatFee": null,
+      "bps": 3
+    }
+  ],
+  "minimums": {
+    "buy": 5.0,
+    "sell": 0.02
   }
 }
 ```
 
 ---
 
-## 7. Error Handling
+## 8. Error Handling
 
 ### Error Response Format
 All errors follow this structure:
@@ -645,7 +973,7 @@ All errors follow this structure:
 
 ---
 
-## 8. Rate Limits
+## 9. Rate Limits
 
 | Endpoint Type | Limit |
 |---------------|-------|

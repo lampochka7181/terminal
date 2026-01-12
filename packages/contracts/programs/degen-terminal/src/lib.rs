@@ -46,7 +46,7 @@ pub mod degen_terminal {
     /// 
     /// # Arguments
     /// * `maker_fee_bps` - Optional new maker fee in basis points
-    /// * `taker_fee_bps` - Optional new taker fee in basis points
+    /// * `taker_fee_bps` - Optional new taker fee in basis points (used as max fee cap)
     pub fn update_config(
         ctx: Context<UpdateConfig>,
         maker_fee_bps: Option<u16>,
@@ -155,13 +155,15 @@ pub mod degen_terminal {
     /// * `maker_args` - Maker's order parameters
     /// * `taker_args` - Taker's order parameters  
     /// * `match_size` - Number of contracts to match
+    /// * `taker_fee` - Fee amount in USDC (6 decimals), calculated by relayer using tiered structure
     pub fn execute_match(
         ctx: Context<ExecuteMatch>,
         maker_args: PlaceOrderArgs,
         taker_args: PlaceOrderArgs,
         match_size: u64,
+        taker_fee: u64,
     ) -> Result<()> {
-        instructions::execute_match(ctx, maker_args, taker_args, match_size)
+        instructions::execute_match(ctx, maker_args, taker_args, match_size, taker_fee)
     }
 
     /// Execute a closing trade (seller sells existing shares to buyer)
