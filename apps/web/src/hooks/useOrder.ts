@@ -47,6 +47,8 @@ export interface OrderResult {
   totalSpent?: number;
   avgPrice?: number;
   unfilledDollars?: number;
+  // Error info when order fails (allows immediate access without waiting for state)
+  error?: string;
 }
 
 export interface UseOrderReturn {
@@ -101,9 +103,16 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
       setError(sizeValidation.error || 'Invalid size');
       return null;
     }
+    
+    // Use truncated size to ensure on-chain compatibility
+    const truncatedSize = sizeValidation.truncatedSize || params.size;
 
     setIsPlacing(true);
     setError(null);
+    
+    // TIMING: Order flow start
+    const t0 = performance.now();
+    console.log(`[⏱️ ORDER TIMING] T+0ms: User clicked ${params.side === 'ask' ? 'SELL' : 'BUY'} - starting order flow`);
 
     try {
       const expiryTimestamp = params.expiryTimestamp || Math.floor(Date.now() / 1000) + 3600;
@@ -122,7 +131,7 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
           market: params.marketAddress,
           side: params.side,
           outcome: params.outcome,
-          size: params.size,
+          size: truncatedSize,
           minPrice: params.price,
           expiry: expiryTimestamp,
           clientOrderId,
@@ -147,7 +156,7 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
           market: params.marketAddress,
           side: params.side,
           outcome: params.outcome,
-          size: params.size,
+          size: truncatedSize,
           price: params.price,
           expiry: expiryTimestamp,
           clientOrderId,
@@ -250,13 +259,17 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         isLeveraged: params.leverage && params.leverage > 1
       });
       
+      // TIMING: Sending API request
+      const t1 = performance.now();
+      console.log(`[⏱️ ORDER TIMING] T+${(t1-t0).toFixed(0)}ms: Signed, sending API request...`);
+      
       const response = await api.notifyOrderPlaced({
         marketAddress: params.marketAddress,
         side: params.side,
         outcome: params.outcome,
         type: params.orderType,
         price: params.price,
-        size: params.size,
+        size: truncatedSize,
         expiry: expiryTimestamp,
         clientOrderId,
         dollarAmount: params.dollarAmount,
@@ -268,20 +281,41 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         marginAmount: params.marginAmount,
       });
 
+      // TIMING: Got API response
+      const t2 = performance.now();
+      console.log(`[⏱️ ORDER TIMING] T+${(t2-t0).toFixed(0)}ms: API response received (API took ${(t2-t1).toFixed(0)}ms)`);
       console.log('[Order] Order response:', response);
 
-      // Trigger user data refetch
-      useUserStore.getState().fetchAll();
+      // Clear pending order
+      useUserStore.getState().setPendingOrder(null);
+      
+      // IMMEDIATE POSITION UPDATE: Use position data from response for instant UI update
+      // This avoids the extra API round-trip that was causing 1-2 second delays
+      if (response.position) {
+        console.log(`[⏱️ ORDER TIMING] T+${(performance.now()-t0).toFixed(0)}ms: Updating position in store...`);
+        useUserStore.getState().upsertPosition(response.position);
+        console.log(`[⏱️ ORDER TIMING] T+${(performance.now()-t0).toFixed(0)}ms: Position store updated!`);
+      } else if (response.position === null && params.side === 'ask') {
+        // Position was fully closed (sell order)
+        console.log('[Order] Position fully closed, removing from state');
+        useUserStore.getState().removePosition(params.marketAddress);
+      }
+      
+      // Background refresh for balance and other data (doesn't block UI)
+      // Use setTimeout to not block the return
+      setTimeout(() => {
+        useUserStore.getState().fetchBalance();
+      }, 100);
 
       const result: OrderResult = {
         orderId: response.orderId || `order-${clientOrderId}`,
         orderPda: '',
         txSignature: '',
         status: response.status as 'open' | 'partial' | 'filled' | 'cancelled' || 'filled',
-        fills: (response as any).fills || 0,
-        filledSize: (response as any).filledSize || 0,
+        fills: response.fills || 0,
+        filledSize: response.filledSize || 0,
         totalSpent: (response as any).totalSpent,
-        avgPrice: (response as any).avgPrice,
+        avgPrice: response.avgPrice,
         unfilledDollars: (response as any).unfilledDollars,
       };
 
@@ -291,10 +325,23 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
     } catch (err) {
       console.error('[Order] Error placing order:', err);
       
+      // Clear pending order on error
+      useUserStore.getState().setPendingOrder(null);
+      
       let errorMessage = 'Failed to place order';
+      let shouldRefreshPositions = false;
       
       if (err instanceof ApiError) {
+        // Handle specific leverage-related errors
+        if (err.code === 'POSITION_BEING_LIQUIDATED') {
+          errorMessage = '⚠️ This position is being liquidated. Please wait for the liquidation to complete.';
+          shouldRefreshPositions = true;
+        } else if (err.code === 'POSITION_ALREADY_CLOSED') {
+          errorMessage = '🔒 This position has been liquidated. Please refresh to see your updated positions.';
+          shouldRefreshPositions = true;
+        } else {
         errorMessage = err.message;
+        }
       } else if (err instanceof Error) {
         if (err.message.includes('User rejected') || err.message.includes('rejected')) {
           errorMessage = 'Transaction was rejected';
@@ -306,9 +353,25 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
           errorMessage = err.message;
         }
       }
+      
+      // Auto-refresh positions for liquidation-related errors
+      if (shouldRefreshPositions) {
+        setTimeout(() => {
+          useUserStore.getState().fetchAllImmediate();
+        }, 500);
+      }
 
       setError(errorMessage);
-      return null;
+      
+      // Return error result object so caller can immediately access error message
+      // without waiting for async state update
+      return {
+        orderId: '',
+        status: 'error' as const,
+        fills: 0,
+        filledSize: 0,
+        error: errorMessage,
+      };
 
     } finally {
       setIsPlacing(false);
@@ -355,7 +418,7 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         
         try {
           await api.cancelOrder(orderId, signature);
-          useUserStore.getState().fetchAll();
+          useUserStore.getState().fetchAllImmediate();
         } catch (apiErr) {
           console.warn('[Order] Backend notification failed, but order cancelled on-chain');
         }
@@ -375,7 +438,7 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
 
         await api.cancelOrder(orderId, signature);
         console.log('[Order] Order cancelled:', orderId);
-        useUserStore.getState().fetchAll();
+        useUserStore.getState().fetchAllImmediate();
         
         return true;
       }
@@ -436,7 +499,7 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
       const result = await api.cancelAllOrders(signature, marketAddress);
       
       console.log('[Order] Cancelled orders:', result.cancelledCount);
-      useUserStore.getState().fetchAll();
+      useUserStore.getState().fetchAllImmediate();
       
       return result.cancelledCount;
 
@@ -487,6 +550,13 @@ export function useQuickOrder(sessionSigner?: SessionSigner) {
     if (connected && !isAuthenticated && publicKey && signMessage) {
       try {
         await signIn(publicKey.toBase58(), signMessage);
+        
+        // Check if sign-in actually succeeded (it may return early without error)
+        const { isAuthenticated: nowAuthenticated } = useAuthStore.getState();
+        if (!nowAuthenticated) {
+          console.warn('[QuickOrder] Sign-in did not complete');
+          return null;
+        }
       } catch (err) {
         console.error('[QuickOrder] Sign-in failed:', err);
         return null;

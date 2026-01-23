@@ -629,15 +629,81 @@ METRICS = {
 
 ---
 
-## 10. Future Improvements
+## 10. Velocity-Aware Quote Pulling (Phase 1 - V3)
+
+**Status: ✅ IMPLEMENTED**
+
+The MM now detects fast price movements and automatically pulls quotes on the losing side to prevent adverse selection.
+
+### How It Works
+
+1. **Velocity Tracking**: Maintains rolling window of price history (default 3 seconds)
+2. **Velocity Classification**: LOW → MEDIUM → HIGH → EXTREME based on %/second
+3. **Directional Detection**: Determines which side (YES or NO) is being hurt
+4. **Quote Decision**: Adjusts spread/size multipliers or pulls quotes entirely
+
+### Velocity Thresholds (Configurable)
+
+| Urgency | Threshold | Action |
+|---------|-----------|--------|
+| LOW | < 0.1%/sec | Normal quoting |
+| MEDIUM | 0.1-0.3%/sec | 1.5x spread, 50% size |
+| HIGH | 0.3-0.5%/sec | 2x spread, 25% size, pull losing side |
+| EXTREME | > 0.5%/sec | 3x spread, 10% size, EMERGENCY PULL losing side |
+
+### Emergency Pull
+
+When velocity is EXTREME, the MM immediately cancels orders on the hurting side **without waiting for the quote cycle**. This prevents getting picked off during fast BTC moves.
+
+### Environment Variables
+
+```bash
+# Enable/disable velocity detection
+MM_VELOCITY_ENABLED=true
+
+# Velocity calculation window (ms)
+MM_VELOCITY_WINDOW_MS=3000
+
+# Max price history entries
+MM_VELOCITY_HISTORY_SIZE=100
+
+# Thresholds (as decimal, e.g., 0.001 = 0.1%/sec)
+MM_VELOCITY_MEDIUM_PCT=0.001
+MM_VELOCITY_HIGH_PCT=0.003
+MM_VELOCITY_EXTREME_PCT=0.005
+
+# Enable sub-cycle emergency pulls
+MM_VELOCITY_EMERGENCY_PULL=true
+```
+
+### Example Scenario
+
+```
+Strike = $100,000
+BTC = $99,500, falling at -$100/sec (-0.1%/sec)
+Fair Value = 0.35 (YES is losing)
+
+Velocity: MEDIUM → Hurting: YES
+Action: 1.5x spread, 50% size on YES bids
+
+If BTC accelerates to -$500/sec (-0.5%/sec):
+Velocity: EXTREME → Hurting: YES
+Action: EMERGENCY PULL all YES bids immediately
+```
+
+---
+
+## 11. Future Improvements
 
 - [ ] **Smarter fair value:** Use implied volatility surface, not flat vol
-- [ ] **Order flow signals:** Detect informed traders, widen spread
+- [x] **Velocity detection:** Pull quotes on fast moves (Phase 1 complete)
+- [ ] **Order flow signals:** Detect informed traders (VPIN), widen spread
 - [ ] **Cross-market hedging:** Net exposure across timeframes
-- [ ] **Dynamic spread:** Widen in high volatility, tighten when quiet
 - [ ] **Maker rebates:** If platform adds maker rebates, factor into pricing
 - [ ] **Multiple price sources:** Arbitrage between Binance/Coinbase
 - [ ] **Backtesting framework:** Test strategies on historical data
+- [ ] **Log-odds space quoting:** RN-JD from arXiv:2510.15205 (Phase 2)
+- [ ] **Belief volatility calibration:** Replace static vol with σ_b (Phase 3)
 
 ---
 

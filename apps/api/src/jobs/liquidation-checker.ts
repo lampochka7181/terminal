@@ -1,4 +1,4 @@
-import { eq, and } from 'drizzle-orm';
+import { eq, and, sql } from 'drizzle-orm';
 import { db, marginAccounts, markets } from '../db/index.js';
 import { marginService } from '../services/margin.service.js';
 import { lendingService } from '../services/lending.service.js';
@@ -8,6 +8,7 @@ import { anchorClient } from '../lib/anchor-client.js';
 import { logger, keeperLogger, logEvents } from '../lib/logger.js';
 import { broadcastUserLiquidation } from '../lib/broadcasts.js';
 import { config } from '../config.js';
+import { redis } from '../db/redis.js';
 
 /**
  * Liquidation Checker Job
@@ -28,6 +29,10 @@ export const LIQUIDATION_CHECK_INTERVAL_MS = 1 * 1000; // 1 second
 const LIQUIDATION_COOLDOWN_MS = 30 * 1000; // 30 seconds
 const failedLiquidations = new Map<string, number>(); // marginAccountId -> timestamp of last failure
 
+// Cache key for tracking if there are any open margin accounts
+const OPEN_ACCOUNTS_CACHE_KEY = 'liquidation:has_open_accounts';
+const OPEN_ACCOUNTS_CACHE_TTL = 10; // seconds
+
 /**
  * Main liquidation checker job
  */
@@ -36,8 +41,22 @@ export async function liquidationCheckerJob(): Promise<void> {
   if (!lendingService.isEnabled()) {
     return;
   }
-  
+
+  // SHORT-CIRCUIT: Check cached count first to avoid DB query when no accounts
+  // This prevents unnecessary DB load when there are no leveraged positions
+  try {
+    const cachedHasAccounts = await redis.get(OPEN_ACCOUNTS_CACHE_KEY);
+    if (cachedHasAccounts === '0') {
+      // No open margin accounts, skip the expensive DB query
+      return;
+    }
+  } catch {
+    // Redis error - proceed with DB query as fallback
+  }
+
   // Get all open margin accounts with their markets
+  // Only check accounts where on-chain position is confirmed (prevents race condition
+  // where liquidation runs before execute_match completes)
   const accountsToCheck = await db
     .select({
       account: marginAccounts,
@@ -47,9 +66,24 @@ export async function liquidationCheckerJob(): Promise<void> {
     .innerJoin(markets, eq(marginAccounts.marketId, markets.id))
     .where(and(
       eq(marginAccounts.status, 'OPEN'),
-      eq(markets.status, 'OPEN')
+      eq(markets.status, 'OPEN'),
+      // Only liquidate accounts with confirmed on-chain position
+      // This prevents trying to execute_close before execute_match completes
+      sql`${marginAccounts.onChainConfirmedAt} IS NOT NULL`
     ));
-  
+
+  // Update cache with current count (even if 0)
+  try {
+    await redis.set(
+      OPEN_ACCOUNTS_CACHE_KEY,
+      accountsToCheck.length > 0 ? '1' : '0',
+      'EX',
+      OPEN_ACCOUNTS_CACHE_TTL
+    );
+  } catch {
+    // Ignore Redis errors - non-critical
+  }
+
   if (accountsToCheck.length === 0) {
     return;
   }
@@ -129,6 +163,17 @@ export async function liquidationCheckerJob(): Promise<void> {
     
     // Execute liquidation
     try {
+      // SET LIQUIDATION LOCK FIRST - blocks user sells while we liquidate
+      // This happens BEFORE any on-chain work to prevent race conditions
+      const lockSet = await marginService.setLiquidationLock(account.id);
+      if (!lockSet) {
+        keeperLogger.warn(`Could not set liquidation lock on ${account.id} - may already be liquidating or closed`, {
+          source: 'LIQUIDATION',
+          marginAccountId: account.id,
+        });
+        continue; // Skip - either already being liquidated or already closed
+      }
+      
       keeperLogger.info(`Liquidating margin account ${account.id}`, {
         source: 'LIQUIDATION',
         userId: account.userId,
@@ -178,28 +223,26 @@ export async function liquidationCheckerJob(): Promise<void> {
       }
       
       if (mmWallet && market.pubkey && anchorClient.isReady()) {
-        // For execute_close, we need to pass the price for the outcome being traded
-        // getExecutionPrice returns YES price (from walking YES orderbook)
-        // For NO positions, convert to NO price: NO_price = 1 - YES_price
-        const closePrice = side === 'NO' 
-          ? (1 - executionPrice)  // Convert YES price to NO price
-          : executionPrice;       // YES price used directly
+        // For execute_close, the price is already in the native terms for each side:
+        // - YES positions: executionPrice is YES liquidation price
+        // - NO positions: executionPrice is NO liquidation price (already converted above)
+        // So we use executionPrice directly - no conversion needed!
+        const closePrice = executionPrice;
         
-        keeperLogger.info(`Executing liquidation close on-chain: ${shares.toFixed(2)} ${side} @ ${closePrice.toFixed(4)} (raw YES price: ${executionPrice.toFixed(4)})`, {
+        keeperLogger.info(`Executing liquidation close on-chain: ${shares.toFixed(2)} ${side} @ ${closePrice.toFixed(4)} (liquidation price)`, {
           source: 'LIQUIDATION',
           lendingPool: lendingPoolWallet.slice(0, 8),
           mmWallet: mmWallet.slice(0, 8),
           marketPubkey: market.pubkey.slice(0, 8),
           side,
           closePrice,
-          rawExecutionPrice: executionPrice,
         });
         
         try {
           // Execute close: Lending Pool sells shares to MM
           // MM buys back the shares at the close price
-          // Minimum fee required by contract: $0.02 (MIN_TAKER_FEE = 20000 in 6 decimals)
-          const MIN_LIQUIDATION_FEE = 0.02;
+          // Use configured flat fee (same as regular orders) to ensure profitability
+          const liquidationFee = config.fees.flatFeeUsd;
           
           const closeResult = await transactionService.executeClose({
             marketPubkey: market.pubkey,
@@ -208,7 +251,7 @@ export async function liquidationCheckerJob(): Promise<void> {
             outcome: side,                   // The share type being traded
             price: closePrice,               // Converted price for the outcome
             matchSize: shares,
-            takerFee: MIN_LIQUIDATION_FEE,   // Min $0.02 fee required by contract
+            takerFee: liquidationFee,        // Use config flat fee for consistency
           });
           
           if (closeResult.success) {
@@ -247,6 +290,9 @@ export async function liquidationCheckerJob(): Promise<void> {
       // Only process liquidation in DB if on-chain close succeeded
       // Otherwise the position still exists on-chain and we'd create accounting mismatch
       if (!onChainCloseSuccess) {
+        // Clear the liquidation lock so user can try to sell (or we retry liquidation)
+        await marginService.clearLiquidationLock(account.id);
+        
         // Track failed liquidation for cooldown (prevent spam)
         failedLiquidations.set(account.id, Date.now());
         

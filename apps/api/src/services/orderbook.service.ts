@@ -61,6 +61,15 @@ export interface OrderbookUpdate {
 const PRICE_MULTIPLIER = 1000000;
 
 export class OrderbookService {
+  private perfEnabled(): boolean {
+    return String(process.env.PERF_REDIS_ORDERBOOK_LOGS || '').toLowerCase() === 'true';
+  }
+
+  private perfMaybeLog(op: string, key: string, details: Record<string, any>): void {
+    if (!this.perfEnabled()) return;
+    logger.info({ op, key, ...details }, '[ORDERBOOK PERF]');
+  }
+
   /**
    * Add an order to the orderbook
    */
@@ -112,8 +121,13 @@ export class OrderbookService {
     
     // Find and remove the order from sorted set
     // We need to find it first since member includes size and timestamp
+    const tScan = Date.now();
     const members = await redis.zrange(key, 0, -1);
+    const scanMs = Date.now() - tScan;
     const memberToRemove = members.find(m => m.startsWith(`${order.id}:`));
+    if (scanMs > 20 || members.length > 1000) {
+      this.perfMaybeLog('removeOrder.scan', key, { scanMs, members: members.length });
+    }
     
     if (memberToRemove) {
       await redis.zrem(key, memberToRemove);
@@ -148,8 +162,13 @@ export class OrderbookService {
     const orderKey = `order:${order.id}`;
     
     // Find and remove old entry
+    const tScan = Date.now();
     const members = await redis.zrange(key, 0, -1);
+    const scanMs = Date.now() - tScan;
     const oldMember = members.find(m => m.startsWith(`${order.id}:`));
+    if (scanMs > 20 || members.length > 1000) {
+      this.perfMaybeLog('updateOrderSize.scan', key, { scanMs, members: members.length });
+    }
     
     if (oldMember) {
       await redis.zrem(key, oldMember);
@@ -211,33 +230,18 @@ export class OrderbookService {
   async getBestAsk(marketId: string, outcome: 'YES' | 'NO'): Promise<OrderbookOrder | null> {
     const key = RedisKeys.orderbook(marketId, outcome, 'ASK');
     
-    // DEBUG: Log all asks in the sorted set
-    const allAsks = await redis.zrange(key, 0, 4, 'WITHSCORES');
-    if (allAsks.length > 0) {
-      const askPrices: string[] = [];
-      for (let i = 0; i < allAsks.length; i += 2) {
-        const score = parseFloat(allAsks[i + 1]) / 1000000;
-        askPrices.push(`$${score.toFixed(2)}`);
-      }
-      logger.debug(`[ORDERBOOK DEBUG] ${key} top asks: ${askPrices.join(', ')}`);
-    }
-    
     // Keep trying until we find a valid order or exhaust the book
     while (true) {
       const results = await redis.zrange(key, 0, 0, 'WITHSCORES');
       
       if (results.length < 2) return null;
       
-      const [member, scoreStr] = results;
+      const [member] = results;
       const [orderId] = member.split(':');
-      const price = parseFloat(scoreStr) / 1000000;
-      
-      logger.debug(`[ORDERBOOK DEBUG] getBestAsk checking orderId=${orderId.slice(0,8)}, score/price=$${price.toFixed(2)}`);
       
       const order = await this.getOrderFromHash(orderId);
       
       if (order) {
-        logger.debug(`[ORDERBOOK DEBUG] getBestAsk returning order at $${order.price.toFixed(2)}`);
         return order;
       }
       
@@ -309,7 +313,13 @@ export class OrderbookService {
     const key = RedisKeys.orderbook(marketId, outcome, side);
     
     // Get all orders with scores
+    const tRange = Date.now();
     const results = await redis.zrange(key, 0, -1, 'WITHSCORES');
+    const rangeMs = Date.now() - tRange;
+    const entries = Math.floor(results.length / 2);
+    if (rangeMs > 30 || entries > 2000) {
+      this.perfMaybeLog('getAggregatedLevels.zrange', key, { rangeMs, entries, side, outcome });
+    }
     
     // Aggregate by price level
     const levels = new Map<number, { size: number; count: number }>();
@@ -402,7 +412,12 @@ export class OrderbookService {
     
     for (const key of patterns) {
       // Get all order IDs first
+      const tRange = Date.now();
       const members = await redis.zrange(key, 0, -1);
+      const rangeMs = Date.now() - tRange;
+      if (rangeMs > 50 || members.length > 2000) {
+        this.perfMaybeLog('clearOrderbook.zrange', key, { rangeMs, members: members.length });
+      }
       for (const member of members) {
         const [orderId] = member.split(':');
         await redis.del(`order:${orderId}`);

@@ -13,14 +13,15 @@ if (!config.databaseUrl) {
 }
 
 // Create PostgreSQL connection pool
-// Optimized for Supabase's connection pooler (Supavisor)
-// Supabase Pro plan supports 200+ pooled connections
+// Optimized for Supabase's connection pooler (Supavisor) in transaction mode
+// Supabase Pro plan supports 60 direct + 200+ pooled connections
 export const pool = new Pool({
   connectionString: config.databaseUrl,
-  max: 100,                   // Increased for MM bot + keeper jobs concurrency
-  min: 2,                     // Keep a couple warm connections ready
-  idleTimeoutMillis: 30000,   // Release idle connections after 30s
-  connectionTimeoutMillis: 15000, // Be more tolerant of pooler / network jitter (15s)
+  max: config.dbPool.max,
+  min: config.dbPool.min,
+  idleTimeoutMillis: config.dbPool.idleTimeoutMillis,
+  connectionTimeoutMillis: config.dbPool.connectionTimeoutMillis,
+  statement_timeout: 15000,   // Kill queries running > 15s (was 30s)
   ssl: config.databaseUrl?.includes('supabase') 
     ? { rejectUnauthorized: false } 
     : undefined,
@@ -29,16 +30,35 @@ export const pool = new Pool({
 
 // Monitor pool metrics
 let lastHighLoadLog = 0;
-pool.on('acquire', () => {
+let lastPoolStatusLog = 0;
+
+// Log pool status periodically for debugging
+const logPoolStatus = () => {
+  const now = Date.now();
   const total = pool.totalCount;
   const idle = pool.idleCount;
   const waiting = pool.waitingCount;
   
-  // Only log if there's actual pressure (waiting clients) and not too frequently
-  if (waiting > 10 && Date.now() - lastHighLoadLog > 30000) {
-    lastHighLoadLog = Date.now();
+  // Log every 5 seconds if there's any waiting, or every 30s otherwise
+  const interval = waiting > 0 ? 5000 : 30000;
+  if (now - lastPoolStatusLog > interval) {
+    lastPoolStatusLog = now;
+    logger.debug(`[DB Pool] total=${total}, idle=${idle}, waiting=${waiting}`);
+  }
+  
+  // Warn if high load
+  if (waiting > 30 && now - lastHighLoadLog > 60000) {
+    lastHighLoadLog = now;
     logger.warn(`Database connection pool high load: total=${total}, idle=${idle}, waiting=${waiting}`);
   }
+};
+
+pool.on('acquire', logPoolStatus);
+pool.on('connect', () => {
+  logger.debug(`[DB Pool] New connection created (total=${pool.totalCount})`);
+});
+pool.on('remove', () => {
+  logger.debug(`[DB Pool] Connection removed (total=${pool.totalCount})`);
 });
 
 // Handle pool errors (these are connection-level errors, not query errors)

@@ -115,8 +115,8 @@ export class OrderService {
   /**
    * Create a new order
    */
-  async create(data: NewOrder & { status?: OrderStatus, filledSize?: number }): Promise<Order> {
-    const { status = 'OPEN', filledSize = 0, ...orderData } = data;
+  async create(data: NewOrder & { status?: OrderStatus, filledSize?: number, leverage?: number, marginAmount?: number }): Promise<Order> {
+    const { status = 'OPEN', filledSize = 0, leverage, marginAmount, ...orderData } = data;
     const remainingSize = parseFloat(orderData.size) - filledSize;
 
     const [order] = await db
@@ -126,10 +126,12 @@ export class OrderService {
         status,
         filledSize: filledSize.toString(),
         remainingSize: Math.max(0, remainingSize).toString(),
+        leverage: leverage ? leverage.toString() : '1',
+        marginAmount: marginAmount ? marginAmount.toString() : null,
       })
       .returning();
     
-    logger.debug(`Order created: ${order.id} (${status})`);
+    logger.debug(`Order created: ${order.id} (${status})${leverage && leverage > 1 ? ` [${leverage}x leverage]` : ''}`);
     return order;
   }
 
@@ -317,6 +319,32 @@ export class OrderService {
       );
     
     return result;
+  }
+
+  /**
+   * Batch cancel multiple orders in a single DB operation
+   * Used by MM Bot to avoid sequential cancel calls
+   */
+  async cancelBatch(orderIds: string[], reason: string = 'MM_CANCEL'): Promise<number> {
+    if (orderIds.length === 0) return 0;
+    
+    await db
+      .update(orders)
+      .set({
+        status: 'CANCELLED',
+        cancelledAt: new Date(),
+        cancelReason: reason,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          inArray(orders.id, orderIds),
+          or(eq(orders.status, 'OPEN'), eq(orders.status, 'PARTIAL'))
+        )
+      );
+    
+    logger.debug(`Batch cancelled ${orderIds.length} orders (${reason})`);
+    return orderIds.length;
   }
 }
 

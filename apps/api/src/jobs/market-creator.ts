@@ -62,16 +62,21 @@ export async function marketCreatorJob(): Promise<void> {
 
 /**
  * Pre-create markets for a given config
+ * 
+ * OPTIMIZED: Uses batch pubkey lookup instead of sequential queries
  */
 async function createPendingMarkets(
   marketConfig: MarketConfig,
   now: number
 ): Promise<void> {
   const { asset, timeframe, intervalMs, durationMs } = marketConfig;
+  const startTime = Date.now();
   
   // Get all existing OPEN markets to avoid duplicates
   // (Markets with strikePrice = '0' are pending activation but still have status OPEN)
   const existingMarkets = await marketService.getMarkets({ asset, timeframe });
+  logger.debug(`[MarketCreator] ${asset}-${timeframe}: getMarkets took ${Date.now() - startTime}ms`);
+  
   const existingExpiries = new Set(
     existingMarkets
       .filter(m => m.status === 'OPEN')
@@ -79,6 +84,13 @@ async function createPendingMarkets(
   );
   
   const currentIntervalStart = Math.floor(now / intervalMs) * intervalMs;
+  
+  // Phase 1: Collect all potential markets and their pubkeys
+  const potentialMarkets: Array<{
+    marketExpiry: number;
+    expiryTs: number;
+    marketPubkey: string;
+  }> = [];
   
   for (let i = 0; i < MARKETS_LOOK_AHEAD; i++) {
     const marketExpiry = currentIntervalStart + (i * intervalMs) + durationMs;
@@ -92,9 +104,21 @@ async function createPendingMarkets(
     const expiryTs = Math.floor(marketExpiry / 1000);
     const marketPubkey = deriveMarketPda(asset, timeframe, expiryTs);
     
-    // Double-check by pubkey
-    const existingByPubkey = await marketService.getByPubkey(marketPubkey);
-    if (existingByPubkey) {
+    potentialMarkets.push({ marketExpiry, expiryTs, marketPubkey });
+  }
+  
+  if (potentialMarkets.length === 0) {
+    return; // Nothing to create
+  }
+  
+  // Phase 2: Batch lookup existing pubkeys (1 query instead of N)
+  const pubkeys = potentialMarkets.map(m => m.marketPubkey);
+  const existingByPubkey = await marketService.getByPubkeys(pubkeys);
+  
+  // Phase 3: Create markets that don't exist
+  for (const { marketExpiry, expiryTs, marketPubkey } of potentialMarkets) {
+    // Skip if already exists in DB
+    if (existingByPubkey.has(marketPubkey)) {
       logger.debug(`Market ${marketPubkey.slice(0, 8)} already exists in DB, skipping`);
       continue;
     }

@@ -114,13 +114,8 @@ pub fn execute_close(
         .checked_add(SHARE_MULTIPLIER - 1).ok_or(DegenError::MathOverflow)?
         .checked_div(SHARE_MULTIPLIER).ok_or(DegenError::DivisionByZero)?;
     
-    // Validate relayer-specified fee
-    let max_fee = transfer_amount
-        .checked_mul(global_state.taker_fee_bps as u64).ok_or(DegenError::MathOverflow)?
-        .checked_div(10_000).ok_or(DegenError::DivisionByZero)?;
-    
+    // Validate relayer-specified fee (minimum only - relayer is trusted)
     require!(args.taker_fee >= MIN_TAKER_FEE, DegenError::FeeTooLow);
-    require!(args.taker_fee <= max_fee.max(MIN_TAKER_FEE), DegenError::FeeTooHigh);
     
     let fee = args.taker_fee;
     let seller_receives = transfer_amount.saturating_sub(fee);

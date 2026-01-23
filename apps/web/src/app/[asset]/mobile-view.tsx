@@ -23,6 +23,9 @@ import { useOrderbook } from '@/hooks/useOrderbook';
 
 const TIMEFRAMES: Timeframe[] = ['5m', '1h', '24h'];
 
+// Truncate to 6 decimal places to match on-chain precision (SHARE_MULTIPLIER = 10^6)
+const truncate6 = (n: number) => Math.floor(n * 1_000_000) / 1_000_000;
+
 interface MobileViewProps {
   asset: Asset;
   onSwitchView: () => void;
@@ -147,7 +150,7 @@ export function MobileView({ asset, onSwitchView }: MobileViewProps) {
                   marketAddress: activeMarket.address,
                   marketExpiry: activeMarket.expiry,
                   mode: 'sell',
-                  shares: position.shares,
+                  shares: truncate6(position.shares),
                   avgEntry: position.avgEntry,
                 });
               }
@@ -211,7 +214,7 @@ export function MobileView({ asset, onSwitchView }: MobileViewProps) {
                   marketAddress,
                   marketExpiry: expiry,
                   mode: 'sell',
-                  shares,
+                  shares: truncate6(shares),
                   avgEntry,
                 });
               }}
@@ -590,9 +593,10 @@ function TradeModal({
   const [limitSize, setLimitSize] = useState('100');
   const [limitPrice, setLimitPrice] = useState(price.toFixed(2));
   
-  // SELL mode state
-  const [sellSize, setSellSize] = useState(existingShares?.toString() || '0');
-  const maxSellSize = existingShares || 0;
+  // SELL mode state - truncate to 6 decimals to match on-chain precision
+  const truncatedExistingShares = existingShares ? truncate6(existingShares) : 0;
+  const [sellSize, setSellSize] = useState(truncatedExistingShares.toString());
+  const maxSellSize = truncatedExistingShares;
   
   const [orderStatus, setOrderStatus] = useState<OrderStatus>('idle');
   const [orderResult, setOrderResult] = useState<{
@@ -695,7 +699,7 @@ function TradeModal({
       maxPrice: (!isSellMode && orderType === 'MARKET') ? maxPrice : undefined,
     });
 
-    if (result) {
+    if (result && !result.error && result.filledSize > 0) {
       setOrderStatus('success');
       setOrderResult({
         orderId: result.orderId,
@@ -706,6 +710,10 @@ function TradeModal({
       setTimeout(() => {
         onClose();
       }, 2000);
+    } else if (result && result.error) {
+      // Handle error returned directly in result (e.g., liquidation errors)
+      setOrderStatus('error');
+      setOrderResult({ errorMessage: result.error });
     } else {
       setOrderStatus('error');
       setOrderResult({ errorMessage: orderError || 'Order failed' });
@@ -795,10 +803,10 @@ function TradeModal({
                   {[0.25, 0.5, 0.75, 1].map((pct) => (
                     <button
                       key={pct}
-                      onClick={() => setSellSize((maxSellSize * pct).toFixed(0))}
+                      onClick={() => setSellSize(truncate6(maxSellSize * pct).toString())}
                       className={cn(
                         'flex-1 py-1.5 text-sm font-bold rounded-lg transition-colors',
-                        Math.abs(sellSizeNum - maxSellSize * pct) < 0.5
+                        sellSizeNum === truncate6(maxSellSize * pct)
                           ? 'bg-warning/20 text-warning'
                           : 'bg-surface-light text-text-muted hover:text-text-primary'
                       )}

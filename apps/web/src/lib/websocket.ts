@@ -120,11 +120,17 @@ export interface UserLiquidationUpdate {
   channel: 'user';
   event: 'liquidation';
   data: {
+    marketId: string;
     marketAddress: string;
-    outcome: 'yes' | 'no';
+    side: 'YES' | 'NO';
     shares: number;
+    entryPrice: number;
     liquidationPrice: number;
-    timestamp: number;
+    executionPrice: number;
+    proceeds: number;
+    returnedToUser: number;
+    leverage: number;
+    timestamp?: number;
   };
 }
 
@@ -383,6 +389,12 @@ export class WebSocketService {
           channel: 'user',
           event: 'settlement',
         };
+      } else if (message.type === 'liquidation') {
+        normalizedMessage = {
+          ...message,
+          channel: 'user',
+          event: 'liquidation',
+        };
       } else if (message.type === 'global_trade') {
         normalizedMessage = {
           ...message,
@@ -435,17 +447,32 @@ export class WebSocketService {
       this.ws.send(JSON.stringify(message));
     } else {
       // Queue the message to be sent when connected
-      console.warn('[WS] Queuing message, not connected yet:', message.op, message.channel, 'readyState:', this.ws?.readyState);
+      // Subscriptions are replayed on connect via `resubscribe()`. Avoid noisy warnings during CONNECTING
+      // (React StrictMode/dev effects can mount/unmount twice, causing rapid subscribe/unsubscribe).
+      const rs = this.ws?.readyState;
+      if (rs === WebSocket.CONNECTING) {
+        console.debug('[WS] Queuing message while CONNECTING:', message.op, message.channel);
+      } else {
+        console.warn('[WS] Queuing message, not connected yet:', message.op, message.channel, 'readyState:', rs);
+      }
     }
   }
 
   // Public API
   authenticate(token: string): void {
+    // Skip if already authenticated to avoid duplicate auth messages
+    if (this.isAuthenticated) {
+      return;
+    }
     this.send({ op: 'auth', token });
   }
 
   subscribeOrderbook(marketAddress: string): void {
     const key = `orderbook:${marketAddress}`;
+    // Skip if already subscribed to avoid duplicate messages
+    if (this.subscriptions.has(key)) {
+      return;
+    }
     const message: WSMessage = {
       op: 'subscribe',
       channel: 'orderbook',
@@ -468,6 +495,10 @@ export class WebSocketService {
 
   subscribeTrades(marketAddress: string): void {
     const key = `trades:${marketAddress}`;
+    // Skip if already subscribed to avoid duplicate messages
+    if (this.subscriptions.has(key)) {
+      return;
+    }
     const message: WSMessage = {
       op: 'subscribe',
       channel: 'trades',
@@ -489,6 +520,10 @@ export class WebSocketService {
 
   subscribePrices(assets: ('BTC' | 'ETH' | 'SOL')[] = ['BTC', 'ETH', 'SOL']): void {
     const key = `prices:${assets.join(',')}`;
+    // Skip if already subscribed to avoid duplicate messages
+    if (this.subscriptions.has(key)) {
+      return;
+    }
     const message: WSMessage = {
       op: 'subscribe',
       channel: 'prices',
@@ -513,6 +548,10 @@ export class WebSocketService {
 
   subscribeMarket(marketAddress: string): void {
     const key = `market:${marketAddress}`;
+    // Skip if already subscribed to avoid duplicate messages
+    if (this.subscriptions.has(key)) {
+      return;
+    }
     const message: WSMessage = {
       op: 'subscribe',
       channel: 'market',
@@ -534,6 +573,10 @@ export class WebSocketService {
 
   subscribeGlobalTrades(): void {
     const key = 'trades:global';
+    // Skip if already subscribed to avoid duplicate messages
+    if (this.subscriptions.has(key)) {
+      return;
+    }
     const message: WSMessage = {
       op: 'subscribe',
       channel: 'trades:global',

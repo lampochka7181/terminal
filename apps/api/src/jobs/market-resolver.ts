@@ -20,55 +20,75 @@ import { prepareSettlementData, settleMarketWithData, type SettlementPrepData } 
 // Track markets being processed to prevent duplicate concurrent processing
 const processingMarkets = new Set<string>();
 
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>
+): Promise<void> {
+  const executing = new Set<Promise<void>>();
+  for (const item of items) {
+    // eslint-disable-next-line no-loop-func
+    const p = worker(item).finally(() => executing.delete(p));
+    executing.add(p);
+    if (executing.size >= limit) {
+      await Promise.race(executing);
+    }
+  }
+  await Promise.all(executing);
+}
+
 export async function marketResolverJob(): Promise<void> {
   const now = new Date();
   
-  // Get markets that are CLOSED but not yet RESOLVED
-  const closedMarkets = await marketService.getMarketsToResolve();
-  
-  // Process CLOSED markets in parallel
-  await Promise.all(
-    closedMarkets
-      .filter(market => !processingMarkets.has(market.id))
-      .map(async market => {
-        processingMarkets.add(market.id);
-        try {
-          await resolveMarket(market.id, market.pubkey, market.asset, market.strikePrice, now);
-        } catch (err: any) {
-          logger.error(`Failed to resolve market ${market.id} (${market.asset}-${market.timeframe}): ${err.message}`);
-        } finally {
-          processingMarkets.delete(market.id);
-        }
-      })
-  );
-  
-  // Check for OPEN markets that should be CLOSED (already expired)
-  // Close AND immediately resolve them in one pass for faster UX
+  // First check for OPEN markets that have expired - this is the most common case
+  // Only make the second query if we actually have expired markets
   const expiredMarkets = await marketService.getExpiredOpenMarkets();
   
-  // Process expired markets in parallel
-  await Promise.all(
-    expiredMarkets
-      .filter(market => !processingMarkets.has(market.id))
-      .map(async market => {
-        processingMarkets.add(market.id);
-        try {
-          // Close + resolve + settle in one atomic flow
-          // We wrap closeMarket in its own try/catch so it doesn't block resolution
-          try {
-            await closeMarket(market.id, market.pubkey);
-          } catch (closeErr: any) {
-            logger.error(`Non-fatal: Failed to close market ${market.id} before resolution: ${closeErr.message}`);
-          }
-          
-          await resolveMarket(market.id, market.pubkey, market.asset, market.strikePrice, now);
-        } catch (err: any) {
-          logger.error(`Failed to resolve market ${market.id} (${market.asset}-${market.timeframe}): ${err.message}`);
-        } finally {
-          processingMarkets.delete(market.id);
-        }
-      })
-  );
+  // Only query for CLOSED markets if we don't have expired ones to process
+  // (CLOSED markets are rare - they only exist briefly between close and resolve)
+  let closedMarkets: Awaited<ReturnType<typeof marketService.getMarketsToResolve>> = [];
+  if (expiredMarkets.length === 0) {
+    closedMarkets = await marketService.getMarketsToResolve();
+  }
+  
+  // Early exit if nothing to do (most common case)
+  if (expiredMarkets.length === 0 && closedMarkets.length === 0) {
+    return;
+  }
+  
+  // Process CLOSED markets with bounded concurrency to avoid DB pool spikes
+  const closedToProcess = closedMarkets.filter(market => !processingMarkets.has(market.id));
+  await runWithConcurrency(closedToProcess, 2, async (market) => {
+    processingMarkets.add(market.id);
+    try {
+      await resolveMarket(market.id, market.pubkey, market.asset, market.strikePrice, now);
+    } catch (err: any) {
+      logger.error(`Failed to resolve market ${market.id} (${market.asset}-${market.timeframe}): ${err.message}`);
+    } finally {
+      processingMarkets.delete(market.id);
+    }
+  });
+  
+  // Process expired markets with bounded concurrency to avoid DB pool spikes
+  const expiredToProcess = expiredMarkets.filter(market => !processingMarkets.has(market.id));
+  await runWithConcurrency(expiredToProcess, 2, async (market) => {
+    processingMarkets.add(market.id);
+    try {
+      // Close + resolve + settle in one atomic flow
+      // We wrap closeMarket in its own try/catch so it doesn't block resolution
+      try {
+        await closeMarket(market.id, market.pubkey);
+      } catch (closeErr: any) {
+        logger.error(`Non-fatal: Failed to close market ${market.id} before resolution: ${closeErr.message}`);
+      }
+      
+      await resolveMarket(market.id, market.pubkey, market.asset, market.strikePrice, now);
+    } catch (err: any) {
+      logger.error(`Failed to resolve market ${market.id} (${market.asset}-${market.timeframe}): ${err.message}`);
+    } finally {
+      processingMarkets.delete(market.id);
+    }
+  });
 }
 
 /**

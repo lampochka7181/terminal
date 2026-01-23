@@ -51,6 +51,14 @@ CREATE TABLE markets (
 CREATE INDEX idx_markets_status ON markets(status);
 CREATE INDEX idx_markets_asset_expiry ON markets(asset, expiry_at);
 CREATE INDEX idx_markets_expiry ON markets(expiry_at) WHERE status = 'OPEN';
+-- Optimized index for getMarkets query (excludes SETTLED, orders by created_at)
+CREATE INDEX idx_markets_active_created ON markets(status, created_at DESC) WHERE status != 'SETTLED';
+-- Optimized for default getMarkets() query: WHERE status != 'SETTLED' ORDER BY created_at DESC
+CREATE INDEX idx_markets_not_settled_created ON markets(created_at DESC) WHERE status != 'SETTLED';
+-- Optimized for getMarkets(asset=X) queries with status exclusion
+CREATE INDEX idx_markets_asset_status_created ON markets(asset, status, created_at DESC) WHERE status != 'SETTLED';
+-- Optimized for pending market activation: WHERE status = 'OPEN' AND strike_price = '0'
+CREATE INDEX idx_markets_pending_activation ON markets(status) WHERE status = 'OPEN' AND strike_price = '0';
 
 -- Orders table
 CREATE TABLE orders (
@@ -70,6 +78,9 @@ CREATE TABLE orders (
     encoded_instruction TEXT,
     binary_message TEXT,
     is_mm_order BOOLEAN DEFAULT FALSE NOT NULL,
+    -- Leverage fields (for displaying leverage info before margin account exists)
+    leverage DECIMAL(4,2) DEFAULT 1,
+    margin_amount DECIMAL(20,6),
     expires_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
@@ -250,6 +261,13 @@ CREATE TABLE margin_accounts (
     leverage DECIMAL(4,2) NOT NULL,
     liquidation_price DECIMAL(10,6) NOT NULL,
     status margin_account_status DEFAULT 'OPEN',
+    -- On-chain tracking (for race condition prevention)
+    -- NULL on_chain_confirmed_at = position not yet confirmed on-chain
+    on_chain_tx_signature VARCHAR(88),
+    on_chain_confirmed_at TIMESTAMP,
+    -- Liquidation lock (set when liquidation starts, blocks user sells)
+    -- NULL = not being liquidated, timestamp = liquidation in progress
+    liquidating_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -257,6 +275,9 @@ CREATE TABLE margin_accounts (
 CREATE INDEX idx_margin_accounts_user ON margin_accounts(user_id);
 CREATE INDEX idx_margin_accounts_status ON margin_accounts(status);
 CREATE INDEX idx_margin_accounts_market ON margin_accounts(market_id);
+CREATE INDEX idx_margin_accounts_confirmed ON margin_accounts(on_chain_confirmed_at) WHERE status = 'OPEN';
+-- Compound index for liquidation checker: WHERE status = 'OPEN' AND on_chain_confirmed_at IS NOT NULL
+CREATE INDEX idx_margin_accounts_open_confirmed ON margin_accounts(status, on_chain_confirmed_at) WHERE status = 'OPEN';
 
 -- Liquidations Table
 CREATE TABLE liquidations (
@@ -296,6 +317,32 @@ CREATE TABLE margin_transactions (
 
 CREATE INDEX idx_margin_transactions_account ON margin_transactions(margin_account_id);
 CREATE INDEX idx_margin_transactions_user ON margin_transactions(user_id);
+
+-- MM Market Metrics Table (tracks MM performance per market)
+CREATE TABLE mm_market_metrics (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    market_id UUID NOT NULL REFERENCES markets(id),
+    
+    -- Position at settlement
+    yes_shares DECIMAL(20,6) DEFAULT 0,
+    no_shares DECIMAL(20,6) DEFAULT 0,
+    
+    -- P&L (calculated as negative of sum of user P&L - zero sum market)
+    total_pnl DECIMAL(20,6) NOT NULL,
+    
+    -- Volume stats
+    trades_count INTEGER DEFAULT 0,
+    volume_traded DECIMAL(20,6) DEFAULT 0,
+    
+    -- Market outcome
+    outcome order_outcome,
+    
+    -- Timing
+    settled_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_mm_market_metrics_market ON mm_market_metrics(market_id);
+CREATE INDEX idx_mm_market_metrics_settled ON mm_market_metrics(settled_at DESC);
 
 -- Views
 CREATE VIEW v_orderbook AS

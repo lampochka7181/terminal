@@ -4,26 +4,36 @@ import { useState, useEffect, useMemo } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useOrderbookStore } from '@/stores/orderbookStore';
 import { useMarketStore } from '@/stores/marketStore';
+import { useUserStore } from '@/stores/userStore';
 import { useQuickOrder } from '@/hooks/useOrder';
 import { cn } from '@/lib/utils';
-import { AlertCircle, ArrowRight, Zap, Loader2, CheckCircle, XCircle, Settings2, TrendingUp } from 'lucide-react';
+import { AlertCircle, ArrowRight, Zap, Loader2, CheckCircle, XCircle, TrendingUp } from 'lucide-react';
 
 type Side = 'YES' | 'NO';
 type OrderType = 'limit' | 'market';
 type OrderStatus = 'idle' | 'signing' | 'submitting' | 'success' | 'error';
 
-// Leverage calculation helpers
+// Leverage calculation helpers (must match backend margin.service.ts)
 const leverageCalc = {
   initialMarginRequired: (totalPosition: number, leverage: number) => totalPosition / leverage,
   loanAmount: (totalPosition: number, leverage: number) => totalPosition - (totalPosition / leverage),
-  liquidationPrice: (shares: number, entryPrice: number, loanAmount: number, side: 'YES' | 'NO') => {
-    const maintenanceMarginPct = 0.10; // 10%
-    const maintenanceMargin = entryPrice * shares * maintenanceMarginPct;
-    if (side === 'YES') {
-      return Math.max(0, Math.min(0.99, (loanAmount + maintenanceMargin) / shares));
-    } else {
-      return Math.max(0.01, Math.min(1, 1 - (loanAmount + maintenanceMargin) / shares));
-    }
+  /**
+   * Calculate liquidation price for a leveraged position
+   * Formula: liqPrice = loanAmount / (shares * (1 - maintenanceMarginPct))
+   * 
+   * For YES: liquidates when YES price drops to this level
+   * For NO: liquidates when NO price drops to this level (returns NO price directly)
+   */
+  liquidationPrice: (shares: number, _entryPrice: number, loanAmount: number, side: 'YES' | 'NO') => {
+    const maintenanceMarginPct = 0.03; // 3% - matches backend config
+    
+    if (shares <= 0 || loanAmount <= 0) return 0;
+    
+    // Same formula for both YES and NO - returns the price at which that side liquidates
+    const liqPrice = loanAmount / (shares * (1 - maintenanceMarginPct));
+    
+    // Clamp to valid price range
+    return Math.max(0.01, Math.min(0.99, liqPrice));
   },
 };
 
@@ -47,8 +57,6 @@ export function TradingPanel() {
   
   // MARKET order inputs
   const [dollarAmount, setDollarAmount] = useState('50');
-  const [priceProtection, setPriceProtection] = useState('0.10');
-  const [showAdvanced, setShowAdvanced] = useState(false);
   
   // Leverage
   const [leverage, setLeverage] = useState(1);
@@ -83,20 +91,18 @@ export function TradingPanel() {
   }, [book.asks]);
 
   // Calculate MARKET order estimates (walk the book)
+  // No maxPrice limit - continuous matching will fill at best available prices
   const marketEstimate = useMemo(() => {
     const amount = parseFloat(dollarAmount) || 0;
-    const maxSlippage = parseFloat(priceProtection) || 0.10;
-    const maxPrice = Math.min(0.99, bestAsk + maxSlippage);
     
     let remainingDollars = amount;
     let totalContracts = 0;
     let totalSpent = 0;
     const fills: { price: number; contracts: number; cost: number }[] = [];
     
-    // Walk the orderbook
+    // Walk the orderbook - no price limit, fill at any available price
     for (const level of askLevels) {
       if (remainingDollars <= 0) break;
-      if (level.price > maxPrice) break;
       
       // How many contracts can we buy at this level?
       const maxContractsAtLevel = level.size;
@@ -116,10 +122,8 @@ export function TradingPanel() {
     // If orderbook is empty or insufficient, estimate based on best ask
     if (totalContracts === 0 && amount > 0) {
       const estimatedPrice = bestAsk || 0.50;
-      if (estimatedPrice <= maxPrice) {
-        totalContracts = Math.floor(amount / estimatedPrice);
-        totalSpent = totalContracts * estimatedPrice;
-      }
+      totalContracts = Math.floor(amount / estimatedPrice);
+      totalSpent = totalContracts * estimatedPrice;
     }
     
     const avgPrice = totalContracts > 0 ? totalSpent / totalContracts : bestAsk;
@@ -133,9 +137,8 @@ export function TradingPanel() {
       totalSpent,
       unfilled,
       fills,
-      maxPrice,
     };
-  }, [dollarAmount, priceProtection, askLevels, bestAsk]);
+  }, [dollarAmount, askLevels, bestAsk]);
 
   // LIMIT order calculations
   const limitPriceNum = parseFloat(limitPrice) || 0;
@@ -204,6 +207,22 @@ export function TradingPanel() {
     const outcomeValue = side.toLowerCase() as 'yes' | 'no';
     console.log('[TradingPanel] Placing order with outcome:', outcomeValue, 'type:', orderType);
 
+    // Set pending order to show leverage info during "Placing..." phase
+    const isLeveraged = leverage > 1;
+    if (isLeveraged) {
+      useUserStore.getState().setPendingOrder({
+        marketAddress: selectedMarket.address,
+        market: `${selectedMarket.asset}-${selectedMarket.timeframe}`,
+        outcome: outcomeValue,
+        side: 'bid',
+        size: orderType === 'market' ? marketEstimate.contracts : limitSizeNum,
+        price: orderType === 'market' ? marketEstimate.avgPrice : limitPriceNum,
+        leverage,
+        marginAmount: leverageStats.marginRequired,
+        expiryAt: expiryTimestamp * 1000,
+      });
+    }
+
     if (orderType === 'market') {
       // MARKET order: dollar-based
       const result = await placeOrder({
@@ -211,10 +230,10 @@ export function TradingPanel() {
         side: 'bid',
         outcome: outcomeValue,
         orderType: 'market',
-        price: marketEstimate.maxPrice, // Max price willing to pay
+        price: 0.99, // No price limit for market orders
         size: marketEstimate.contracts, // Estimated contracts
         dollarAmount: parseFloat(dollarAmount),
-        maxPrice: marketEstimate.maxPrice,
+        maxPrice: 0.99, // No slippage protection - continuous matching
         expiryTimestamp,
         leverage: leverage > 1 ? leverage : undefined,
         marginAmount: leverage > 1 ? leverageStats.marginRequired : undefined,
@@ -451,41 +470,6 @@ export function TradingPanel() {
                 </button>
               ))}
             </div>
-          </div>
-
-          {/* Price Protection */}
-          <div className="mb-4">
-            <button 
-              onClick={() => setShowAdvanced(!showAdvanced)}
-              className="flex items-center gap-1 text-xs text-text-muted hover:text-text-primary mb-2"
-            >
-              <Settings2 className="w-3 h-3" />
-              {showAdvanced ? 'Hide' : 'Show'} Price Protection
-            </button>
-            
-            {showAdvanced && (
-              <div className="bg-surface-light rounded-lg p-3">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-sm text-text-muted">Max Price Above Best Ask</span>
-                  <span className="text-sm font-mono">${priceProtection}</span>
-                </div>
-                <input
-                  type="range"
-                  value={parseFloat(priceProtection) * 100}
-                  onChange={(e) => setPriceProtection((parseInt(e.target.value) / 100).toFixed(2))}
-                  min="1"
-                  max="25"
-                  className="w-full accent-accent"
-                />
-                <div className="flex justify-between text-xs text-text-muted mt-1">
-                  <span>$0.01</span>
-                  <span>$0.25</span>
-                </div>
-                <div className="mt-2 text-xs text-text-muted">
-                  Best ask: ${bestAsk.toFixed(2)} → Max: ${marketEstimate.maxPrice.toFixed(2)}
-                </div>
-              </div>
-            )}
           </div>
 
           {/* Market Order Summary */}

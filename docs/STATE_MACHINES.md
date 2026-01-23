@@ -609,9 +609,360 @@ Background jobs that drive state transitions.
 │  │ Position Settler   │ 5s       │ Batch settle winning positions         │    │
 │  │ Order Expirer      │ 10s      │ Cancel GTT orders + market close       │    │
 │  │ Market Closer      │ 20s      │ Close settled markets, reclaim rent    │    │
+│  │ Liquidation Checker│ 5s       │ Check & liquidate underwater positions │    │
+│  │ Lending Pool Syncer│ 60s      │ Sync lending pool balance from chain   │    │
 │  └────────────────────┴──────────┴────────────────────────────────────────┘    │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 10. Margin Account Lifecycle (Leverage)
+
+Margin accounts track leveraged positions and their liquidation state.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        MARGIN ACCOUNT LIFECYCLE                                  │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│                         User places leveraged order                             │
+│                         (leverage > 1x, e.g., 5x)                               │
+│                                      │                                          │
+│                                      │ Margin + fee collected                   │
+│                                      │ Loan recorded                            │
+│                                      │ Lending Pool executes trade              │
+│                                      ▼                                          │
+│                                 ┌─────────┐                                    │
+│    ┌───────────────────────────│  OPEN   │───────────────────────────┐        │
+│    │                           └────┬────┘                           │        │
+│    │                                │                                │        │
+│    │ Price moves toward             │                                │ Price drops to
+│    │ liquidation price              │ User sells position            │ liquidation price
+│    │                                │ (manual close)                 │ (keeper triggers)
+│    │                                │                                │        │
+│    │    ┌───────────────────────────┼───────────────────────────┐    │        │
+│    │    │                           │                           │    │        │
+│    │    │        ┌──────────────────┴──────────────────┐        │    │        │
+│    │    │        │       Market Resolves               │        │    │        │
+│    │    │        │   (position-settler job)            │        │    │        │
+│    │    │        └──────────────────┬──────────────────┘        │    │        │
+│    │    │                           │                           │    │        │
+│    │    ▼                           ▼                           ▼    │        │
+│    │  ┌─────────────────┐    ┌─────────────────┐    ┌──────────────────┐     │
+│    │  │ MANUAL CLOSE    │    │ SETTLEMENT      │    │  LIQUIDATED      │     │
+│    │  │                 │    │                 │    │                  │     │
+│    │  │ • User sells    │    │ • WIN: payout-  │    │ • Keeper sells   │     │
+│    │  │ • Loan repaid   │    │   loan→user     │    │ • Loan repaid    │     │
+│    │  │ • Equity→user   │    │ • LOSE: loan    │    │ • Penalty→       │     │
+│    │  │ • DB: SETTLED   │    │   may be bad    │    │   Insurance      │     │
+│    │  │                 │    │   debt          │    │ • Remaining→user │     │
+│    │  └────────┬────────┘    └────────┬────────┘    └────────┬─────────┘     │
+│    │           │                      │                      │               │
+│    │           └──────────────────────┼──────────────────────┘               │
+│    │                                  │                                      │
+│    │                                  ▼                                      │
+│    │                            ┌──────────┐                                 │
+│    └───────────────────────────▶│  CLOSED  │◀────────────────────────────────┘
+│                                 │          │
+│                                 │ status = CLOSED                            │
+│                                 │ closedAt = now                             │
+│                                 └──────────┘                                 │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+MANUAL CLOSE - LENDING POOL CLEANUP:
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  When a leveraged position is manually closed:                               │
+│                                                                              │
+│  1. User sells shares via execute_close                                      │
+│     └─ Lending Pool (seller) → MM (buyer)                                    │
+│     └─ Lending Pool's on-chain position now has 0 shares                     │
+│                                                                              │
+│  2. Loan repaid, margin account closed, user DB position marked SETTLED      │
+│     └─ User receives equity (proceeds - loan)                                │
+│                                                                              │
+│  3. PROBLEM: Lending Pool's ON-CHAIN position still exists!                  │
+│     └─ On-chain: settled_positions < total_positions                         │
+│     └─ Market can't transition to SETTLED status                             │
+│     └─ close_market would fail                                               │
+│                                                                              │
+│  4. SOLUTION: When market resolves, position-settler checks for margin       │
+│     accounts tied to this market. If found, includes Lending Pool wallet     │
+│     in settlement batch.                                                     │
+│     └─ settle_positions(Lending Pool) → closes 0-share position account      │
+│     └─ On-chain: settled_positions == total_positions                        │
+│     └─ Market becomes SETTLED → close_market succeeds                        │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+LIQUIDATION TRIGGER:
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  Liquidation Price Formula (for YES position):                               │
+│                                                                              │
+│    liq_price = loan_amount / (shares × (1 - maintenance_margin_pct))         │
+│                                                                              │
+│  Example: $100 loan, 200 shares, 3% maintenance margin                       │
+│    liq_price = 100 / (200 × 0.97) = $0.5155                                  │
+│                                                                              │
+│  When current_price ≤ liq_price → LIQUIDATE                                  │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+LIQUIDATION vs USER SELL - RACE CONDITION HANDLING:
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  Problem: User might try to sell shares while liquidation is in progress     │
+│                                                                              │
+│    User Sell:      [request] ──► [Redis match] ──► [on-chain] ──► ???        │
+│    Liquidation:    [detect]  ──► [on-chain close] ──► [DB update]            │
+│                                                                              │
+│  If both happen simultaneously:                                              │
+│    - Liquidation closes all shares on-chain                                  │
+│    - User sell tries to close same shares → InsufficientShares error!        │
+│    - GUI shows inconsistent state                                            │
+│                                                                              │
+│  Solution: OFF-CHAIN LIQUIDATION LOCK                                        │
+│  ─────────────────────────────────────                                       │
+│                                                                              │
+│    ┌─────────────────────────────────────────────────────────────────────┐   │
+│    │                   LIQUIDATION LOCK FLOW                             │   │
+│    ├─────────────────────────────────────────────────────────────────────┤   │
+│    │                                                                     │   │
+│    │  1. Keeper detects position needs liquidation                       │   │
+│    │                      │                                              │   │
+│    │                      ▼                                              │   │
+│    │  2. SET liquidating_at = NOW() ◄── LOCK ACQUIRED                    │   │
+│    │     (blocks all user sells)        (OFF-CHAIN, instant!)            │   │
+│    │                      │                                              │   │
+│    │                      ▼                                              │   │
+│    │  3. Execute on-chain close (may take 1-3 seconds)                   │   │
+│    │                      │                                              │   │
+│    │           ┌──────────┴──────────┐                                   │   │
+│    │           │                     │                                   │   │
+│    │        SUCCESS               FAILED                                 │   │
+│    │           │                     │                                   │   │
+│    │           ▼                     ▼                                   │   │
+│    │  4a. Update DB              4b. CLEAR liquidating_at = NULL         │   │
+│    │      status=CLOSED              (user can try to sell again)        │   │
+│    │      (lock implicit)            Will retry in 30s                   │   │
+│    │                                                                     │   │
+│    └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  User Sell During Liquidation:                                               │
+│  ────────────────────────────                                                │
+│                                                                              │
+│    User Request ──► Check liquidating_at ──► NOT NULL?                       │
+│                                                   │                          │
+│                                            Return 409 Error:                 │
+│                                            "POSITION_BEING_LIQUIDATED"       │
+│                                            (show modal on frontend)          │
+│                                                                              │
+│  Database Field:                                                             │
+│    margin_accounts.liquidating_at TIMESTAMP NULL                             │
+│    - NULL: not being liquidated, sells allowed                               │
+│    - NOT NULL: liquidation in progress, sells blocked                        │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Margin Account Status Values
+
+```typescript
+type MarginAccountStatus = 'OPEN' | 'CLOSED' | 'LIQUIDATED';
+```
+
+### Margin Account Fields (Database)
+
+```typescript
+interface MarginAccount {
+  id: string;
+  userId: string;
+  marketId: string;
+  positionId: string;
+  side: 'YES' | 'NO';
+  leverage: number;           // 2-10
+  entryPrice: string;         // Decimal
+  shares: string;             // Decimal
+  marginDeposited: string;    // User's collateral
+  loanAmount: string;         // From Lending Pool
+  liquidationPrice: string;   // Auto-calculated
+  status: 'OPEN' | 'CLOSED' | 'LIQUIDATED';
+  closedAt?: Date;
+  closedReason?: string;
+  createdAt: Date;
+}
+```
+
+---
+
+## 11. Leveraged Trade Flow
+
+How leveraged trades differ from regular trades in on-chain execution.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          LEVERAGED TRADE FLOW                                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  REGULAR TRADE:                          LEVERAGED TRADE:                       │
+│  ─────────────                           ───────────────                        │
+│                                                                                 │
+│  ┌──────────┐                            ┌──────────┐                          │
+│  │   User   │                            │   User   │                          │
+│  │  Wallet  │                            │  Wallet  │                          │
+│  └────┬─────┘                            └────┬─────┘                          │
+│       │                                       │                                │
+│       │ $100 USDC                             │ $25 margin + fee               │
+│       │                                       │                                │
+│       ▼                                       ▼                                │
+│  ┌──────────┐                            ┌──────────────┐                      │
+│  │  Vault   │                            │ Lending Pool │                      │
+│  │          │                            │              │                      │
+│  │ execute_ │                            │ Step 1:      │                      │
+│  │ match    │                            │ Collect $25  │                      │
+│  │          │                            │ from user    │                      │
+│  └────┬─────┘                            └──────┬───────┘                      │
+│       │                                         │                              │
+│       │ Mint 100 YES                            │ Step 2: Borrow $75           │
+│       │ shares to user                          │ Total: $100                  │
+│       │                                         │                              │
+│       ▼                                         ▼                              │
+│  ┌──────────┐                            ┌──────────────┐                      │
+│  │   User   │                            │ Lending Pool │                      │
+│  │ Position │                            │   Position   │ ◀── On-chain owner   │
+│  │          │                            │              │                      │
+│  │ 100 YES  │                            │ 100 YES      │                      │
+│  │ shares   │                            │ shares       │                      │
+│  └──────────┘                            └──────────────┘                      │
+│                                                 │                              │
+│                                                 │ (DB tracks user as           │
+│                                                 │  beneficial owner)           │
+│                                                 ▼                              │
+│                                          ┌──────────────┐                      │
+│                                          │ Margin Acct  │                      │
+│                                          │              │                      │
+│                                          │ user_id      │                      │
+│                                          │ loan: $75    │                      │
+│                                          │ margin: $25  │                      │
+│                                          │ liq: $0.39   │                      │
+│                                          └──────────────┘                      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+LEVERAGED CLOSE FLOW:
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                 │
+│  User wants to sell their leveraged position:                                   │
+│                                                                                 │
+│  ┌──────────────┐      execute_close      ┌──────────┐                         │
+│  │ Lending Pool │ ────────────────────────▶│    MM    │                         │
+│  │   (seller)   │      100 YES shares     │  (buyer) │                         │
+│  └──────────────┘                         └────┬─────┘                         │
+│         │                                      │                               │
+│         │                                      │ $90 USDC                      │
+│         │                                      │ (price dropped)               │
+│         │◀─────────────────────────────────────┘                               │
+│         │                                                                       │
+│         │  Proceeds: $90                                                        │
+│         │  - Loan:   $75                                                        │
+│         │  ─────────────                                                        │
+│         │  Equity:   $15 ────────────────────────────────▶ User Wallet          │
+│         │                                                                       │
+│         │  (User lost $10 on $25 margin = -40% with 4x leverage)                │
+│         │  (Price dropped 10%, 4x leverage = 40% loss)                          │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 12. Lending Pool State
+
+The Lending Pool provides USDC for leveraged trades.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           LENDING POOL STATE                                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│                              ┌───────────────────┐                              │
+│                              │   LENDING POOL    │                              │
+│                              │                   │                              │
+│                              │ balance: $100,000 │                              │
+│                              │ loaned:  $10,000  │                              │
+│                              │ avail:   $90,000  │                              │
+│                              └─────────┬─────────┘                              │
+│                                        │                                        │
+│         ┌──────────────────────────────┼──────────────────────────────┐         │
+│         │                              │                              │         │
+│         ▼                              ▼                              ▼         │
+│   ┌───────────┐                 ┌───────────┐                 ┌───────────┐     │
+│   │  BORROW   │                 │  REPAY    │                 │ INSURANCE │     │
+│   │           │                 │           │                 │           │     │
+│   │ User opens│                 │ User/Liq  │                 │ Liq pnlty │     │
+│   │ leveraged │                 │ closes    │                 │ goes here │     │
+│   │ position  │                 │ position  │                 │           │     │
+│   └─────┬─────┘                 └─────┬─────┘                 └─────┬─────┘     │
+│         │                             │                             │           │
+│         │ loaned += loan              │ loaned -= repaid            │ balance++ │
+│         │ available -= loan           │ available += repaid         │           │
+│         │                             │                             │           │
+│         ▼                             ▼                             ▼           │
+│   ┌───────────────────────────────────────────────────────────────────────┐     │
+│   │                         ACCOUNTING                                    │     │
+│   ├───────────────────────────────────────────────────────────────────────┤     │
+│   │                                                                       │     │
+│   │  available = balance - loaned                                         │     │
+│   │                                                                       │     │
+│   │  Constraints:                                                         │     │
+│   │  • New loan: loan_amount ≤ available × max_utilization (80%)          │     │
+│   │  • Max single loan: $50,000 (configurable)                            │     │
+│   │                                                                       │     │
+│   └───────────────────────────────────────────────────────────────────────┘     │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+INSURANCE FUND:
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  Sources:                              Uses:                                 │
+│  • Liquidation penalties (3%)          • Cover bad debt from                 │
+│  • (Future: interest spread)             underwater liquidations             │
+│                                                                              │
+│  Bad Debt Scenario:                                                          │
+│  ─────────────────                                                           │
+│  If liquidation proceeds < loan amount:                                      │
+│    bad_debt = loan - proceeds                                                │
+│    insurance_fund.balance -= bad_debt                                        │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Lending Pool Fields (Database)
+
+```typescript
+interface LendingPool {
+  id: string;
+  walletAddress: string;      // On-chain USDC holder
+  balance: string;            // Total USDC in pool
+  totalLoaned: string;        // Currently outstanding loans
+  totalBorrowed: string;      // Lifetime borrowed (stats)
+  totalRepaid: string;        // Lifetime repaid (stats)
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface InsuranceFund {
+  id: string;
+  balance: string;            // Available to cover bad debt
+  totalPenaltiesCollected: string;
+  totalBadDebtCovered: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
 ```
 
 ---
@@ -628,6 +979,11 @@ type OrderStatus = 'OPEN' | 'PARTIAL' | 'FILLED' | 'CANCELLED';
 type TxStatus = 'PENDING' | 'CONFIRMED' | 'FAILED';
 type LedgerType = 'DEPOSIT' | 'WITHDRAW' | 'TRADE' | 'SETTLE' | 'FEE';
 
+// Leverage Enums (apps/api/src/db/schema.ts)
+type MarginAccountStatus = 'OPEN' | 'CLOSED' | 'LIQUIDATED';
+type MarginTransactionType = 'MARGIN_DEPOSIT' | 'LOAN_ISSUED' | 'LOAN_REPAID' | 
+                             'LIQUIDATION' | 'MARGIN_ADDED' | 'EQUITY_RETURNED';
+
 // On-Chain Enums (packages/contracts/programs/degen-terminal/src/state.rs)
 enum MarketStatus { Pending, Open, Closed, Resolved, Settled }
 enum MarketOutcome { Pending, Yes, No }
@@ -636,6 +992,22 @@ enum Side { Bid, Ask }
 enum Outcome { Yes, No }
 enum OrderType { Limit, Market, IOC, FOK }
 enum TradeType { Opening, Closing }
+```
+
+---
+
+## Leverage Configuration Parameters
+
+```typescript
+// apps/api/src/config.ts
+const leverageConfig = {
+  maxLeverage: 10,              // Maximum 10x
+  minMarginUsd: 5,              // Minimum $5 margin
+  maintenanceMarginPct: 0.03,   // 3% maintenance margin
+  liquidationPenaltyPct: 0.03,  // 3% penalty → Insurance Fund
+  maxLoanUsd: 50000,            // Max single loan
+  maxUtilization: 0.80,         // Pool utilization cap (80%)
+};
 ```
 
 ---

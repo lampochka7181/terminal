@@ -11,6 +11,7 @@ import {
   jsonb,
   bigint,
   pgEnum,
+  index,
 } from 'drizzle-orm/pg-core';
 import { relations } from 'drizzle-orm';
 
@@ -45,25 +46,41 @@ export const users = pgTable('users', {
 });
 
 // Markets table
-export const markets = pgTable('markets', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  pubkey: varchar('pubkey', { length: 44 }).unique().notNull(),
-  asset: varchar('asset', { length: 10 }).notNull(),
-  timeframe: varchar('timeframe', { length: 10 }).notNull(),
-  strikePrice: numeric('strike_price', { precision: 20, scale: 8 }).notNull(),
-  finalPrice: numeric('final_price', { precision: 20, scale: 8 }),
-  createdAt: timestamp('created_at').defaultNow(),
-  expiryAt: timestamp('expiry_at').notNull(),
-  resolvedAt: timestamp('resolved_at'),
-  settledAt: timestamp('settled_at'),
-  status: marketStatusEnum('status').default('OPEN'),
-  outcome: varchar('outcome', { length: 10 }),
-  totalVolume: numeric('total_volume', { precision: 20, scale: 6 }).default('0'),
-  totalTrades: integer('total_trades').default(0),
-  openInterest: numeric('open_interest', { precision: 20, scale: 6 }).default('0'),
-  yesPrice: numeric('yes_price', { precision: 10, scale: 6 }),
-  noPrice: numeric('no_price', { precision: 10, scale: 6 }),
-});
+export const markets = pgTable(
+  'markets',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    pubkey: varchar('pubkey', { length: 44 }).unique().notNull(),
+    asset: varchar('asset', { length: 10 }).notNull(),
+    timeframe: varchar('timeframe', { length: 10 }).notNull(),
+    strikePrice: numeric('strike_price', { precision: 20, scale: 8 }).notNull(),
+    finalPrice: numeric('final_price', { precision: 20, scale: 8 }),
+    createdAt: timestamp('created_at').defaultNow(),
+    expiryAt: timestamp('expiry_at').notNull(),
+    resolvedAt: timestamp('resolved_at'),
+    settledAt: timestamp('settled_at'),
+    status: marketStatusEnum('status').default('OPEN'),
+    outcome: varchar('outcome', { length: 10 }),
+    totalVolume: numeric('total_volume', { precision: 20, scale: 6 }).default('0'),
+    totalTrades: integer('total_trades').default(0),
+    openInterest: numeric('open_interest', { precision: 20, scale: 6 }).default('0'),
+    yesPrice: numeric('yes_price', { precision: 10, scale: 6 }),
+    noPrice: numeric('no_price', { precision: 10, scale: 6 }),
+  },
+  (t) => ({
+    // Fast path for UI + MM: /markets?asset=BTC&status=OPEN ordered by createdAt
+    assetStatusCreatedAtIdx: index('markets_asset_status_created_at_idx').on(t.asset, t.status, t.createdAt),
+    // Keeper lookups: expiring/expired markets
+    statusExpiryAtIdx: index('markets_status_expiry_at_idx').on(t.status, t.expiryAt),
+    // Pending activation scan: status=OPEN AND strikePrice='0'
+    statusStrikePriceIdx: index('markets_status_strike_price_idx').on(t.status, t.strikePrice),
+    // NOTE: Partial indexes for status != 'SETTLED' are defined in init-db.sql and
+    // applied via apply-db-indexes.ts. Drizzle ORM doesn't support partial indexes
+    // in the schema DSL, so they must be applied separately:
+    // - idx_markets_not_settled_created: (created_at DESC) WHERE status != 'SETTLED'
+    // - idx_markets_active_created: (status, created_at DESC) WHERE status != 'SETTLED'
+  })
+);
 
 // Orders table
 export const orders = pgTable('orders', {
@@ -83,6 +100,9 @@ export const orders = pgTable('orders', {
   encodedInstruction: text('encoded_instruction'), // Nullable - MM orders don't have this
   binaryMessage: text('binary_message'), // For signature verification (base64 encoded)
   isMmOrder: boolean('is_mm_order').default(false).notNull(), // True for Market Maker bot orders
+  // Leverage fields (for displaying leverage info before margin account exists)
+  leverage: numeric('leverage', { precision: 4, scale: 2 }).default('1'),
+  marginAmount: numeric('margin_amount', { precision: 20, scale: 6 }),
   expiresAt: timestamp('expires_at'),
   createdAt: timestamp('created_at').defaultNow(),
   updatedAt: timestamp('updated_at').defaultNow(),
@@ -242,6 +262,15 @@ export const marginAccounts = pgTable('margin_accounts', {
   // Status
   status: marginAccountStatusEnum('status').default('OPEN'),
   
+  // On-chain tracking (for race condition prevention)
+  // NULL onChainConfirmedAt = position not yet confirmed on-chain
+  onChainTxSignature: varchar('on_chain_tx_signature', { length: 88 }),
+  onChainConfirmedAt: timestamp('on_chain_confirmed_at'),
+  
+  // Liquidation lock (set when liquidation starts, blocks user sells)
+  // NULL = not being liquidated, timestamp = liquidation in progress
+  liquidatingAt: timestamp('liquidating_at'),
+  
   createdAt: timestamp('created_at').defaultNow(),
   updatedAt: timestamp('updated_at').defaultNow(),
 });
@@ -286,6 +315,29 @@ export const marginTransactions = pgTable('margin_transactions', {
   
   txSignature: varchar('tx_signature', { length: 88 }),
   createdAt: timestamp('created_at').defaultNow(),
+});
+
+// MM Market Metrics (tracks MM performance per market)
+export const mmMarketMetrics = pgTable('mm_market_metrics', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  marketId: uuid('market_id').notNull().references(() => markets.id),
+  
+  // Position at settlement
+  yesShares: numeric('yes_shares', { precision: 20, scale: 6 }).default('0'),
+  noShares: numeric('no_shares', { precision: 20, scale: 6 }).default('0'),
+  
+  // P&L (calculated as negative of sum of user P&L - zero sum)
+  totalPnl: numeric('total_pnl', { precision: 20, scale: 6 }).notNull(),
+  
+  // Volume stats
+  tradesCount: integer('trades_count').default(0),
+  volumeTraded: numeric('volume_traded', { precision: 20, scale: 6 }).default('0'),
+  
+  // Market outcome
+  outcome: orderOutcomeEnum('outcome'),
+  
+  // Timing
+  settledAt: timestamp('settled_at').defaultNow(),
 });
 
 // Relations

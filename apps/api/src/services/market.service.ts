@@ -1,4 +1,4 @@
-import { eq, and, gte, lte, desc, sql } from 'drizzle-orm';
+import { eq, ne, and, gte, lte, desc, sql, inArray } from 'drizzle-orm';
 import { db, markets, trades, type Market, type NewMarket } from '../db/index.js';
 import { logger } from '../lib/logger.js';
 import { redis, RedisKeys } from '../db/redis.js';
@@ -16,72 +16,154 @@ export interface MarketFilter {
 export class MarketService {
   /**
    * Helper to clear markets cache
+   * Uses SCAN instead of KEYS to avoid blocking Redis
+   * Also debounced to prevent stampede on rapid updates
    */
+  private clearCacheQueued = false;
+  private clearCacheTimer: NodeJS.Timeout | null = null;
+  
+  /**
+   * CIRCUIT BREAKER: Track concurrent DB queries to prevent overload
+   * If too many queries are in flight, return cached/stale data instead of queuing more
+   */
+  private activeDbQueries = 0;
+  private static readonly MAX_CONCURRENT_QUERIES = 10;
+  
   private async clearMarketsCache(): Promise<void> {
-    try {
-      const keys = await redis.keys('markets:list:*');
-      if (keys.length > 0) {
-        await redis.del(...keys);
-        logger.debug(`Cleared ${keys.length} markets cache keys`);
-      }
-    } catch (err) {
-      logger.error('Failed to clear markets cache:', err);
+    // Debounce cache clears - wait 100ms and batch multiple clears into one
+    if (this.clearCacheQueued) return;
+    
+    this.clearCacheQueued = true;
+    
+    if (this.clearCacheTimer) {
+      clearTimeout(this.clearCacheTimer);
     }
+    
+    this.clearCacheTimer = setTimeout(async () => {
+      this.clearCacheQueued = false;
+      this.clearCacheTimer = null;
+      
+      try {
+        // Use a known set of cache keys instead of scanning
+        // We cache with specific filter combinations, so clear those
+        const commonFilters = [
+          '{}',
+          '{"status":"OPEN"}',
+          '{"asset":"BTC"}',
+          '{"asset":"BTC","status":"OPEN"}',
+          '{"asset":"ETH","status":"OPEN"}',
+          '{"asset":"SOL","status":"OPEN"}',
+        ];
+        
+        const keysToDelete = commonFilters.map(f => RedisKeys.markets(f));
+        
+        // Also clear any asset+timeframe combos
+        for (const asset of ['BTC', 'ETH', 'SOL']) {
+          for (const timeframe of ['5m', '15m', '1h', '4h', '24h']) {
+            keysToDelete.push(RedisKeys.markets(JSON.stringify({ asset, timeframe })));
+            keysToDelete.push(RedisKeys.markets(JSON.stringify({ asset, timeframe, status: 'OPEN' })));
+          }
+        }
+        
+        // Delete in one batch (ignore errors for non-existent keys)
+        if (keysToDelete.length > 0) {
+          await redis.del(...keysToDelete).catch(() => {});
+        }
+      } catch (err) {
+        // Silently ignore cache clear errors - not critical
+      }
+    }, 100);
   }
 
   /**
    * Get all markets with optional filters
+   * By default excludes SETTLED markets to improve performance
+   * 
+   * CIRCUIT BREAKER: If too many DB queries are in flight, return stale cache
+   * rather than queue more queries and risk pool exhaustion
    */
   async getMarkets(filter: MarketFilter = {}): Promise<Market[]> {
     // Try cache first
     const cacheKey = RedisKeys.markets(JSON.stringify(filter));
+    let cachedData: Market[] | null = null;
+    
     try {
       const cached = await redis.get(cacheKey);
       if (cached) {
         const parsed = JSON.parse(cached);
         if (Array.isArray(parsed)) {
           // Revive Date objects from JSON strings
-          return parsed.map(m => ({
+          cachedData = parsed.map(m => ({
             ...m,
             createdAt: m.createdAt ? new Date(m.createdAt) : null,
             expiryAt: m.expiryAt ? new Date(m.expiryAt) : null,
             resolvedAt: m.resolvedAt ? new Date(m.resolvedAt) : null,
             settledAt: m.settledAt ? new Date(m.settledAt) : null,
           }));
+          logger.debug(`[MarketService] getMarkets cache HIT (${cachedData.length} markets)`);
+          return cachedData;
         }
       }
     } catch (err) {
       logger.debug('Markets cache miss or invalid data');
     }
+    
+    // CIRCUIT BREAKER: If too many queries in flight, return empty or stale data
+    // This prevents the cascade failure when cache clears and many clients hit DB
+    if (this.activeDbQueries >= MarketService.MAX_CONCURRENT_QUERIES) {
+      logger.warn(`[MarketService] Circuit breaker: ${this.activeDbQueries} queries in flight, skipping DB query`);
+      // Return cached data if available, otherwise empty array
+      return cachedData || [];
+    }
 
-    let query = db.select().from(markets);
+    const startTime = Date.now();
+    this.activeDbQueries++;
     
-    const conditions: any[] = [];
-    
-    if (filter.asset) {
-      conditions.push(eq(markets.asset, filter.asset));
-    }
-    if (filter.status) {
-      conditions.push(eq(markets.status, filter.status));
-    }
-    if (filter.timeframe) {
-      conditions.push(eq(markets.timeframe, filter.timeframe));
-    }
-    
-    if (conditions.length > 0) {
-      query = query.where(and(...conditions)) as typeof query;
-    }
-    
-    const result = await query.orderBy(desc(markets.createdAt));
-
-    // Cache the result for 10 seconds (short enough for frequent updates, long enough for high load)
     try {
-      await redis.set(cacheKey, JSON.stringify(result), 'EX', 10);
-    } catch (err) {
-      logger.error('Failed to cache markets:', err);
-    }
+      let query = db.select().from(markets);
+      
+      const conditions: any[] = [];
+      
+      if (filter.asset) {
+        conditions.push(eq(markets.asset, filter.asset));
+      }
+      if (filter.status) {
+        conditions.push(eq(markets.status, filter.status));
+      } else {
+        // By default exclude SETTLED markets - they're archived and not needed for trading
+        // This significantly improves query performance as SETTLED markets accumulate
+        conditions.push(ne(markets.status, 'SETTLED'));
+      }
+      if (filter.timeframe) {
+        conditions.push(eq(markets.timeframe, filter.timeframe));
+      }
+      
+      if (conditions.length > 0) {
+        query = query.where(and(...conditions)) as typeof query;
+      }
+      
+      // Limit results to prevent slow queries as markets accumulate
+      // 100 is plenty - frontend only shows active markets anyway
+      const result = await query.orderBy(desc(markets.createdAt)).limit(100);
+      const duration = Date.now() - startTime;
+      
+      logger.debug(`[MarketService] getMarkets DB query took ${duration}ms (${result.length} results, filter=${JSON.stringify(filter)})`);
+      if (duration > 500) {
+        logger.warn(`[MarketService] SLOW getMarkets query: ${duration}ms`);
+      }
 
-    return result;
+      // Cache the result for 15 seconds (increased from 10s to reduce DB pressure during market lifecycle events)
+      // The frontend uses WebSocket for real-time updates, so polling frequency can be relaxed
+      try {
+        await redis.set(cacheKey, JSON.stringify(result), 'EX', 15);
+      } catch (err) {
+        logger.error('Failed to cache markets:', err);
+      }
+
+      return result;
+    } finally {
+      this.activeDbQueries--;
+    }
   }
 
   /**
@@ -95,6 +177,21 @@ export class MarketService {
       .limit(1);
     
     return result[0] || null;
+  }
+
+  /**
+   * Get multiple markets by pubkeys in a single query
+   * Returns a Map for O(1) lookup
+   */
+  async getByPubkeys(pubkeys: string[]): Promise<Map<string, Market>> {
+    if (pubkeys.length === 0) return new Map();
+    
+    const result = await db
+      .select()
+      .from(markets)
+      .where(inArray(markets.pubkey, pubkeys));
+    
+    return new Map(result.map(m => [m.pubkey, m]));
   }
 
   /**

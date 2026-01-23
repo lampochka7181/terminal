@@ -202,14 +202,9 @@ pub fn execute_match(
     
     // Validate relayer-specified fee
     // Fee must be at least MIN_TAKER_FEE (prevents relayer from under-charging)
-    // Fee must be at most taker_fee_bps% of notional (prevents relayer from over-charging)
-    let taker_notional = if is_maker_yes_buyer { no_cost } else { yes_cost };
-    let max_fee = taker_notional
-        .checked_mul(global_state.taker_fee_bps as u64).ok_or(DegenError::MathOverflow)?
-        .checked_div(10_000).ok_or(DegenError::DivisionByZero)?;
-    
+    // Note: FeeTooHigh check removed - relayer is trusted and fee aggregation
+    // for multiple fills can legitimately exceed per-trade percentage limits
     require!(taker_fee >= MIN_TAKER_FEE, DegenError::FeeTooLow);
-    require!(taker_fee <= max_fee.max(MIN_TAKER_FEE), DegenError::FeeTooHigh);
     
     // Calculate costs
     let (maker_cost, taker_cost) = if is_maker_yes_buyer {

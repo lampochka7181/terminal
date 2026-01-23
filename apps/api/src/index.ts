@@ -34,6 +34,9 @@ import { mmBotV2 } from './bot/mm-bot-v2.js';
 // Anchor Client (for config endpoint)
 import { anchorClient } from './lib/anchor-client.js';
 
+// Circuit Breaker for self-healing
+import { circuitBreaker, circuitBreakerMiddleware } from './lib/circuit-breaker.js';
+
 const app = Fastify({
   logger: {
     level: process.env.LOG_LEVEL || 'info',
@@ -168,8 +171,15 @@ async function main() {
     
     const priceFeedHealth = priceFeedService.isHealthy();
     const mmStatus = mmBotV2.getStatus();
+    const cbStatus = circuitBreaker.getStatus();
 
-    const status = dbHealth ? 'ok' : 'degraded';
+    // Determine overall status based on circuit breaker and DB health
+    let status: 'ok' | 'degraded' | 'unhealthy' = 'ok';
+    if (!dbHealth) {
+      status = 'unhealthy';
+    } else if (cbStatus.state !== 'CLOSED' || cbStatus.metrics.poolWaiting > 20) {
+      status = 'degraded';
+    }
 
     return {
       status,
@@ -181,6 +191,14 @@ async function main() {
         priceFeed: priceFeedHealth ? 'ok' : 'degraded',
         marketMaker: mmStatus.running ? 'ok' : 'disabled',
         solana: 'ok', // TODO: Add Solana RPC health check
+      },
+      circuitBreaker: {
+        state: cbStatus.state,
+        poolWaiting: cbStatus.metrics.poolWaiting,
+        poolTotal: cbStatus.metrics.poolTotal,
+        poolIdle: cbStatus.metrics.poolIdle,
+        trippedCount: cbStatus.metrics.trippedCount,
+        recoveredCount: cbStatus.metrics.recoveredCount,
       },
       marketMaker: {
         enabled: config.mmEnabled,
@@ -287,6 +305,17 @@ async function main() {
         size: parseFloat(t.size || '0'),
       })),
     };
+  });
+
+  // Circuit Breaker status & control endpoint
+  app.get('/debug/circuit-breaker', async () => {
+    return circuitBreaker.getStatus();
+  });
+
+  // Manual circuit breaker recovery (for ops)
+  app.post('/debug/circuit-breaker/recover', async () => {
+    circuitBreaker.forceRecovery();
+    return { success: true, status: circuitBreaker.getStatus() };
   });
 
   // MM Bot debug endpoint (for testing)
@@ -458,6 +487,10 @@ async function main() {
     logger.info(`Received ${signal}, shutting down gracefully...`);
     
     try {
+      // Stop accepting new requests
+      circuitBreaker.forceTrip('shutdown');
+      circuitBreaker.stopMonitoring();
+      
       await mmBotV2.stop();
       priceFeedService.stop();
       stopKeeperJobs();
@@ -488,6 +521,10 @@ async function main() {
     logger.info(`🚀 Server running on http://${config.host}:${config.port}`);
     logger.info(`📡 WebSocket available at ws://${config.host}:${config.port}/ws`);
     logger.info(`📋 Health check at http://${config.host}:${config.port}/health`);
+    
+    // Start circuit breaker monitoring for self-healing
+    circuitBreaker.startMonitoring(1000);
+    logger.info('🔌 Circuit breaker monitoring started');
     
     // Start price feed (Coinbase WebSocket)
     priceFeedService.start();

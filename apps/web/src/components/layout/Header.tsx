@@ -16,11 +16,11 @@ import { useDelegation } from '@/hooks/useDelegation';
 import { useSessionKey, SESSION_DURATIONS } from '@/hooks/useSessionKey';
 
 export function Header() {
-  const { connected, publicKey } = useWallet();
+  const { connected, publicKey, connecting, wallet } = useWallet();
   const { prices } = usePriceStore();
   const pathname = usePathname();
   const { balance } = useBalance();
-  const { isAuthenticated, isAuthenticating, signIn, signOut } = useAuth();
+  const { isAuthenticated, isAuthenticating, signIn, signOut, error: authError, clearError } = useAuth();
   const authedWalletAddress = useAuthStore((s) => s.walletAddress);
   const { oneClickEnabled, oneClickAmount, setOneClickAmount } = useSettingsStore();
   const { isApproved: isDelegationApproved, delegatedAmount, approve: approveDelegation, revoke: revokeDelegation, isApproving } = useDelegation();
@@ -37,8 +37,6 @@ export function Header() {
   const [oneClickInput, setOneClickInput] = useState('');
   const oneClickDropdownRef = useRef<HTMLDivElement>(null);
 
-  const lastAttemptRef = useRef<{ wallet: string | null; at: number }>({ wallet: null, at: 0 });
-  
   // Close dropdowns when clicking outside
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -66,38 +64,25 @@ export function Header() {
     return `${mins}m`;
   };
 
-  // Ensure SIWS runs from any page:
-  // - When wallet connects and we're not authenticated -> prompt sign message
-  // - When wallet changes while authenticated -> sign out and prompt sign-in for the new wallet
+  // Keep auth state sane when the connected wallet changes:
+  // - If the user is authenticated for a different wallet, sign out.
+  //
+  // IMPORTANT: do NOT auto-trigger signMessage on wallet connect.
+  // Phantom (and some wallet-standard adapters) can throw "Unexpected error" when signing
+  // is invoked outside an explicit user action (or during adapter initialization).
   useEffect(() => {
-    const wallet = publicKey?.toBase58() ?? null;
-    if (!connected || !wallet) return;
+    const walletAddress = publicKey?.toBase58() ?? null;
+    
+    // Wait for wallet to be fully connected (not still connecting)
+    if (!connected || connecting || !walletAddress || !wallet) return;
 
-    // Throttle repeated attempts (hot reload, reconnect storms)
-    const now = Date.now();
-    if (lastAttemptRef.current.wallet === wallet && now - lastAttemptRef.current.at < 20_000) {
-      return;
-    }
-
-    const walletMismatch = Boolean(authedWalletAddress && authedWalletAddress !== wallet);
+    const walletMismatch = Boolean(authedWalletAddress && authedWalletAddress !== walletAddress);
 
     // If authenticated for a different wallet, clear session first.
     if (walletMismatch && isAuthenticated && !isAuthenticating) {
-      lastAttemptRef.current = { wallet, at: now };
       signOut().catch(() => {});
-      // Then prompt sign-in for the new wallet (small delay to let state settle)
-      setTimeout(() => {
-        signIn().catch(() => {});
-      }, 150);
-      return;
     }
-
-    // If not authenticated, always prompt sign-in from any page.
-    if (!isAuthenticated && !isAuthenticating) {
-      lastAttemptRef.current = { wallet, at: now };
-      signIn().catch(() => {});
-    }
-  }, [connected, publicKey, authedWalletAddress, isAuthenticated, isAuthenticating, signIn, signOut]);
+  }, [connected, connecting, publicKey, wallet, authedWalletAddress, isAuthenticated, isAuthenticating, signIn, signOut]);
 
   return (
     <header className="sticky top-0 z-50 glass-strong border-b border-border/50">
@@ -471,6 +456,20 @@ export function Header() {
                 </span>
               </div>
             </div>
+          )}
+          {/* Manual Sign In button when auto-sign-in fails */}
+          {connected && !isAuthenticated && !isAuthenticating && (
+            <button
+              onClick={() => {
+                clearError();
+                signIn().catch(() => {});
+              }}
+              className="flex items-center gap-1.5 px-3 py-2 bg-accent text-background rounded-lg text-xs font-bold hover:bg-accent-dim transition-colors btn-press"
+              title={authError || "Click to sign in with your wallet"}
+            >
+              <Wallet className="w-3.5 h-3.5" />
+              <span>Sign In</span>
+            </button>
           )}
           <WalletButton className="!bg-accent !text-background hover:!bg-accent-dim !rounded-lg !font-semibold !h-10 !px-4 btn-press" />
         </div>

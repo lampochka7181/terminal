@@ -1,22 +1,26 @@
 import { eq, and, sql, lt, lte } from 'drizzle-orm';
-import { 
-  db, 
-  marginAccounts, 
-  liquidations, 
+import {
+  db,
+  marginAccounts,
+  liquidations,
   marginTransactions,
   positions,
   markets,
-  type MarginAccount, 
+  type MarginAccount,
   type NewMarginAccount,
   type Liquidation,
   type NewLiquidation,
   type Position,
   type Market,
 } from '../db/index.js';
+import { redis } from '../db/redis.js';
 import { userService } from './user.service.js';
 import { config } from '../config.js';
 import { logger } from '../lib/logger.js';
 import { lendingService } from './lending.service.js';
+
+// Cache key for liquidation checker short-circuit (must match liquidation-checker.ts)
+const OPEN_ACCOUNTS_CACHE_KEY = 'liquidation:has_open_accounts';
 
 /**
  * Leverage/Margin calculation utilities
@@ -243,10 +247,115 @@ export class MarginService {
     
     // Record loan in lending pool
     await lendingService.recordLoan(loanAmount);
-    
-    logger.info(`Created margin account: ${account.id} - ${leverage}x ${side} @ $${entryPrice}, liq=$${liquidationPrice.toFixed(4)}`);
+
+    // Invalidate liquidation checker cache so it starts checking immediately
+    try {
+      await redis.set(OPEN_ACCOUNTS_CACHE_KEY, '1', 'EX', 10);
+    } catch {
+      // Ignore Redis errors - non-critical
+    }
+
+    logger.info(`Created margin account: ${account.id} - ${leverage}x ${side} @ $${entryPrice}, liq=$${liquidationPrice.toFixed(4)} (pending on-chain confirmation)`);
     
     return account;
+  }
+  
+  /**
+   * Set the on-chain transaction signature for a margin account
+   * Called after execute_match is submitted
+   */
+  async setOnChainTxSignature(accountId: string, signature: string): Promise<void> {
+    await db
+      .update(marginAccounts)
+      .set({
+        onChainTxSignature: signature,
+        updatedAt: new Date(),
+      })
+      .where(eq(marginAccounts.id, accountId));
+    
+    logger.debug(`Set on-chain tx signature for margin account ${accountId}: ${signature.slice(0, 8)}...`);
+  }
+  
+  /**
+   * Confirm that the on-chain position exists
+   * Called after execute_match transaction is confirmed
+   */
+  async confirmOnChain(accountId: string): Promise<void> {
+    await db
+      .update(marginAccounts)
+      .set({
+        onChainConfirmedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(marginAccounts.id, accountId));
+    
+    logger.info(`Margin account ${accountId} confirmed on-chain`);
+  }
+  
+  /**
+   * Check if a margin account's on-chain position is confirmed
+   */
+  async isOnChainConfirmed(accountId: string): Promise<boolean> {
+    const result = await db
+      .select({ onChainConfirmedAt: marginAccounts.onChainConfirmedAt })
+      .from(marginAccounts)
+      .where(eq(marginAccounts.id, accountId))
+      .limit(1);
+    
+    return result.length > 0 && result[0].onChainConfirmedAt !== null;
+  }
+  
+  /**
+   * Set liquidation lock on a margin account (blocks user sells)
+   * Call this BEFORE starting on-chain liquidation
+   */
+  async setLiquidationLock(accountId: string): Promise<boolean> {
+    const result = await db
+      .update(marginAccounts)
+      .set({
+        liquidatingAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(marginAccounts.id, accountId),
+        eq(marginAccounts.status, 'OPEN')
+      ))
+      .returning({ id: marginAccounts.id });
+    
+    if (result.length > 0) {
+      logger.info(`Liquidation lock set on margin account ${accountId}`);
+      return true;
+    }
+    return false;
+  }
+  
+  /**
+   * Clear liquidation lock (if liquidation fails and needs retry)
+   */
+  async clearLiquidationLock(accountId: string): Promise<void> {
+    await db
+      .update(marginAccounts)
+      .set({
+        liquidatingAt: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(marginAccounts.id, accountId));
+    
+    logger.info(`Liquidation lock cleared on margin account ${accountId}`);
+  }
+  
+  /**
+   * Check if margin account is being liquidated (locked)
+   * Returns timestamp if locked, null if not
+   */
+  async isBeingLiquidated(accountId: string): Promise<Date | null> {
+    const result = await db
+      .select({ liquidatingAt: marginAccounts.liquidatingAt })
+      .from(marginAccounts)
+      .where(eq(marginAccounts.id, accountId))
+      .limit(1);
+    
+    return result[0]?.liquidatingAt || null;
   }
   
   /**
@@ -263,13 +372,34 @@ export class MarginService {
   }
   
   /**
-   * Get margin account for a position
+   * Get margin account by user and market (for confirming after on-chain tx)
+   */
+  async getByUserAndMarket(userId: string, marketId: string): Promise<MarginAccount | null> {
+    const result = await db
+      .select()
+      .from(marginAccounts)
+      .where(and(
+        eq(marginAccounts.userId, userId),
+        eq(marginAccounts.marketId, marketId),
+        eq(marginAccounts.status, 'OPEN')
+      ))
+      .limit(1);
+    
+    return result[0] || null;
+  }
+  
+  /**
+   * Get OPEN margin account for a position
+   * Only returns active margin accounts - ignores closed ones from previous trades
    */
   async getByPositionId(positionId: string): Promise<MarginAccount | null> {
     const result = await db
       .select()
       .from(marginAccounts)
-      .where(eq(marginAccounts.positionId, positionId))
+      .where(and(
+        eq(marginAccounts.positionId, positionId),
+        eq(marginAccounts.status, 'OPEN')
+      ))
       .limit(1);
     
     return result[0] || null;
@@ -428,11 +558,11 @@ export class MarginService {
     const side = account.side as 'YES' | 'NO';
     
     // Calculate liquidation proceeds
-    // For YES: we sell shares at execution price
-    // For NO: we sell shares, receiving (1 - execution price)
-    const proceeds = side === 'YES'
-      ? shares * executionPrice
-      : shares * (1 - executionPrice);
+    // executionPrice is already in NATIVE terms for the position side:
+    // - YES positions: executionPrice = YES liquidation price
+    // - NO positions: executionPrice = NO liquidation price (NOT 1 - YES price!)
+    // So proceeds = shares × executionPrice for BOTH sides
+    const proceeds = shares * executionPrice;
     
     // Calculate what's returned to user
     // Order: 1) Repay loan, 2) Take penalty from remaining equity, 3) Return remainder
@@ -520,6 +650,13 @@ export class MarginService {
         const transferSig = await lendingService.transferToUser(user.walletAddress, returnedToUser);
         if (transferSig) {
           logger.info(`✅ Liquidation: Transferred $${returnedToUser.toFixed(2)} back to user ${user.walletAddress.slice(0, 8)}: ${transferSig}`);
+          
+          // Update liquidation record with the equity transfer signature
+          // This is the transaction the user cares about (where they received funds)
+          await db
+            .update(liquidations)
+            .set({ txSignature: transferSig })
+            .where(eq(liquidations.id, liquidation.id));
         } else {
           logger.error(`❌ Liquidation: Failed to transfer $${returnedToUser.toFixed(2)} back to user ${user.walletAddress.slice(0, 8)}`);
         }
@@ -531,6 +668,73 @@ export class MarginService {
     logger.info(`Liquidated account ${marginAccountId}: proceeds=$${proceeds.toFixed(2)}, loan=$${loanAmount.toFixed(2)}, penalty=$${actualPenalty.toFixed(2)}, returnedToUser=$${returnedToUser.toFixed(2)}, badDebt=$${badDebt.toFixed(2)}`);
     
     return liquidation;
+  }
+  
+  /**
+   * Update margin account after a partial close
+   * Recalculates loan and liquidation price based on new share count
+   */
+  async updateAfterPartialClose(
+    marginAccountId: string,
+    sharesSold: number,
+    loanRepaid: number
+  ): Promise<{ newShares: number; newLoan: number; newLiqPrice: number }> {
+    const account = await this.getById(marginAccountId);
+    if (!account) {
+      throw new Error('Margin account not found');
+    }
+    
+    if (account.status !== 'OPEN') {
+      throw new Error('Cannot update closed margin account');
+    }
+    
+    const currentShares = parseFloat(account.shares);
+    const currentLoan = parseFloat(account.loanAmount);
+    const entryPrice = parseFloat(account.entryPrice);
+    const side = account.side as 'YES' | 'NO';
+    
+    // Calculate new values
+    // Floor new shares to match on-chain precision
+    const newShares = Math.floor((currentShares - sharesSold) * 1_000_000) / 1_000_000;
+    const newLoan = Math.max(0, currentLoan - loanRepaid);
+    
+    if (newShares <= 0) {
+      // Full close - just close the account
+      await this.closeAccount(marginAccountId);
+      return { newShares: 0, newLoan: 0, newLiqPrice: 0 };
+    }
+    
+    // Recalculate liquidation price with new shares/loan
+    const newLiqPrice = side === 'YES'
+      ? leverageCalc.liquidationPriceYes(newShares, entryPrice, newLoan)
+      : leverageCalc.liquidationPriceNo(newShares, entryPrice, newLoan);
+    
+    // Calculate new leverage (position value / remaining margin)
+    // Margin remaining is proportional: original margin * (remaining shares / original shares)
+    const originalMargin = parseFloat(account.marginDeposited);
+    const marginRemaining = originalMargin * (newShares / currentShares);
+    const positionValue = newShares * entryPrice;
+    const newLeverage = positionValue / marginRemaining;
+    
+    // Update the margin account
+    await db
+      .update(marginAccounts)
+      .set({
+        shares: newShares.toString(),
+        loanAmount: newLoan.toString(),
+        liquidationPrice: newLiqPrice.toString(),
+        leverage: newLeverage.toFixed(2),
+        marginDeposited: marginRemaining.toFixed(6),
+        updatedAt: new Date(),
+      })
+      .where(eq(marginAccounts.id, marginAccountId));
+    
+    // Note: loanRepaid was already recorded when the partial close happened
+    // (in orders.ts via lendingService.recordRepayment)
+    
+    logger.info(`Updated margin account ${marginAccountId} after partial close: shares ${currentShares.toFixed(2)} → ${newShares.toFixed(2)}, loan $${currentLoan.toFixed(2)} → $${newLoan.toFixed(2)}, liq $${account.liquidationPrice} → $${newLiqPrice.toFixed(4)}`);
+    
+    return { newShares, newLoan, newLiqPrice };
   }
   
   /**

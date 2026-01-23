@@ -228,10 +228,12 @@ withdraw_margin(amount):
 
 ```
 close_position():
-    1. Sell all shares at market price
+    1. Sell all shares at market price (Lending Pool → MM via execute_close)
     2. Repay loan to Lending Pool
-    3. Return remaining to User
-    4. Close margin account
+    3. Return remaining equity to User
+    4. Close margin account (DB status → CLOSED)
+    5. Mark user's DB position as SETTLED
+    6. [On market resolve] Lending Pool's on-chain position is settled (cleanup)
 ```
 
 **Example (price rose to $0.70):**
@@ -241,6 +243,13 @@ Sell 100 YES @ $0.70:
 ├── Repay Loan:   -$40.00
 └── Profit:        $30.00 → User (3x return on $10 margin!)
 ```
+
+**Important:** When a leveraged position is manually closed, the Lending Pool's
+on-chain position account still exists (with 0 shares). This account is settled
+automatically when the market resolves (position-settler includes Lending Pool
+in the settlement batch if any margin accounts exist for that market). This
+ensures `settled_positions == total_positions` on-chain, allowing `close_market`
+to succeed.
 
 ### 6.2 Settlement (Market Expiry)
 
@@ -624,8 +633,9 @@ MIN_POOL_RESERVE_PCT=10            # Default: 10 (keep 10% always available)
 - [ ] On-chain USDC transfer: user profit ← Lending Pool (production)
 - [ ] Handle bad debt coverage from Insurance Fund on-chain
 
-### Phase 6: Testing & Monitoring
-- [ ] Unit tests for liquidation math
+### Phase 6: Testing & Monitoring ✅
+- [x] Unit tests for liquidation math (81 leverage tests)
+- [x] Unit tests for margin service, lending service, leverage flow
 - [ ] Integration tests for full leverage flow
 - [ ] End-to-end test: margin → trade → settlement → payout
 - [ ] Set up monitoring dashboards

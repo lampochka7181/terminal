@@ -171,6 +171,9 @@ export class PositionService {
         avgEntryYes: newAvgYes.toString(),
         avgEntryNo: newAvgNo.toString(),
         realizedPnl: newRealizedPnl.toString(),
+        // Re-open position if adding shares to a settled position
+        // This handles the case where user closes a position and opens a new one on the same market
+        status: isBuy ? 'OPEN' : position.status,
         updatedAt: new Date(),
       })
       .where(eq(positions.id, position.id));
@@ -260,6 +263,24 @@ export class PositionService {
       .limit(limit);
     
     return result;
+  }
+
+  /**
+   * Mark a position as settled (used when leveraged positions are manually closed)
+   * FIX L5: Prevents position-settler from trying to settle already-closed positions
+   */
+  async markAsSettled(positionId: string, payout: number): Promise<void> {
+    await db
+      .update(positions)
+      .set({
+        status: 'SETTLED',
+        payout: payout.toString(),
+        settledAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(positions.id, positionId));
+    
+    logger.info(`Position ${positionId} marked as SETTLED (manual leveraged close, payout: $${payout.toFixed(2)})`);
   }
 }
 

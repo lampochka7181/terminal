@@ -242,11 +242,14 @@ class TransactionService {
       };
     }
     
-    logger.info(`[Leveraged] Step 1: Collecting $${params.marginAmount.toFixed(2)} margin from user ${params.userWallet.slice(0,8)} → Lending Pool`);
+    // Collect margin + trading fee from user
+    // The fee covers the Lending Pool's on-chain transaction fee (it's the taker)
+    const totalToCollect = params.marginAmount + params.takerFee;
+    logger.info(`[Leveraged] Step 1: Collecting $${totalToCollect.toFixed(2)} (margin: $${params.marginAmount.toFixed(2)} + fee: $${params.takerFee.toFixed(2)}) from user ${params.userWallet.slice(0,8)} → Lending Pool`);
     
     const marginTxSig = await lendingService.collectMarginFromUser(
       params.userWallet,
-      params.marginAmount,
+      totalToCollect,  // Collect margin + fee
       relayerKeypair
     );
     
@@ -300,6 +303,20 @@ class TransactionService {
         // Check if this is a permanent failure
         const permanentError = this.isPermanentError(err);
         if (permanentError) {
+          // ROLLBACK: Trade permanently failed - return margin + fee to user
+          logger.warn(`[Leveraged] Permanent error after margin collection. Rolling back: returning $${totalToCollect.toFixed(2)} to user ${params.userWallet.slice(0,8)}`);
+          
+          try {
+            const rollbackSig = await lendingService.transferToUser(params.userWallet, totalToCollect);
+            if (rollbackSig) {
+              logger.info(`[Leveraged] Rollback successful: Tx ${rollbackSig}`);
+            } else {
+              logger.error(`[Leveraged] CRITICAL: Rollback failed for permanent error! User ${params.userWallet} has $${totalToCollect.toFixed(2)} stuck.`);
+            }
+          } catch (rollbackErr: any) {
+            logger.error(`[Leveraged] CRITICAL: Rollback exception! ${rollbackErr.message}`);
+          }
+          
           return {
             success: false,
             error: err.message,
@@ -313,6 +330,21 @@ class TransactionService {
           await this.sleep(delay);
         }
       }
+    }
+
+    // ROLLBACK: Trade failed after margin was collected - return margin + fee to user
+    logger.warn(`[Leveraged] Trade failed after margin collection. Rolling back: returning $${totalToCollect.toFixed(2)} to user ${params.userWallet.slice(0,8)}`);
+    
+    try {
+      const rollbackSig = await lendingService.transferToUser(params.userWallet, totalToCollect);
+      if (rollbackSig) {
+        logger.info(`[Leveraged] Rollback successful: $${totalToCollect.toFixed(2)} returned to user. Tx: ${rollbackSig}`);
+      } else {
+        // Critical: margin stuck in lending pool
+        logger.error(`[Leveraged] CRITICAL: Rollback failed! User ${params.userWallet} has $${totalToCollect.toFixed(2)} stuck in lending pool. Manual intervention required.`);
+      }
+    } catch (rollbackErr: any) {
+      logger.error(`[Leveraged] CRITICAL: Rollback exception! User ${params.userWallet} has $${totalToCollect.toFixed(2)} stuck. Error: ${rollbackErr.message}`);
     }
 
     return {

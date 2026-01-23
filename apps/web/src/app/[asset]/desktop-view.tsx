@@ -37,6 +37,9 @@ import { useOrderbook } from '@/hooks/useOrderbook';
 
 const TIMEFRAMES: Timeframe[] = ['5m', '1h', '24h'];
 
+// Truncate to 6 decimal places to match on-chain precision (SHARE_MULTIPLIER = 10^6)
+const truncate6 = (n: number) => Math.floor(n * 1_000_000) / 1_000_000;
+
 interface DesktopViewProps {
   asset: Asset;
   onSwitchView: () => void;
@@ -339,6 +342,11 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
         setOrderStatus('error');
         setOrderResult({ message: 'No fills - try adjusting price or wait for buyers' });
         setToast({ type: 'error', message: 'No fills - try adjusting price or wait for buyers' });
+      } else if (result && result.error) {
+        // Handle error returned directly in result (e.g., liquidation errors)
+        setOrderStatus('error');
+        setOrderResult({ message: result.error });
+        setToast({ type: 'error', message: result.error });
       } else {
         setOrderStatus('error');
         setOrderResult({ message: orderError || 'Order failed' });
@@ -412,12 +420,14 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
       setOrderStatus('error');
       setOrderResult({ message: 'Order cancelled - no sellers at this price' });
       setToast({ type: 'error', message: 'Order cancelled - no sellers at this price' });
+    } else if (result && result.error) {
+      // Handle error returned directly in result (e.g., liquidation errors)
+      setOrderStatus('error');
+      setOrderResult({ message: result.error });
+      setToast({ type: 'error', message: result.error });
     } else {
       // Order failed or returned null (validation error)
-      // Wait a tick for the error state to update from the hook
-      await new Promise(resolve => setTimeout(resolve, 50));
       setOrderStatus('error');
-      // The orderError should now be set - if not, show generic message
       const errorMsg = orderError || 'Order failed';
       setOrderResult({ message: errorMsg });
       setToast({ type: 'error', message: errorMsg });
@@ -428,13 +438,15 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
   const handleSellFromPositions = (marketAddress: string, outcome: 'YES' | 'NO', shares: number, avgEntry: number, price: number) => {
     setSelectedOutcome(outcome);
     setTradeMode('sell');
+    // Truncate shares to 6 decimals to match on-chain precision
+    const truncatedShares = truncate6(shares);
     setSellData({
       marketAddress,
-      shares,
+      shares: truncatedShares,
       avgEntry,
       currentPrice: price,
     });
-    setSellSize(shares.toString());
+    setSellSize(truncatedShares.toString());
   };
 
   const assetNames: Record<string, string> = {
@@ -660,13 +672,15 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                         setSelectedOutcome(position.outcome.toUpperCase() as 'YES' | 'NO');
                         setTradeMode('sell');
                         if (activeMarket) {
+                          // Truncate shares to 6 decimals to match on-chain precision
+                          const truncatedShares = truncate6(position.shares);
                           setSellData({
                             marketAddress: activeMarket.address,
-                            shares: position.shares,
+                            shares: truncatedShares,
                             avgEntry: position.avgEntry,
                             currentPrice: position.currentPrice,
                           });
-                          setSellSize(position.shares.toString());
+                          setSellSize(truncatedShares.toString());
                         }
                       }}
                     />
@@ -799,10 +813,10 @@ export function DesktopView({ asset, onSwitchView }: DesktopViewProps) {
                               {[0.25, 0.5, 0.75, 1].map((pct) => (
                                 <button
                                   key={pct}
-                                  onClick={() => setSellSize(Math.floor(maxSellSize * pct).toString())}
+                                  onClick={() => setSellSize(truncate6(maxSellSize * pct).toString())}
                                   className={cn(
                                     'flex-1 py-1.5 text-xs rounded-lg transition-colors font-bold',
-                                    sellSizeNum === Math.floor(maxSellSize * pct)
+                                    sellSizeNum === truncate6(maxSellSize * pct)
                                       ? 'bg-warning/20 text-warning'
                                       : 'bg-surface-light text-text-muted hover:text-text-primary'
                                   )}

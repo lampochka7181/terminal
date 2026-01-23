@@ -23,8 +23,15 @@ import { broadcastMarketActivated } from '../lib/broadcasts.js';
  * Main market activator job
  */
 export async function marketActivatorJob(): Promise<void> {
+  const startTime = Date.now();
+  
   // Get markets with strikePrice = 0 that should be activated
   const pendingMarkets = await marketService.getPendingMarketsToActivate();
+  const queryTime = Date.now() - startTime;
+  
+  if (queryTime > 100) {
+    logger.debug(`[MarketActivator] getPendingMarketsToActivate took ${queryTime}ms`);
+  }
   
   if (pendingMarkets.length === 0) {
     return;

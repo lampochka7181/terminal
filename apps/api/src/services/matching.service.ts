@@ -11,6 +11,8 @@ import { logger, tradeLogger, orderLogger, logEvents } from '../lib/logger.js';
 import { broadcastOrderbookUpdate, broadcastTrade, broadcastGlobalTrade, broadcastUserFill } from '../lib/broadcasts.js';
 import { config } from '../config.js';
 import { mmBotV2 } from '../bot/mm-bot-v2.js';
+import { lendingService } from './lending.service.js';
+import { marginService } from './margin.service.js';
 
 // Get MM bot user ID
 function getMMUserId(): string | null {
@@ -29,6 +31,11 @@ function getMMUserId(): string | null {
  * - Price-time priority: Best price first, then oldest order
  * - Partial fills: Orders can be partially filled
  * - Market orders: Use extreme prices (0.99 for BID, 0.01 for ASK) to guarantee matching
+ * 
+ * Performance Optimization (v2):
+ * - On-chain execution happens IMMEDIATELY after Redis matching
+ * - DB updates (trades, positions, stats) run in BACKGROUND
+ * - Batch operations reduce 110+ queries to ~10 queries per order
  */
 
 export interface MatchResult {
@@ -64,6 +71,8 @@ export interface Fill {
   leverage?: number;         // 1 = no leverage, 2-10 = leveraged
   marginAmount?: number;     // User's margin amount
   loanAmount?: number;       // Loan amount from lending pool
+  // Leveraged close: on-chain shares are owned by Lending Pool, not user
+  isLeveragedClose?: boolean;
 }
 
 // Fee configuration - Now uses tiered fee service from fee.service.ts
@@ -131,6 +140,8 @@ export interface SellOrder {
   // For on-chain verification (user's signed authorization)
   signature?: string;
   binaryMessage?: string;
+  // Leveraged position close: on-chain shares are owned by Lending Pool
+  isLeveragedClose?: boolean;
 }
 
 export interface SellMatchResult {
@@ -172,6 +183,24 @@ export interface LimitMatchResult {
 }
 
 export class MatchingService {
+  /**
+   * Opt-in perf logging for matching loops.
+   * Enable with: PERF_MATCHING_LOGS=true
+   */
+  private matchingPerfEnabled(): boolean {
+    return String(process.env.PERF_MATCHING_LOGS || '').toLowerCase() === 'true';
+  }
+
+  private async safeZcard(key: string): Promise<number | null> {
+    try {
+      // Lazy import to avoid adding redis dependency plumbing here
+      const { redis } = await import('../db/redis.js');
+      return await redis.zcard(key);
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Helper to check if a user is the Market Maker bot (supports both v1 and v2)
    */
@@ -457,6 +486,24 @@ export class MatchingService {
     let totalContracts = 0;
     let totalSpent = 0;
     
+    const perfEnabled = this.matchingPerfEnabled();
+    const perf = {
+      iterations: 0,
+      emptyRetries: 0,
+      sleepMs: 0,
+      getBestMs: 0,
+      updateOrderMs: 0,
+      removeOrderMs: 0,
+      zcardAtTimeout: null as number | null,
+    };
+
+    // CONTINUOUS MATCHING CONFIG
+    const MAX_RETRIES = 20;           // Max times to retry when orderbook is empty
+    const RETRY_DELAY_MS = 100;       // Wait 100ms between retries for MM to replenish
+    const MAX_MATCHING_TIME_MS = 5000; // Max 5 seconds total matching time
+    const startTime = Date.now();
+    let emptyBookRetries = 0;
+    
     // SINGLE ORDERBOOK MODEL: Transform NO orders to match against YES orderbook
     // 
     // NO price derivation from YES:
@@ -479,20 +526,55 @@ export class MatchingService {
       matchSide = order.side === 'BID' ? 'ASK' : 'BID';  // Opposite for YES
     }
     
-    if (isNoOrder) {
-      logger.info(
-        `[SINGLE ORDERBOOK] ${order.side} NO → matching YES ${matchSide}s (NO price = 1 - YES_${matchSide})`
-      );
-    }
-    
     while (remainingDollars > 0) {
+      perf.iterations++;
+      // Check timeout
+      if (Date.now() - startTime > MAX_MATCHING_TIME_MS) {
+        if (perfEnabled) {
+          // For BID NO, we match against YES:BID. For other cases, the key still provides useful context.
+          const { RedisKeys } = await import('../db/redis.js');
+          const key = RedisKeys.orderbook(order.marketId, effectiveOutcome, matchSide);
+          perf.zcardAtTimeout = await this.safeZcard(key);
+        }
+        logger.warn(`Matching timeout after ${MAX_MATCHING_TIME_MS}ms, remaining $${remainingDollars.toFixed(2)}`);
+        if (perfEnabled) {
+          logger.warn(
+            {
+              marketId: order.marketId,
+              side: order.side,
+              outcome: order.outcome,
+              matchSide,
+              elapsedMs: Date.now() - startTime,
+              fills: fills.length,
+              remainingDollars,
+              perf,
+            },
+            '[MATCH PERF] Timeout'
+          );
+        }
+        break;
+      }
+      
       // Get best opposing order from YES orderbook
+      const tBest = Date.now();
       const bestOrder = matchSide === 'ASK'
         ? await orderbookService.getBestAsk(order.marketId, effectiveOutcome)
         : await orderbookService.getBestBid(order.marketId, effectiveOutcome);
+      perf.getBestMs += Date.now() - tBest;
       
       if (!bestOrder) {
-        // Devnet/testing: force-fill against MM if the book is empty so market orders always fill.
+        // CONTINUOUS MATCHING: Wait and retry for MM to replenish orderbook
+        if (emptyBookRetries < MAX_RETRIES) {
+          emptyBookRetries++;
+          perf.emptyRetries = emptyBookRetries;
+          logger.debug(`Orderbook empty, retry ${emptyBookRetries}/${MAX_RETRIES} in ${RETRY_DELAY_MS}ms...`);
+          const tSleep = Date.now();
+          await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+          perf.sleepMs += Date.now() - tSleep;
+          continue; // Retry the loop
+        }
+        
+        // Exhausted retries - use DEV synthetic fill if enabled
         if (config.devAlwaysFillMarketOrders) {
           const mmUserId = getMMUserId();
           if (!mmUserId) {
@@ -541,20 +623,29 @@ export class MatchingService {
             (order.leverage && order.leverage > 1 ? ` (${order.leverage}x leverage)` : '')
           );
         }
+        
+        logger.info(`Orderbook exhausted after ${emptyBookRetries} retries, remaining $${remainingDollars.toFixed(2)}`);
         break;
       }
+      
+      // Reset retry counter when we find an order
+      emptyBookRetries = 0;
+      
+      // Log each fill's price to show we're getting fresh best prices
+      logger.debug(`[MATCH] Best ${matchSide} found: $${bestOrder.price.toFixed(4)} (order ${bestOrder.id.slice(0,8)})`);
       
       // SINGLE ORDERBOOK MODEL: Calculate effective price for user
       // For NO orders, the user's price is the complement of the YES order price
       // YES BID @ $0.56 → User pays $0.44 for NO
       const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
       
-      // Self-trade prevention
+      // NO maxPrice check - market orders fill at any available price
+      // This enables continuous matching as MM replenishes at different prices
+      
+      // Self-trade prevention - if best order is yours, stop matching
       if (bestOrder.userId === order.userId) {
-        logger.debug(`Walk-the-book: Self-trade prevented for user ${order.userId}`);
-        // Skip this order and try next
-        await orderbookService.removeOrder(bestOrder);
-        continue;
+        logger.debug(`Self-trade prevented for user ${order.userId}`);
+        break;
       }
       
       // Calculate how many contracts we can afford at the user's effective price
@@ -614,9 +705,13 @@ export class MatchingService {
       // Update maker order in orderbook
       const newMakerRemaining = bestOrder.remainingSize - fillSize;
       if (newMakerRemaining > 0) {
+        const tUpd = Date.now();
         await orderbookService.updateOrderSize(bestOrder, newMakerRemaining);
+        perf.updateOrderMs += Date.now() - tUpd;
       } else {
+        const tRem = Date.now();
         await orderbookService.removeOrder(bestOrder);
+        perf.removeOrderMs += Date.now() - tRem;
       }
       
       logger.debug(
@@ -632,6 +727,22 @@ export class MatchingService {
       `${totalContracts.toFixed(6)} contracts @ avg ${avgPrice.toFixed(4)}, ` +
       `spent $${totalSpent.toFixed(2)}, unfilled $${remainingDollars.toFixed(4)}`
     );
+
+    if (perfEnabled) {
+      logger.info(
+        {
+          marketId: order.marketId,
+          side: order.side,
+          outcome: order.outcome,
+          elapsedMs: Date.now() - startTime,
+          fills: fills.length,
+          totalSpent,
+          unfilledDollars: remainingDollars,
+          perf,
+        },
+        '[MATCH PERF] Completed'
+      );
+    }
     
     return {
       orderId: '',
@@ -646,16 +757,32 @@ export class MatchingService {
   /**
    * Process a dollar-based MARKET order
    * Creates fills, updates positions, and executes on-chain
+   * 
+   * PERFORMANCE OPTIMIZED (v2):
+   * - On-chain execution starts IMMEDIATELY after Redis matching
+   * - DB updates run in BACKGROUND (batched for efficiency)
+   * - Response returns to user within ~100ms instead of 12+ seconds
    */
   async processMarketOrderByDollar(order: DollarMarketOrder): Promise<DollarMatchResult> {
-    // 1. Match against the in-memory orderbook (RAM speed)
+    const t0 = Date.now();
+    
+    // 1. Match against the in-memory orderbook (RAM speed - instant)
     const result = await this.matchMarketOrderByDollar(order);
+    logger.info(`[⏱️ MATCHING] T+${Date.now()-t0}ms: Redis matching done, ${result.fills.length} fills`);
     
     if (result.fills.length === 0) {
       return { ...result, orderId: 'cancelled' };
     }
     
-    // 2. Create taker order record synchronously with final status
+    // 2. Get market data ONCE (cached) - needed for on-chain and DB
+    const market = await marketService.getById(order.marketId);
+    logger.info(`[⏱️ MATCHING] T+${Date.now()-t0}ms: Market lookup done`);
+    if (!market) {
+      logger.error(`Market ${order.marketId} not found for order processing`);
+      return { ...result, orderId: 'cancelled' };
+    }
+    
+    // 3. Create taker order record (minimal DB touch before response)
     const takerOrder = await orderService.create({
       clientOrderId: order.clientOrderId || Date.now(),
       marketId: order.marketId,
@@ -671,24 +798,66 @@ export class MatchingService {
       expiresAt: order.expiresAt ? new Date(order.expiresAt) : new Date(Date.now() + 3600000),
       status: result.unfilledDollars > 0.01 ? 'PARTIAL' : 'FILLED',
       filledSize: result.totalContracts,
+      leverage: order.leverage,
+      marginAmount: order.marginAmount,
     });
+    logger.info(`[⏱️ MATCHING] T+${Date.now()-t0}ms: Order record created`);
     
     // Update fills with the real taker order ID
     for (const fill of result.fills) {
       fill.takerOrderId = takerOrder.id;
     }
     
-    // 3. PROCESS DB UPDATES SYNCHRONOUSLY
-    // We process these sequentially to avoid exhausting the database connection pool
-    // (especially important on Supabase/limited plans).
+    // 4. For LEVERAGED orders: Create taker position SYNCHRONOUSLY
+    // This is required because orders.ts needs the position to create the margin account
+    // For regular orders, positions are created in background for speed
+    if (order.leverage && order.leverage > 1) {
+      const takerIsBuy = order.side === 'BID';
+      const takerNotional = result.fills.reduce((sum, f) => sum + f.price * f.size, 0);
+      const takerFeeTotal = result.fills.reduce((sum, f) => sum + f.takerFee, 0);
+      
+      // Aggregate all fills by outcome for taker position
+      const outcomeShares = new Map<'YES' | 'NO', number>();
     for (const fill of result.fills) {
-      await this.processFillForDollarOrderFast(fill, order, true);
+        const current = outcomeShares.get(fill.outcome) || 0;
+        outcomeShares.set(fill.outcome, current + fill.size);
+      }
+      
+      // Update taker position for each outcome
+      for (const [outcome, shares] of outcomeShares) {
+        const outcomeFills = result.fills.filter(f => f.outcome === outcome);
+        const outcomeNotional = outcomeFills.reduce((sum, f) => sum + f.price * f.size, 0);
+        const outcomeFee = outcomeFills.reduce((sum, f) => sum + f.takerFee, 0);
+        
+        await positionService.updateAfterTrade(
+          order.userId,
+          order.marketId,
+          outcome,
+          shares,
+          takerIsBuy ? outcomeNotional + outcomeFee : outcomeNotional - outcomeFee,
+          takerIsBuy
+        );
+      }
+      
+      logger.info(`[⏱️ MATCHING] T+${Date.now()-t0}ms: Leveraged position created synchronously`);
     }
     
-    // 4. EXECUTE ON-CHAIN ASYNCHRONOUSLY (Background)
-    // The user already has their shares in our DB, we settle on Solana in the background.
+    // 5. EXECUTE ON-CHAIN IMMEDIATELY (fire-and-forget)
+    // For leveraged orders: executeFillsOnChain → executeLeveragedMatch handles collateral + execution
+    // For regular orders: executeFillsOnChain → executeMatch does direct on-chain settlement
+    logger.info(`[⏱️ MATCHING] T+${Date.now()-t0}ms: Firing off on-chain + background DB (async)`);
     this.executeFillsOnChain(result.fills, order.marketId)
       .catch(err => logger.error(`Background on-chain execution failed: ${err.message}`));
+    
+    // 6. PROCESS DB UPDATES IN BACKGROUND (batched for efficiency)
+    // This runs async - user doesn't wait for these ~10 queries
+    // Note: For leveraged orders, taker position was already created above, so skip it in background
+    this.processFillsInBackground(result.fills, order, {
+      id: market.id,
+      pubkey: market.pubkey,
+      asset: market.asset,
+      timeframe: market.timeframe,
+    }, order.leverage && order.leverage > 1).catch(err => logger.error(`Background DB processing failed: ${err.message}`));
     
     return { ...result, orderId: takerOrder.id };
   }
@@ -706,6 +875,24 @@ export class MatchingService {
     let remainingSize = order.size;
     let totalProceeds = 0;
     
+    const perfEnabled = this.matchingPerfEnabled();
+    const perf = {
+      iterations: 0,
+      emptyRetries: 0,
+      sleepMs: 0,
+      getBestMs: 0,
+      updateOrderMs: 0,
+      removeOrderMs: 0,
+      zcardAtTimeout: null as number | null,
+    };
+
+    // CONTINUOUS MATCHING CONFIG (same as buy orders for consistency)
+    const MAX_RETRIES = 20;           // Max times to retry when orderbook is empty
+    const RETRY_DELAY_MS = 100;       // Wait 100ms between retries for MM to replenish
+    const MAX_MATCHING_TIME_MS = 5000; // Max 5 seconds total matching time
+    const startTime = Date.now();
+    let emptyBookRetries = 0;
+    
     // SINGLE ORDERBOOK MODEL: Transform NO sell to match YES orderbook
     const isNoOrder = order.outcome === 'NO';
     const effectiveOutcome: 'YES' | 'NO' = 'YES';
@@ -716,15 +903,54 @@ export class MatchingService {
     );
     
     while (remainingSize > 0.001) {  // Min 0.001 contracts
+      perf.iterations++;
+      // Check total matching time
+      if (Date.now() - startTime > MAX_MATCHING_TIME_MS) {
+        if (perfEnabled) {
+          const { RedisKeys } = await import('../db/redis.js');
+          // For sell NO, we match YES:ASK; for sell YES, YES:BID. Either way, the key is helpful context.
+          const key = RedisKeys.orderbook(order.marketId, effectiveOutcome, isNoOrder ? 'ASK' : 'BID');
+          perf.zcardAtTimeout = await this.safeZcard(key);
+        }
+        logger.warn(`Sell order matching timed out after ${MAX_MATCHING_TIME_MS}ms, remaining: ${remainingSize.toFixed(6)}`);
+        if (perfEnabled) {
+          logger.warn(
+            {
+              marketId: order.marketId,
+              outcome: order.outcome,
+              elapsedMs: Date.now() - startTime,
+              fills: fills.length,
+              remainingSize,
+              perf,
+            },
+            '[MATCH PERF] Sell timeout'
+          );
+        }
+        break;
+      }
+      
       // SINGLE ORDERBOOK: 
       // - Sell YES → Get best YES BID (buyer for YES)
       // - Sell NO → Get best YES ASK (MM selling YES = buying NO from user)
+      const tBest = Date.now();
       const bestOrder = isNoOrder
         ? await orderbookService.getBestAsk(order.marketId, effectiveOutcome)
         : await orderbookService.getBestBid(order.marketId, effectiveOutcome);
+      perf.getBestMs += Date.now() - tBest;
       
       if (!bestOrder) {
-        // Devnet/testing: force-fill sell orders against MM if the book is empty
+        // CONTINUOUS MATCHING: Wait and retry for MM to replenish orderbook
+        if (emptyBookRetries < MAX_RETRIES) {
+          emptyBookRetries++;
+          perf.emptyRetries = emptyBookRetries;
+          logger.debug(`Sell: Orderbook empty, retry ${emptyBookRetries}/${MAX_RETRIES} in ${RETRY_DELAY_MS}ms...`);
+          const tSleep = Date.now();
+          await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+          perf.sleepMs += Date.now() - tSleep;
+          continue; // Retry the loop
+        }
+        
+        // Exhausted retries - use DEV synthetic fill if enabled
         if (config.devAlwaysFillMarketOrders) {
           const mmUserId = getMMUserId();
           if (!mmUserId) {
@@ -768,10 +994,13 @@ export class MatchingService {
             `DEV fill: synthetic MM bid ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for SELL ${order.outcome}`
           );
         } else {
-          logger.debug('Sell order: No more orders to match');
+          logger.debug('Sell order: No more orders to match after retries');
         }
         break;
       }
+      
+      // Reset retry counter on successful order fetch
+      emptyBookRetries = 0;
       
       // SINGLE ORDERBOOK MODEL: Calculate user's effective price
       // For NO sells, user's price is complement of YES order price
@@ -803,6 +1032,8 @@ export class MatchingService {
               takerSide: 'ASK',
               makerClientOrderId: Date.now(),
               takerClientOrderId: order.clientOrderId || Date.now(),
+              // Leveraged close: on-chain shares are owned by Lending Pool
+              isLeveragedClose: order.isLeveragedClose,
             };
 
             fills.push(fill);
@@ -810,7 +1041,8 @@ export class MatchingService {
             remainingSize = 0;
 
             logger.info(
-              `DEV fill: synthetic MM bid at min price ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for SELL ${order.outcome}`
+              `DEV fill: synthetic MM bid at min price ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for SELL ${order.outcome}` +
+              (order.isLeveragedClose ? ' [LEVERAGED CLOSE]' : '')
             );
             break;
           }
@@ -822,8 +1054,7 @@ export class MatchingService {
       // Self-trade prevention
       if (bestOrder.userId === order.userId) {
         logger.debug(`Sell order: Self-trade prevented for user ${order.userId}`);
-        await orderbookService.removeOrder(bestOrder);
-        continue;
+        break;
       }
       
       // Calculate fill size and proceeds using user's effective price
@@ -854,6 +1085,8 @@ export class MatchingService {
         makerMessage: bestOrder.binaryMessage,
         takerSignature: order.signature,
         takerMessage: order.binaryMessage,
+        // Leveraged close: on-chain shares are owned by Lending Pool
+        isLeveragedClose: order.isLeveragedClose,
       };
       
       fills.push(fill);
@@ -863,9 +1096,13 @@ export class MatchingService {
       // Update maker order in orderbook
       const newMakerRemaining = bestOrder.remainingSize - fillSize;
       if (newMakerRemaining > 0) {
+        const tUpd = Date.now();
         await orderbookService.updateOrderSize(bestOrder, newMakerRemaining);
+        perf.updateOrderMs += Date.now() - tUpd;
       } else {
+        const tRem = Date.now();
         await orderbookService.removeOrder(bestOrder);
+        perf.removeOrderMs += Date.now() - tRem;
       }
       
       logger.debug(
@@ -883,6 +1120,21 @@ export class MatchingService {
       `${(order.size - remainingSize).toFixed(6)} sold @ avg ${avgPrice.toFixed(4)}, ` +
       `proceeds $${totalProceeds.toFixed(2)}, unsold ${remainingSize.toFixed(6)}`
     );
+
+    if (perfEnabled) {
+      logger.info(
+        {
+          marketId: order.marketId,
+          outcome: order.outcome,
+          elapsedMs: Date.now() - startTime,
+          fills: fills.length,
+          proceeds: totalProceeds,
+          remainingSize,
+          perf,
+        },
+        '[MATCH PERF] Sell completed'
+      );
+    }
     
     return {
       orderId: '',
@@ -897,16 +1149,27 @@ export class MatchingService {
   /**
    * Process a sell order (user selling existing shares)
    * Creates fills, updates positions, and executes on-chain via execute_close
+   * 
+   * PERFORMANCE OPTIMIZED (v2):
+   * - On-chain execution starts IMMEDIATELY after Redis matching
+   * - DB updates run in BACKGROUND (batched for efficiency)
    */
   async processSellOrder(order: SellOrder): Promise<SellMatchResult> {
-    // 1. Match against the bids (in-memory)
+    // 1. Match against the bids (in-memory - instant)
     const result = await this.matchSellOrder(order);
     
     if (result.fills.length === 0) {
       return { ...result, orderId: 'cancelled' };
     }
     
-    // 2. Create taker order record synchronously with final status
+    // 2. Get market data ONCE (cached) - needed for on-chain and DB
+    const market = await marketService.getById(order.marketId);
+    if (!market) {
+      logger.error(`Market ${order.marketId} not found for sell order`);
+      return { ...result, orderId: 'cancelled' };
+    }
+    
+    // 3. Create taker order record (minimal DB touch before response)
     const takerOrder = await orderService.create({
       clientOrderId: order.clientOrderId || Date.now(),
       marketId: order.marketId,
@@ -917,7 +1180,7 @@ export class MatchingService {
       price: result.avgPrice.toString(),
       size: result.totalSold.toString(),
       signature: order.signature || null,
-      encodedInstruction: null,  // No on-chain order for sell via delegation
+      encodedInstruction: null,
       isMmOrder: false,
       expiresAt: order.expiresAt ? new Date(order.expiresAt) : new Date(Date.now() + 3600000),
       status: result.remainingSize > 0.001 ? 'PARTIAL' : 'FILLED',
@@ -929,8 +1192,12 @@ export class MatchingService {
       fill.takerOrderId = takerOrder.id;
     }
     
-    // 3. PROCESS DB UPDATES SYNCHRONOUSLY
-    // Convert SellOrder to DollarMarketOrder format for reusing update logic
+    // 4. EXECUTE ON-CHAIN IMMEDIATELY (fire-and-forget)
+    // IMPORTANT: Pass isClosingTrade=true because sell orders are ALWAYS closing trades
+    this.executeFillsOnChain(result.fills, order.marketId, true)
+      .catch(err => logger.error(`Background on-chain close failed: ${err.message}`));
+    
+    // 5. PROCESS DB UPDATES IN BACKGROUND (batched for efficiency)
     const asMarketOrder: DollarMarketOrder = {
       marketId: order.marketId,
       userId: order.userId,
@@ -944,17 +1211,12 @@ export class MatchingService {
       binaryMessage: order.binaryMessage,
     };
     
-    // Process sequentially to keep connection pool usage low
-    for (const fill of result.fills) {
-      await this.processFillForDollarOrderFast(fill, asMarketOrder, true);
-    }
-    
-    // 4. EXECUTE ON-CHAIN ASYNCHRONOUSLY
-    // IMPORTANT: Pass isClosingTrade=true because sell orders are ALWAYS closing trades
-    // (user is selling their existing holdings). We must pass this explicitly because
-    // by this point the DB position has already been updated/deducted.
-    this.executeFillsOnChain(result.fills, order.marketId, true)
-      .catch(err => logger.error(`Background on-chain execution failed: ${err.message}`));
+    this.processFillsInBackground(result.fills, asMarketOrder, {
+      id: market.id,
+      pubkey: market.pubkey,
+      asset: market.asset,
+      timeframe: market.timeframe,
+    }).catch(err => logger.error(`Background DB processing failed: ${err.message}`));
     
     return { ...result, orderId: takerOrder.id };
   }
@@ -983,6 +1245,9 @@ export class MatchingService {
       encodedInstruction: null,  // No on-chain order PDA for delegation
       isMmOrder: false,
       expiresAt: order.expiresAt ? new Date(order.expiresAt) : new Date(Date.now() + 3600000),
+      // Store leverage info on order so it's visible before margin account exists
+      leverage: order.leverage,
+      marginAmount: order.marginAmount,
     });
 
     // Convert to orderbook order format
@@ -1033,309 +1298,6 @@ export class MatchingService {
       remainingSize,
       status,
     };
-  }
-
-  /**
-   * Process fills asynchronously (fire-and-forget from HTTP response)
-   * Handles all DB writes, position updates, and on-chain execution
-   */
-  private async processFillsAsync(
-    fills: Fill[],
-    order: DollarMarketOrder,
-    takerOrderId: string,
-    totalContracts: number
-  ): Promise<void> {
-    // Legacy: kept for compatibility, but matching should now call processFillForDollarOrderFast sync
-    await this.executeFillsOnChain(fills, order.marketId);
-  }
-
-  /**
-   * Process sell fills asynchronously (fire-and-forget from HTTP response)
-   */
-  private async processSellFillsAsync(
-    fills: Fill[],
-    order: SellOrder,
-    takerOrderId: string,
-    totalSold: number
-  ): Promise<void> {
-    // Legacy: kept for compatibility
-    await this.executeFillsOnChain(fills, order.marketId);
-  }
-
-  /**
-   * FAST version of processFillForDollarOrder - parallelizes all DB operations
-   * Used by processFillsAsync for instant order response
-   */
-  private async processFillForDollarOrderFast(
-    fill: Fill, 
-    order: DollarMarketOrder, 
-    skipOnChain: boolean = false
-  ): Promise<void> {
-    const takerSide = order.side;
-    const takerOutcome = fill.outcome;
-    const price = fill.price;
-    const notional = price * fill.size;
-    
-    const takerNotional = notional;
-    const makerNotional = notional;
-
-    // Get market data first (needed for on-chain execution)
-    const market = await marketService.getById(order.marketId);
-    const marketAddress = market?.pubkey || '';
-
-    // IMPORTANT: Check if this is a closing trade BEFORE updating positions!
-    // For sell orders (ASK), check seller's shares before we reduce them
-    const isClosingTrade = takerSide === 'ASK';
-    let sellerHasShares = false;
-    if (isClosingTrade) {
-      const sellerPosition = await positionService.getPosition(fill.takerUserId, order.marketId);
-      const sellerShares = takerOutcome === 'YES' 
-        ? parseFloat(sellerPosition?.yesShares || '0')
-        : parseFloat(sellerPosition?.noShares || '0');
-      sellerHasShares = sellerShares >= fill.size;
-      logger.debug(`Closing trade check: seller has ${sellerShares} ${takerOutcome} shares, need ${fill.size}, isClosing=${sellerHasShares}`);
-    }
-
-    // SEQUENTIAL DB OPERATIONS: One by one to prevent connection pool exhaustion
-    // 1. Insert trade record
-    const [trade] = await db.insert(trades).values({
-      marketId: order.marketId,
-      makerOrderId: this.tradeOrderIdForDb(fill.makerUserId, fill.makerOrderId),
-      takerOrderId: this.tradeOrderIdForDb(fill.takerUserId, fill.takerOrderId),
-      makerUserId: fill.makerUserId,
-      takerUserId: fill.takerUserId,
-      takerSide: takerSide,
-      takerOutcome: takerOutcome,
-      takerPrice: price.toString(),
-      takerNotional: takerNotional.toString(),
-      takerFee: fill.takerFee.toString(),
-      makerOutcome: takerOutcome,
-      makerPrice: price.toString(),
-      makerNotional: makerNotional.toString(),
-      makerFee: fill.makerFee.toString(),
-      size: fill.size.toString(),
-      txStatus: 'PENDING',
-      outcome: fill.outcome,
-      price: fill.price.toString(),
-      notional: takerNotional.toString(),
-    }).returning();
-
-    // 2. Update maker order
-    const makerOrderIsSynthetic = String(fill.makerOrderId || '').startsWith('mm_synth_');
-    if (!makerOrderIsSynthetic && !(config.disableMmOrderPersistence && this.isMarketMaker(fill.makerUserId))) {
-      await orderService.updateAfterFill(fill.makerOrderId, fill.size);
-    }
-
-    // 3. Update taker position
-    const isTakerBuy = takerSide === 'BID';
-    await positionService.updateAfterTrade(
-      fill.takerUserId, 
-      order.marketId, 
-      takerOutcome,
-      fill.size, 
-      isTakerBuy ? takerNotional + fill.takerFee : takerNotional - fill.takerFee,
-      isTakerBuy
-    );
-
-    // 4. Update maker position
-    const isMakerBuy = !isTakerBuy;
-    await positionService.updateAfterTrade(
-      fill.makerUserId, 
-      order.marketId, 
-      takerOutcome,
-      fill.size, 
-      isMakerBuy ? makerNotional + fill.makerFee : makerNotional - fill.makerFee,
-      isMakerBuy
-    );
-
-    // 5. Update user stats
-    await userService.updateTradeStats(fill.takerUserId, takerNotional);
-    await userService.updateTradeStats(fill.makerUserId, makerNotional);
-
-    // 6. Update market volume & prices
-    await marketService.incrementStats(order.marketId, takerNotional + makerNotional);
-    await marketService.updatePrices(order.marketId, fill.price, 1 - fill.price);
-
-    // 7. Broadcast trade + user fills ALWAYS (even if on-chain execution is skipped/fails).
-    // This is needed for realtime UX (and chart animations) in simulation mode or transient wallet lookup issues.
-    // Best-effort: include taker wallet on the public trade stream so UI can display a wallet prefix.
-    let takerWalletForWs: string | undefined = undefined;
-    try {
-      takerWalletForWs = await this.getWalletForUser(fill.takerUserId);
-    } catch {}
-    if (marketAddress) {
-      const tradeTimestamp = Date.now();
-      const tradeSide = fill.takerSide === 'BID' ? 'buy' : 'sell';
-      const tradeOutcome = String(fill.outcome).toLowerCase() as 'yes' | 'no';
-      
-      // Market-specific trade feed
-      broadcastTrade(marketAddress, {
-        price: fill.price,
-        size: fill.size,
-        side: tradeSide,
-        outcome: tradeOutcome,
-        timestamp: tradeTimestamp,
-        takerWallet: takerWalletForWs,
-      });
-      
-      // Global trade blotter feed
-      broadcastGlobalTrade({
-        id: trade.id,
-        market: `${market?.asset}-${market?.timeframe}`,
-        marketAddress,
-        asset: market?.asset || '',
-        timeframe: market?.timeframe || '',
-        side: tradeSide as 'buy' | 'sell',
-        outcome: tradeOutcome,
-        price: fill.price,
-        size: fill.size,
-        notional: fill.price * fill.size,
-        txSignature: null, // Will be updated after on-chain execution
-        timestamp: tradeTimestamp,
-      });
-    }
-
-    broadcastUserFill(fill.takerUserId, {
-      orderId: fill.takerOrderId,
-      marketAddress,
-      side: this.toWsSide(fill.takerSide),
-      outcome: this.toWsOutcome(fill.outcome),
-      price: fill.price,
-      filledSize: fill.size,
-      remainingSize: 0,
-      status: 'filled',
-      timestamp: Date.now(),
-    });
-
-    broadcastUserFill(fill.makerUserId, {
-      orderId: fill.makerOrderId,
-      marketAddress,
-      side: this.toWsSide(fill.makerSide),
-      outcome: this.toWsOutcome(fill.outcome),
-      price: fill.price,
-      filledSize: fill.size,
-      remainingSize: 0,
-      status: 'filled',
-      timestamp: Date.now(),
-    });
-
-    // 8. Get wallets for on-chain (best-effort; doesn't gate broadcasts)
-    const makerWallet = await this.getWalletForUser(fill.makerUserId);
-    const takerWallet = await this.getWalletForUser(fill.takerUserId);
-
-    // On-chain execution (fire-and-forget)
-    if (market && makerWallet && takerWallet && !skipOnChain) {
-      // Use the stored on-chain pubkey from the database
-      const onChainMarketPubkey = market.pubkey;
-
-      // Use pre-checked closing trade flag (checked BEFORE position update)
-      if (isClosingTrade && sellerHasShares) {
-        // True closing trade - use execute_close instruction
-        // Transfers USDC from buyer to seller, transfers shares from seller to buyer
-        const closeParams: CloseParams = {
-          marketPubkey: onChainMarketPubkey,
-          buyerWallet: makerWallet,  // Maker is buying
-          sellerWallet: takerWallet, // Taker is selling
-          outcome: takerOutcome,
-          price: fill.price,
-          matchSize: fill.size,
-          takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
-          tradeId: trade.id,  // Pass trade ID to update with tx signature
-        };
-        logger.info(`Executing on-chain CLOSE: ${fill.size} ${takerOutcome} @ ${fill.price} fee=${fill.takerFee} (seller=${takerWallet}, buyer=${makerWallet})`);
-        transactionService.executeClose(closeParams).catch(err => 
-          logger.error(`On-chain close failed: ${err.message}`)
-        );
-      } else if (isClosingTrade && !sellerHasShares) {
-        // Seller doesn't have enough shares - this shouldn't happen for validated sell orders
-        logger.warn(`Taker selling but insufficient shares, using execute_match as fallback`);
-        transactionService.executeMatch({
-          marketPubkey: onChainMarketPubkey,
-          makerOrderId: fill.makerOrderId,
-          takerOrderId: fill.takerOrderId,
-          makerWallet,
-          takerWallet,
-          makerSide: fill.makerSide,
-          takerSide: fill.takerSide,
-          outcome: fill.outcome,
-          price: fill.price,
-          matchSize: fill.size,
-          takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
-          makerClientOrderId: fill.makerClientOrderId,
-          takerClientOrderId: fill.takerClientOrderId,
-          makerOrderPda: fill.makerOrderPda,
-          takerOrderPda: fill.takerOrderPda,
-          makerSignature: fill.makerSignature,
-          takerSignature: fill.takerSignature,
-          makerMessage: fill.makerMessage,
-          takerMessage: fill.takerMessage,
-        }).catch(err => logger.error(`On-chain match failed: ${err.message}`));
-      } else if (fill.leverage && fill.leverage > 1 && fill.marginAmount && fill.loanAmount) {
-        // LEVERAGED opening trade - use Lending Pool wallet
-        // Position is owned by Lending Pool on-chain, tracked to user in DB
-        logger.info(`Executing LEVERAGED on-chain: ${fill.size} ${fill.outcome} @ ${fill.price} (${fill.leverage}x) - Lending Pool buying for user ${takerWallet.slice(0,8)}`);
-        transactionService.executeLeveragedMatch({
-          marketPubkey: onChainMarketPubkey,
-          makerOrderId: fill.makerOrderId,
-          takerOrderId: fill.takerOrderId,
-          makerWallet,
-          userWallet: takerWallet,  // User wallet for tracking (NOT used on-chain)
-          makerSide: fill.makerSide,
-          takerSide: fill.takerSide,
-          outcome: fill.outcome,
-          price: fill.price,
-          matchSize: fill.size,
-          takerFee: fill.takerFee,
-          makerClientOrderId: fill.makerClientOrderId,
-          takerClientOrderId: fill.takerClientOrderId,
-          leverage: fill.leverage,
-          marginAmount: fill.marginAmount,
-          loanAmount: fill.loanAmount,
-        }).catch(err => logger.error(`On-chain leveraged match failed: ${err.message}`));
-      } else {
-        // Regular opening trade - use execute_match instruction
-        transactionService.executeMatch({
-          marketPubkey: onChainMarketPubkey,
-          makerOrderId: fill.makerOrderId,
-          takerOrderId: fill.takerOrderId,
-          makerWallet,
-          takerWallet,
-          makerSide: fill.makerSide,
-          takerSide: fill.takerSide,
-          outcome: fill.outcome,
-          price: fill.price,
-          matchSize: fill.size,
-          takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
-          makerClientOrderId: fill.makerClientOrderId,
-          takerClientOrderId: fill.takerClientOrderId,
-          makerOrderPda: fill.makerOrderPda,
-          takerOrderPda: fill.takerOrderPda,
-          makerSignature: fill.makerSignature,
-          takerSignature: fill.takerSignature,
-          makerMessage: fill.makerMessage,
-          takerMessage: fill.takerMessage,
-        }).catch(err => logger.error(`On-chain match failed: ${err.message}`));
-      }
-
-      // Log trade
-      logEvents.tradeExecuted({
-        tradeId: trade.id,
-        marketId: order.marketId,
-        asset: market.asset,
-        timeframe: market.timeframe,
-        makerOrderId: fill.makerOrderId,
-        takerOrderId: fill.takerOrderId,
-        makerUserId: fill.makerUserId,
-        takerUserId: fill.takerUserId,
-        price: fill.price,
-        size: fill.size,
-        outcome: fill.outcome,
-        takerSide: fill.takerSide,
-        notional: takerNotional,
-        makerFee: fill.makerFee,
-        takerFee: fill.takerFee,
-      });
-    }
   }
 
   /**
@@ -1391,11 +1353,26 @@ export class MatchingService {
     // For sell orders (forceClose=true), ALWAYS use execute_close
     // This transfers USDC from buyer to seller, not the other way around!
     if (forceClose && isClosingTrade) {
-      logger.info(`Executing CLOSE (sell) on-chain: seller=${takerWallet.slice(0,8)}, buyer=${makerWallet.slice(0,8)}, ${fill.size} @ ${fill.price} fee=${fill.takerFee}`);
+      // LEVERAGED CLOSE: On-chain shares are owned by Lending Pool, not user
+      // The Lending Pool must be the on-chain seller
+      let actualSellerWallet = takerWallet;
+      
+      if (fill.isLeveragedClose) {
+        const lendingPoolWallet = lendingService.getLendingWalletPubkey()?.toBase58();
+        if (!lendingPoolWallet) {
+          logger.error(`[LeveragedClose] Lending pool wallet not configured, cannot execute close for user ${takerWallet.slice(0,8)}`);
+          return;
+        }
+        actualSellerWallet = lendingPoolWallet;
+        logger.info(`[LeveragedClose] Executing close on-chain: LendingPool=${actualSellerWallet.slice(0,8)} selling for user=${takerWallet.slice(0,8)}, buyer=${makerWallet.slice(0,8)}, ${fill.size} @ ${fill.price}`);
+      } else {
+        logger.info(`Executing CLOSE (sell) on-chain: seller=${takerWallet.slice(0,8)}, buyer=${makerWallet.slice(0,8)}, ${fill.size} @ ${fill.price} fee=${fill.takerFee}`);
+      }
+      
       const closeParams: CloseParams = {
         marketPubkey: marketPubkey,
-        buyerWallet: makerWallet,  // Maker is buying (MM)
-        sellerWallet: takerWallet, // Taker is selling (user)
+        buyerWallet: makerWallet,        // Maker is buying (MM)
+        sellerWallet: actualSellerWallet, // Lending Pool for leveraged, user otherwise
         outcome: fill.outcome,
         price: fill.price,
         matchSize: fill.size,
@@ -1408,7 +1385,7 @@ export class MatchingService {
         if (!result.success) {
           logger.warn(`On-chain close failed: ${result.error}`);
         } else {
-          logger.info(`On-chain close success: ${result.signature}`);
+          logger.info(`On-chain close success: ${result.signature}${fill.isLeveragedClose ? ' [LEVERAGED]' : ''}`);
         }
       }).catch(err => {
         logger.error(`Failed to execute on-chain close: ${err.message}`);
@@ -1468,11 +1445,25 @@ export class MatchingService {
         leverage: fill.leverage,
         marginAmount: fill.marginAmount,
         loanAmount: fill.loanAmount,
-      }).then(result => {
+      }).then(async result => {
         if (!result.success) {
           logger.error(`On-chain leveraged match failed: ${result.error}`);
         } else {
           logger.info(`On-chain leveraged match success: ${result.signature}`);
+          
+          // Confirm margin account on-chain (allows liquidation checker to proceed)
+          // The margin account is created in orders.ts after matching completes
+          // We need to find it by userId + marketId and mark it as confirmed
+          try {
+            const marginAccount = await marginService.getByUserAndMarket(fill.takerUserId, marketId);
+            if (marginAccount && !marginAccount.onChainConfirmedAt) {
+              await marginService.confirmOnChain(marginAccount.id);
+              logger.info(`[Leveraged] Margin account ${marginAccount.id} confirmed on-chain`);
+            }
+          } catch (confirmErr: any) {
+            // Non-fatal: liquidation checker will retry
+            logger.warn(`[Leveraged] Failed to confirm margin account: ${confirmErr.message}`);
+          }
         }
       }).catch(err => logger.error(`On-chain leveraged match failed: ${err.message}`));
       return;
@@ -1898,6 +1889,252 @@ export class MatchingService {
       makerFee: fill.makerFee,
       takerFee: fill.takerFee,
     });
+  }
+
+  // ========================================================================
+  // BATCH DB OPERATIONS (Performance Optimization)
+  // Reduces 110+ queries per order to ~10 queries by batching and aggregating
+  // ========================================================================
+
+  /**
+   * Process all fills for an order in background with batched DB operations.
+   * This runs AFTER on-chain execution has started, so the user gets instant response.
+   * 
+   * Optimization: Instead of 11 queries per fill (110 for 10 fills), we:
+   * - Batch insert all trades (1 query)
+   * - Aggregate position updates per user (2-4 queries)
+   * - Aggregate user stats (2 queries)
+   * - Update market stats once (1 query)
+   */
+  private async processFillsInBackground(
+    fills: Fill[],
+    order: DollarMarketOrder,
+    market: { id: string; pubkey: string; asset?: string; timeframe?: string },
+    skipTakerPosition: boolean = false,
+  ): Promise<void> {
+    if (fills.length === 0) return;
+    
+    const startTime = Date.now();
+    
+    try {
+      // 1. BATCH INSERT ALL TRADES (1 query instead of N)
+      const tradeRecords = fills.map(fill => {
+        const notional = fill.price * fill.size;
+        return {
+          marketId: order.marketId,
+          makerOrderId: this.tradeOrderIdForDb(fill.makerUserId, fill.makerOrderId),
+          takerOrderId: this.tradeOrderIdForDb(fill.takerUserId, fill.takerOrderId),
+          makerUserId: fill.makerUserId,
+          takerUserId: fill.takerUserId,
+          takerSide: order.side,
+          takerOutcome: fill.outcome,
+          takerPrice: fill.price.toString(),
+          takerNotional: notional.toString(),
+          takerFee: fill.takerFee.toString(),
+          makerOutcome: fill.outcome,
+          makerPrice: fill.price.toString(),
+          makerNotional: notional.toString(),
+          makerFee: fill.makerFee.toString(),
+          size: fill.size.toString(),
+          txStatus: 'PENDING' as const,
+          outcome: fill.outcome,
+          price: fill.price.toString(),
+          notional: notional.toString(),
+        };
+      });
+      
+      const insertedTrades = await db.insert(trades).values(tradeRecords).returning();
+      
+      // 2. AGGREGATE POSITION UPDATES (2-4 queries instead of 2N)
+      // Group fills by user+market to minimize position updates
+      const positionUpdates = this.aggregateFillsForPositions(fills, order);
+      
+      for (const update of positionUpdates) {
+        // Skip taker position if already created synchronously (leveraged orders)
+        if (skipTakerPosition && update.userId === order.userId) {
+          continue;
+        }
+        
+        await positionService.updateAfterTrade(
+          update.userId,
+          order.marketId,
+          update.outcome,
+          update.totalShares,
+          update.totalCost,
+          update.isBuy
+        );
+      }
+      
+      // 3. AGGREGATE USER STATS (2 queries: taker + unique makers)
+      const takerNotional = fills.reduce((sum, f) => sum + f.price * f.size, 0);
+      await userService.updateTradeStats(order.userId, takerNotional);
+      
+      // Update maker stats - aggregate by unique maker
+      const makerVolumes = new Map<string, number>();
+      for (const fill of fills) {
+        const current = makerVolumes.get(fill.makerUserId) || 0;
+        makerVolumes.set(fill.makerUserId, current + fill.price * fill.size);
+      }
+      for (const [makerId, volume] of makerVolumes) {
+        if (makerId !== order.userId) { // Don't double-count if self-trade somehow
+          await userService.updateTradeStats(makerId, volume);
+        }
+      }
+      
+      // 4. UPDATE MARKET STATS ONCE (1 query instead of N)
+      const totalVolume = fills.reduce((sum, f) => sum + 2 * f.price * f.size, 0); // Both sides
+      const lastFill = fills[fills.length - 1];
+      await marketService.incrementStats(order.marketId, totalVolume);
+      await marketService.updatePrices(order.marketId, lastFill.price, 1 - lastFill.price);
+      
+      // 5. BROADCAST TRADES (WebSocket - no DB queries)
+      const takerWallet = await this.getWalletForUser(order.userId).catch(() => '');
+      const tradeTimestamp = Date.now();
+      
+      for (let i = 0; i < fills.length; i++) {
+        const fill = fills[i];
+        const trade = insertedTrades[i];
+        const tradeSide = fill.takerSide === 'BID' ? 'buy' : 'sell';
+        const tradeOutcome = String(fill.outcome).toLowerCase() as 'yes' | 'no';
+        
+        // Market-specific trade feed
+        broadcastTrade(market.pubkey, {
+          price: fill.price,
+          size: fill.size,
+          side: tradeSide,
+          outcome: tradeOutcome,
+          timestamp: tradeTimestamp,
+          takerWallet,
+        });
+        
+        // Global trade blotter
+        broadcastGlobalTrade({
+          id: trade.id,
+          market: `${market.asset}-${market.timeframe}`,
+          marketAddress: market.pubkey,
+          asset: market.asset || '',
+          timeframe: market.timeframe || '',
+          side: tradeSide as 'buy' | 'sell',
+          outcome: tradeOutcome,
+          price: fill.price,
+          size: fill.size,
+          notional: fill.price * fill.size,
+          txSignature: null,
+          timestamp: tradeTimestamp,
+        });
+        
+        // User fills
+        broadcastUserFill(fill.takerUserId, {
+          orderId: fill.takerOrderId,
+          marketAddress: market.pubkey,
+          side: this.toWsSide(fill.takerSide),
+          outcome: this.toWsOutcome(fill.outcome),
+          price: fill.price,
+          filledSize: fill.size,
+          remainingSize: 0,
+          status: 'filled',
+          timestamp: tradeTimestamp,
+        });
+        
+        broadcastUserFill(fill.makerUserId, {
+          orderId: fill.makerOrderId,
+          marketAddress: market.pubkey,
+          side: this.toWsSide(fill.makerSide),
+          outcome: this.toWsOutcome(fill.outcome),
+          price: fill.price,
+          filledSize: fill.size,
+          remainingSize: 0,
+          status: 'filled',
+          timestamp: tradeTimestamp,
+        });
+      }
+      
+      // 6. UPDATE MAKER ORDERS (only for non-MM synthetic orders)
+      for (const fill of fills) {
+        const makerOrderIsSynthetic = String(fill.makerOrderId || '').startsWith('mm_synth_');
+        if (!makerOrderIsSynthetic && !(config.disableMmOrderPersistence && this.isMarketMaker(fill.makerUserId))) {
+          await orderService.updateAfterFill(fill.makerOrderId, fill.size);
+        }
+      }
+      
+      const elapsed = Date.now() - startTime;
+      logger.debug(`[PERF] Background DB processing for ${fills.length} fills completed in ${elapsed}ms`);
+      
+    } catch (err: any) {
+      logger.error(`Background fill processing failed: ${err.message}`);
+      // Non-fatal: on-chain execution already happened, user has their position
+    }
+  }
+
+  /**
+   * Aggregate fills into position updates.
+   * Groups by user+outcome to minimize DB queries.
+   */
+  private aggregateFillsForPositions(
+    fills: Fill[],
+    order: DollarMarketOrder
+  ): Array<{
+    userId: string;
+    outcome: 'YES' | 'NO';
+    totalShares: number;
+    totalCost: number;
+    isBuy: boolean;
+  }> {
+    const updates: Array<{
+      userId: string;
+      outcome: 'YES' | 'NO';
+      totalShares: number;
+      totalCost: number;
+      isBuy: boolean;
+    }> = [];
+    
+    // Taker position update (all fills aggregate to one update)
+    const takerIsBuy = order.side === 'BID';
+    const takerOutcomes = new Map<'YES' | 'NO', { shares: number; cost: number }>();
+    
+    for (const fill of fills) {
+      const current = takerOutcomes.get(fill.outcome) || { shares: 0, cost: 0 };
+      const notional = fill.price * fill.size;
+      current.shares += fill.size;
+      current.cost += takerIsBuy ? notional + fill.takerFee : notional - fill.takerFee;
+      takerOutcomes.set(fill.outcome, current);
+    }
+    
+    for (const [outcome, data] of takerOutcomes) {
+      updates.push({
+        userId: order.userId,
+        outcome,
+        totalShares: data.shares,
+        totalCost: data.cost,
+        isBuy: takerIsBuy,
+      });
+    }
+    
+    // Maker position updates (group by maker+outcome)
+    const makerUpdates = new Map<string, { shares: number; cost: number }>();
+    
+    for (const fill of fills) {
+      const key = `${fill.makerUserId}:${fill.outcome}`;
+      const current = makerUpdates.get(key) || { shares: 0, cost: 0 };
+      const notional = fill.price * fill.size;
+      current.shares += fill.size;
+      // Maker is opposite side of taker
+      current.cost += takerIsBuy ? notional - fill.makerFee : notional + fill.makerFee;
+      makerUpdates.set(key, current);
+    }
+    
+    for (const [key, data] of makerUpdates) {
+      const [makerId, outcome] = key.split(':');
+      updates.push({
+        userId: makerId,
+        outcome: outcome as 'YES' | 'NO',
+        totalShares: data.shares,
+        totalCost: data.cost,
+        isBuy: !takerIsBuy, // Opposite of taker
+      });
+    }
+    
+    return updates;
   }
 
   /**

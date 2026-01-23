@@ -4,6 +4,7 @@ import { marketService } from '../services/market.service.js';
 import { priceFeedService } from '../services/price-feed.service.js';
 import { redis, RedisKeys } from '../db/redis.js';
 import { logger } from '../lib/logger.js';
+import { circuitBreaker } from '../lib/circuit-breaker.js';
 
 // Validation schemas
 const listMarketsSchema = z.object({
@@ -140,11 +141,61 @@ function buildCandlesFromTicks(params: {
 }
 
 export async function marketRoutes(app: FastifyInstance) {
+  // Track concurrent requests
+  let concurrentRequests = 0;
+  
+  // REQUEST COALESCING: Batch identical requests within a time window
+  // This prevents the "thundering herd" when cache clears and multiple clients hit /markets
+  const pendingRequests = new Map<string, Promise<any>>();
+  const COALESCE_WINDOW_MS = 100; // Requests within 100ms share the same DB query
+  
+  async function coalesceRequest<T>(
+    key: string,
+    fetcher: () => Promise<T>
+  ): Promise<T> {
+    const existing = pendingRequests.get(key);
+    if (existing) {
+      logger.debug(`[Markets Route] Coalescing request for key: ${key}`);
+      return existing;
+    }
+    
+    const promise = fetcher();
+    pendingRequests.set(key, promise);
+    
+    // Clean up after the coalesce window
+    setTimeout(() => pendingRequests.delete(key), COALESCE_WINDOW_MS);
+    
+    return promise;
+  }
+  
   /**
    * GET /markets
    * List all markets with optional filters
+   * 
+   * Uses request coalescing to prevent DB pool exhaustion during cache invalidation storms
+   * Circuit breaker returns 503 when system is overloaded
    */
   app.get('/', async (request: FastifyRequest, reply: FastifyReply) => {
+    // Circuit breaker check - shed load if system is overloaded
+    if (!circuitBreaker.shouldAllowRequest()) {
+      const status = circuitBreaker.getStatus();
+      return reply
+        .code(503)
+        .header('Retry-After', '5')
+        .send({
+          error: {
+            code: 'SERVICE_OVERLOADED',
+            message: 'Server is experiencing high load. Please retry in a few seconds.',
+            state: status.state,
+          },
+        });
+    }
+    
+    concurrentRequests++;
+    const startTime = Date.now();
+    const requestId = Math.random().toString(36).slice(2, 8);
+    
+    try {
     const query = listMarketsSchema.safeParse(request.query);
     
     if (!query.success) {
@@ -156,8 +207,25 @@ export async function marketRoutes(app: FastifyInstance) {
         },
       });
     }
+      
+      if (concurrentRequests > 10) {
+        logger.warn(`[Markets Route] High concurrent requests: ${concurrentRequests} (req=${requestId})`);
+      }
     
-    const markets = await marketService.getMarkets(query.data);
+      // Coalesce identical requests - key is the stringified query params
+      const coalesceKey = `markets:${JSON.stringify(query.data)}`;
+      const markets = await coalesceRequest(coalesceKey, () => 
+        marketService.getMarkets(query.data)
+      );
+      
+      // Record success for circuit breaker
+      circuitBreaker.recordSuccess();
+      
+      const duration = Date.now() - startTime;
+      
+      if (duration > 500) {
+        logger.warn(`[Markets Route] Slow request ${requestId}: ${duration}ms (concurrent=${concurrentRequests})`);
+      }
     
     // Transform to API response format
     return markets.map((m) => {
@@ -176,6 +244,9 @@ export async function marketRoutes(app: FastifyInstance) {
         noPrice: m.noPrice ? parseFloat(m.noPrice) : null,
       };
     });
+    } finally {
+      concurrentRequests--;
+    }
   });
 
   /**

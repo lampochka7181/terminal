@@ -38,6 +38,16 @@ export const config = {
   // Server
   port: parseInt(process.env.API_PORT || '4000'),
   host: process.env.API_HOST || '0.0.0.0',
+
+  // Database pool tuning (override in .env as needed)
+  // NOTE: Defaults are intentionally conservative for local/dev to avoid exhausting
+  // Supabase pooler / local Postgres under bursty keeper workloads.
+  dbPool: {
+    max: parseInt(process.env.DB_POOL_MAX || '30'),
+    min: parseInt(process.env.DB_POOL_MIN || '0'),
+    idleTimeoutMillis: parseInt(process.env.DB_POOL_IDLE_TIMEOUT_MS || '15000'),
+    connectionTimeoutMillis: parseInt(process.env.DB_POOL_CONN_TIMEOUT_MS || '5000'),
+  },
   
   // Supabase
   supabaseUrl: process.env.SUPABASE_URL || '',
@@ -115,8 +125,11 @@ export const config = {
   // Gas Cost (for reference/monitoring - actual cost ~$0.00135 at current settings)
   gasCostUsd: parseFloat(process.env.GAS_COST_USD || '0.00135'),
   
-  // Legacy - kept for backward compatibility, use fees.* instead
-  takerFeeBps: 20,   // 0.20% - legacy flat rate (replaced by tiered structure)
+  // On-chain max fee cap (basis points) - must accommodate per-fill flat fees
+  // With aggregated fills + flat fee per fill, effective fee % can be high for small trades:
+  // Example: $50 trade with 12 fills × $0.06 flat = $0.72 = 1.44%
+  // Set to max allowed (500 bps = 5%) since relayer is trusted
+  takerFeeBps: 500,   // 5% max fee cap for on-chain validation
   minNotionalValue: 10.0, // Legacy - use minBuyNotional/minSellNotional instead
   
   // ============================================================================

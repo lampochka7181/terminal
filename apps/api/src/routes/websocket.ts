@@ -93,7 +93,13 @@ export async function wsHandler(
   socket: WebSocket,
   request: FastifyRequest
 ) {
-  logger.info('WebSocket client connected');
+  const totalClients = clients.size + 1;
+  logger.info(`WebSocket client connected (total=${totalClients})`);
+  
+  // Warn if many connections from same origin
+  if (totalClients > 10) {
+    logger.warn(`[WS] High connection count: ${totalClients} total clients`);
+  }
   
   // Initialize client state
   const initialState: ClientState = {
@@ -126,7 +132,7 @@ export async function wsHandler(
   socket.on('close', () => {
     clients.delete(socket);
     broadcastClients.delete(socket);
-    logger.info('WebSocket client disconnected');
+    logger.info(`WebSocket client disconnected (remaining=${clients.size})`);
   });
 
   // Handle errors
