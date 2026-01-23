@@ -1,7 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "pnpm --filter=@degen/types build && pnpm --filter=@degen/web build",
+  "buildCommand": "pnpm --filter=@degen/types build && pnpm --filter=webv2 build",
+  "outputDirectory": "apps/webv2/dist",
   "installCommand": "pnpm install --no-frozen-lockfile",
-  "framework": "nextjs"
+  "framework": "vite"
 }
-
