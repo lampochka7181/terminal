@@ -1,0 +1,8 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "cd ../.. && pnpm --filter=@degen/types build && pnpm --filter=webv2 build",
+  "outputDirectory": "dist",
+  "installCommand": "cd ../.. && pnpm install --no-frozen-lockfile",
+  "framework": "vite"
+}
+
