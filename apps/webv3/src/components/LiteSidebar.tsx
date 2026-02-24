@@ -70,7 +70,7 @@ export default function LiteSidebar() {
   const [chatOpen, setChatOpen] = useState(false);
   const [delegationModalOpen, setDelegationModalOpen] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
-  const [promptMsg, setPromptMsg] = useState({ title: '', message: '', type: 'info' as const });
+  const [promptMsg, setPromptMsg] = useState({ title: '', message: '', type: 'info' as 'info' | 'error' | 'success' | 'warning' });
   const amountPresets = [25, 50, 100, 250];
 
   const showPrompt = useCallback((title: string, message: string, type: 'info' | 'error' | 'success' | 'warning' = 'info') => {

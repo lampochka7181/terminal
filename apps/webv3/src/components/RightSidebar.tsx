@@ -38,7 +38,7 @@ export default function RightSidebar() {
   const [chatOpen, setChatOpen] = useState(false);
   const [delegationModalOpen, setDelegationModalOpen] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
-  const [promptMsg, setPromptMsg] = useState({ title: '', message: '', type: 'info' as const });
+  const [promptMsg, setPromptMsg] = useState({ title: '', message: '', type: 'info' as 'info' | 'error' | 'success' | 'warning' });
   
   const leverageOptions = [1, 2, 3, 5, 10];
 

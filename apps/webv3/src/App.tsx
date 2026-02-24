@@ -25,7 +25,7 @@ export default function App() {
   const [liqPrompt, setLiqPrompt] = useState({ open: false, title: '', message: '', type: 'warning' as const });
 
   useLiquidationNotifications({
-    onLiquidation: useCallback((n) => {
+    onLiquidation: useCallback((n: any) => {
       setLiqPrompt({
         open: true,
         title: 'Position Liquidated',
