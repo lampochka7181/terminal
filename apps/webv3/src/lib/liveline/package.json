@@ -1,0 +1,6 @@
+{
+  "name": "liveline-local",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "type": "module"
+}

@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx --version:*)",
+      "Bash(curl:*)",
+      "Bash(npm run build:*)",
+      "Bash(npx tsc:*)",
+      "Bash(anchor build:*)",
+      "Bash(anchor deploy:*)",
+      "Bash(grep:*)",
+      "Bash(xargs -I{} sh -c 'echo \"\"\"\"=== {} ===\"\"\"\" && grep -A5 \"\"\"\"pub struct\"\"\"\" {}')",
+      "Bash(find:*)",
+      "Bash(npm ls:*)",
+      "Bash(node -e:*)",
+      "Bash(node:*)",
+      "Bash(pnpm add:*)",
+      "Bash(ls:*)",
+      "Bash(pnpm exec tsc:*)",
+      "Bash(pgrep:*)",
+      "Bash(netstat:*)",
+      "Bash(ss:*)",
+      "Bash(kill:*)",
+      "Bash(pkill:*)",
+      "Bash(PERF_TEST_MODE=true pnpm exec tsx:*)",
+      "Bash(python3:*)",
+      "Bash(solana balance:*)",
+      "Bash(solana airdrop:*)",
+      "Bash(solana transfer:*)",
+      "Bash(lsof:*)",
+      "Bash(source .env)",
+      "Bash(psql:*)",
+      "Bash(tsx:*)",
+      "Bash(for addr in GK1rM159zCtA4Q56Xdb7zLZ643v1zEU5HeY9qx6V6XE3 DRHzTERR5NrMMXnYvmY81ypFi93ZWRXfhjC1x39zuPxN 5G4VEtcNdSjP34ND3Wv45PK9vkKBxrWdR6ST97BcaUHf 7EznmbirrSPcszMUH7fGytvdR5zTkzZ6CrPQ73zYe7Zj)",
+      "Bash(do)",
+      "Bash(echo:*)",
+      "Bash(done)",
+      "Bash(docker ps:*)",
+      "Bash(PGPASSWORD=postgres psql:*)",
+      "Bash(NODE_PATH=./node_modules node:*)",
+      "Bash(PGPASSWORD='P@Sword7788' psql:*)"
+    ]
+  }
+}

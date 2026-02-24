@@ -12,6 +12,20 @@ pub mod close_market;
 pub mod pause_protocol;
 pub mod update_config;
 
+// V2 instructions (tokenized shares model)
+pub mod initialize_market_v2;
+pub mod execute_match_v2;
+pub mod execute_close_v2;
+pub mod activate_market_v2;
+pub mod resolve_market_v2;
+
+// V2 merkle settlement instructions
+pub mod post_merkle_root;
+pub mod batch_settle_v2;
+pub mod burn_remaining_shares_v2;
+pub mod finalize_market_v2;
+pub mod close_market_v2;
+
 pub use initialize_global::*;
 pub use initialize_market::*;
 pub use activate_market::*;
@@ -25,3 +39,17 @@ pub use settle_positions::*;
 pub use close_market::*;
 pub use pause_protocol::*;
 pub use update_config::*;
+
+// V2 exports
+pub use initialize_market_v2::*;
+pub use execute_match_v2::*;
+pub use execute_close_v2::*;
+pub use activate_market_v2::*;
+pub use resolve_market_v2::*;
+
+// V2 merkle settlement exports
+pub use post_merkle_root::*;
+pub use batch_settle_v2::*;
+pub use burn_remaining_shares_v2::*;
+pub use finalize_market_v2::*;
+pub use close_market_v2::*;

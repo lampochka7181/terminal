@@ -9,6 +9,7 @@ import { mmBotV2 } from '../bot/mm-bot-v2.js';
 import { logger, positionLogger, marketLogger, logEvents } from '../lib/logger.js';
 import { broadcastUserSettlement } from '../lib/broadcasts.js';
 import { anchorClient } from '../lib/anchor-client.js';
+import { config } from '../config.js';
 
 /**
  * Batch settlement item - prepared data for one position
@@ -299,18 +300,28 @@ async function settleMarketFast(
     positionCount: openPositions.length,
   });
   
+  // V2 markets with trades need merkle settlement (on-chain first, then DB).
+  // Don't settle in DB until on-chain settlement is confirmed.
+  // Market stays RESOLVED — the merkle settlement pipeline will handle the full flow.
+  if (config.useV2) {
+    logger.info(`[V2] Market ${market.id} (${market.asset}-${market.timeframe}) resolved with ${openPositions.length} positions — awaiting merkle settlement`);
+    return;
+  }
+
+  // --- V1 settlement path (Position PDAs) ---
+
   // BATCH SETTLEMENT: Build all settlement data first, then execute in one transaction
   const settlementBatch = await prepareSettlementBatch(openPositions, outcome, market, walletMap, settlementMap);
-  
+
   // Check if Lending Pool needs to be settled (for leveraged positions that were manually closed)
   const lendingPoolWallet = lendingService.getLendingWalletPubkey()?.toBase58() || null;
   const needsLendingPoolSettlement = lendingPoolWallet && await checkLendingPoolNeedsSettlement(market.id);
-  
+
   if (settlementBatch.length > 0 || needsLendingPoolSettlement) {
     // Execute all on-chain settlements in a single transaction
     await executeBatchSettlement(settlementBatch, market, needsLendingPoolSettlement ? lendingPoolWallet : null);
   }
-  
+
   // Process DB updates/notifications with bounded concurrency to avoid DB pool spikes
   await runWithConcurrency(settlementBatch, 3, async (item) => finalizeSettlement(item, market));
 
@@ -318,10 +329,10 @@ async function settleMarketFast(
   const remainingOpen = await positionService.getPositionsForSettlement(market.id);
   if (remainingOpen.length === 0) {
     await marketService.markSettled(market.id);
-    
+
     // Calculate total payout for logging
     const totalPayout = settlementBatch.reduce((sum, item) => sum + item.payout, 0);
-    
+
     logEvents.marketSettled({
       marketId: market.id,
       asset: market.asset,
@@ -333,19 +344,15 @@ async function settleMarketFast(
     // Calculate and store MM metrics (zero-sum: MM P&L = -sum of user P&L)
     await calculateAndStoreMmMetrics(market.id, market.outcome as 'YES' | 'NO');
 
-    // Immediately recover on-chain market/vault rent after settlement (no 5m delay).
-    // This is safe because `settle_positions` should have paid out all positions and
-    // the program's `close_market` sweeps any leftover dust before closing the vault.
-    //
-    // We keep the Market Closer job as a fallback in case this fails (RPC issues, etc.).
+    // Immediately recover on-chain market/vault rent after settlement.
     if (anchorClient.isReady() && !market.pubkey.startsWith('arc-')) {
       try {
         const sig = await anchorClient.closeMarket({ marketPubkey: market.pubkey });
-        logger.info(`🧹 Market rent recovered immediately after settlement: ${sig}`);
+        logger.info(`Market rent recovered immediately after settlement: ${sig}`);
         await marketService.markArchived(market.id);
       } catch (err: any) {
         const msg = err?.message || String(err);
-        logger.warn(`Market ${market.id} close_market failed post-settlement (will retry via Market Closer): ${msg}`);
+        logger.warn(`Market ${market.id} close failed post-settlement (will retry via Market Closer): ${msg}`);
       }
     }
   }
@@ -483,45 +490,51 @@ async function executeBatchSettlement(
   market: typeof markets.$inferSelect,
   lendingPoolWallet: string | null = null
 ): Promise<string | null> {
+  // V2 markets use tokenized shares — no Position PDAs to settle on-chain.
+  // Settlement happens via merkle batch settlement (post_merkle_root → batch_settle_v2 → finalize_market_v2).
+  // The V1 settle_positions instruction cannot work on V2 MarketV2 accounts.
+  // Leave settlement records as PENDING — they'll be confirmed when on-chain settlement completes.
+  if (config.useV2) {
+    logger.info(`[V2] Market ${market.id} needs merkle settlement (Phase 7) — skipping V1 settle_positions`);
+    return null;
+  }
+
+  // --- V1 settlement path (Position PDAs) ---
+
   // Filter positions that need on-chain settlement
   const onChainItems = batch.filter(item => item.needsOnChainSettlement);
-  
+
   // Build wallets list from batch items
   const wallets = onChainItems.map(item => item.settlementWallet!);
-  
+
   // Add Lending Pool wallet if it needs to be settled (for manually closed leveraged positions)
   // This ensures the on-chain position account is closed even if the user's DB position was already marked settled
   if (lendingPoolWallet && !wallets.includes(lendingPoolWallet)) {
     wallets.push(lendingPoolWallet);
     logger.info(`[Settlement] Adding Lending Pool ${lendingPoolWallet.slice(0,8)} to settlement batch (cleanup for manually closed positions)`);
   }
-  
+
   if (wallets.length === 0) {
     logger.info(`No on-chain settlements needed for market ${market.id}`);
     return null;
   }
-  
+
   // Separate regular and leveraged settlements
   const regularItems = onChainItems.filter(item => !item.isLeveraged);
   const leveragedItems = onChainItems.filter(item => item.isLeveraged);
-  
+
   const lendingPoolIncluded = lendingPoolWallet && wallets.includes(lendingPoolWallet);
   logger.info(`Executing batch settlement: ${regularItems.length} regular + ${leveragedItems.length} leveraged positions${lendingPoolIncluded ? ' + Lending Pool cleanup' : ''}`);
-  
+
   try {
-    // Build all settle instructions
-    // Use settlementWallet which is:
-    // - User wallet for regular positions
-    // - Lending Pool wallet for leveraged positions
-    
     // Execute batch settlement (all in one transaction)
     const signature = await anchorClient.settlePositionsBatch({
       marketPubkey: market.pubkey,
       userWallets: wallets,
     });
-    
-    logger.info(`✅ Batch settlement executed: ${signature} (${onChainItems.length} positions)`);
-    
+
+    logger.info(`Batch settlement executed: ${signature} (${onChainItems.length} positions)`);
+
     // Mark all as confirmed
     const settlementIds = onChainItems.map(item => item.settlementId);
     await db
@@ -532,24 +545,24 @@ async function executeBatchSettlement(
         confirmedAt: new Date(),
       })
       .where(inArray(settlements.id, settlementIds));
-    
+
     return signature;
   } catch (err: any) {
     const errorMsg = err.message || '';
-    
-    // FIX L5: If batch fails, try individual settlements so one bad position doesn't kill the batch
+
+    // If batch fails, try individual settlements so one bad position doesn't kill the batch
     logger.warn(`Batch settlement failed, attempting individual settlements: ${errorMsg}`);
-    
+
     let successCount = 0;
     let failCount = 0;
-    
+
     for (const item of onChainItems) {
       try {
         const signature = await anchorClient.settlePositionsBatch({
           marketPubkey: market.pubkey,
           userWallets: [item.settlementWallet!],
         });
-        
+
         // Mark as confirmed
         await db
           .update(settlements)
@@ -559,16 +572,16 @@ async function executeBatchSettlement(
             confirmedAt: new Date(),
           })
           .where(eq(settlements.id, item.settlementId));
-        
+
         successCount++;
-        logger.info(`✅ Individual settlement success for position ${item.position.id}: ${signature}`);
+        logger.info(`Individual settlement success for position ${item.position.id}: ${signature}`);
       } catch (individualErr: any) {
         const individualMsg = individualErr.message || '';
-        
+
         // Check if position doesn't exist on-chain (already closed)
         if (individualMsg.includes('AccountNotInitialized') || individualMsg.includes('0xbc4')) {
           logger.warn(`Position ${item.position.id} not found on-chain - may have been manually closed`);
-          
+
           // Mark position as settled (it was likely closed via execute_close)
           await db
             .update(positions)
@@ -579,7 +592,7 @@ async function executeBatchSettlement(
               updatedAt: new Date(),
             })
             .where(eq(positions.id, item.position.id));
-          
+
           // Mark settlement as confirmed (no payout needed - already handled)
           await db
             .update(settlements)
@@ -588,7 +601,7 @@ async function executeBatchSettlement(
               confirmedAt: new Date(),
             })
             .where(eq(settlements.id, item.settlementId));
-          
+
           successCount++;
         } else {
           // Mark as failed
@@ -596,13 +609,13 @@ async function executeBatchSettlement(
             .update(settlements)
             .set({ txStatus: 'FAILED' })
             .where(eq(settlements.id, item.settlementId));
-          
+
           failCount++;
-          logger.error(`❌ Individual settlement failed for position ${item.position.id}: ${individualMsg}`);
+          logger.error(`Individual settlement failed for position ${item.position.id}: ${individualMsg}`);
         }
       }
     }
-    
+
     // Also try to settle Lending Pool individually if it was in the batch
     if (lendingPoolWallet && !onChainItems.some(item => item.settlementWallet === lendingPoolWallet)) {
       try {
@@ -611,22 +624,21 @@ async function executeBatchSettlement(
           userWallets: [lendingPoolWallet],
         });
         successCount++;
-        logger.info(`✅ Lending Pool settlement success: ${lpSignature}`);
+        logger.info(`Lending Pool settlement success: ${lpSignature}`);
       } catch (lpErr: any) {
         const lpMsg = lpErr.message || '';
         if (lpMsg.includes('AccountNotInitialized') || lpMsg.includes('0xbc4')) {
-          // Lending Pool position doesn't exist (already settled or never created)
           logger.info(`Lending Pool position not found on-chain - may not have been created or already settled`);
-          successCount++; // Count as success since there's nothing to settle
+          successCount++;
         } else {
           failCount++;
-          logger.error(`❌ Lending Pool settlement failed: ${lpMsg}`);
+          logger.error(`Lending Pool settlement failed: ${lpMsg}`);
         }
       }
     }
-    
+
     logger.info(`Individual settlement results: ${successCount} success, ${failCount} failed`);
-    
+
     // If all positions failed, market might not exist
     if (successCount === 0 && failCount === onChainItems.length) {
       if (errorMsg.includes('AccountNotInitialized') || errorMsg.includes('0xbc4')) {
@@ -634,7 +646,7 @@ async function executeBatchSettlement(
         await marketService.markArchived(market.id);
       }
     }
-    
+
     return null;
   }
 }

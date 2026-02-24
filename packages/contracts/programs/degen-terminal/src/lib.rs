@@ -3,6 +3,7 @@ use anchor_lang::prelude::*;
 declare_id!("5Kq43SR2HUNsyNZWaau1p8kQzAvW2UA2mAvempdchTrk");
 
 pub mod state;
+pub mod state_v2;  // V2 tokenized shares state
 pub mod instructions;
 pub mod errors;
 
@@ -196,15 +197,182 @@ pub mod degen_terminal {
     }
 
     /// Close a fully settled market and recover rent
-    /// 
+    ///
     /// This instruction closes the market account and its vault after all positions
     /// have been settled. The rent (~0.006 SOL) is returned to the specified recipient.
-    /// 
+    ///
     /// Requirements:
     /// - Market status must be `Settled` (all positions paid out)
     /// - Vault balance must be 0
     /// - Caller must be the market authority (relayer)
     pub fn close_market(ctx: Context<CloseMarket>) -> Result<()> {
         instructions::close_market(ctx)
+    }
+
+    // =========================================================================
+    // V2 INSTRUCTIONS (Tokenized Shares Model)
+    // =========================================================================
+
+    /// Create a new V2 market with tokenized YES/NO shares
+    ///
+    /// Unlike V1 which uses Position PDAs, V2 markets use Token-2022 tokens:
+    /// - Creates YES token mint (Token-2022 + MintCloseAuthority, authority: market PDA)
+    /// - Creates NO token mint (Token-2022 + MintCloseAuthority, authority: market PDA)
+    /// - Users hold YES/NO tokens in Token-2022 ATAs
+    /// - MintCloseAuthority allows rent recovery when market closes
+    ///
+    /// # Arguments
+    /// * `asset` - Asset symbol (BTC, ETH, SOL)
+    /// * `timeframe` - Market timeframe (5m, 15m, 1h, 4h, 24h)
+    /// * `strike_price` - Strike price with 8 decimals (0 for pending markets)
+    /// * `expiry_ts` - Unix timestamp when market expires
+    pub fn initialize_market_v2(
+        ctx: Context<InitializeMarketV2>,
+        asset: String,
+        timeframe: String,
+        strike_price: u64,
+        expiry_ts: i64,
+    ) -> Result<()> {
+        instructions::initialize_market_v2(ctx, asset, timeframe, strike_price, expiry_ts)
+    }
+
+    /// Finalize V2 market initialization (phase 2)
+    ///
+    /// Creates the NO token mint and USDC vault. This two-phase initialization
+    /// is required to avoid stack overflow from too many init accounts.
+    ///
+    /// # Arguments
+    /// * `strike_price` - Strike price (can override initial, or pass 0 to keep pending)
+    pub fn initialize_market_v2_finalize(
+        ctx: Context<InitializeMarketV2Finalize>,
+        strike_price: u64,
+    ) -> Result<()> {
+        instructions::initialize_market_v2_finalize(ctx, strike_price)
+    }
+
+    /// Execute a match in a V2 market (tokenized shares)
+    ///
+    /// Instead of updating Position PDAs, this instruction:
+    /// 1. Transfers USDC from both parties to vault
+    /// 2. Mints YES tokens to the YES buyer
+    /// 3. Mints NO tokens to the NO buyer
+    /// 4. Collects trading fees
+    ///
+    /// # Arguments
+    /// * `maker_args` - Maker's order parameters
+    /// * `taker_args` - Taker's order parameters
+    /// * `match_size` - Number of contracts to match
+    /// * `taker_fee` - Fee amount in USDC (6 decimals)
+    pub fn execute_match_v2(
+        ctx: Context<ExecuteMatchV2>,
+        maker_args: PlaceOrderArgs,
+        taker_args: PlaceOrderArgs,
+        match_size: u64,
+        taker_fee: u64,
+    ) -> Result<()> {
+        instructions::execute_match_v2(ctx, maker_args, taker_args, match_size, taker_fee)
+    }
+
+    /// Execute a closing trade in a V2 market (token transfer)
+    ///
+    /// For secondary market trades where:
+    /// 1. Seller has existing YES/NO tokens they want to sell
+    /// 2. Buyer pays seller directly (not through vault)
+    /// 3. Tokens transfer from seller to buyer
+    /// 4. Open interest unchanged (no new tokens minted)
+    ///
+    /// # Arguments
+    /// * `args` - Close trade parameters (outcome, price, size, fee)
+    pub fn execute_close_v2(
+        ctx: Context<ExecuteCloseV2>,
+        args: CloseTradeArgsV2,
+    ) -> Result<()> {
+        instructions::execute_close_v2(ctx, args)
+    }
+
+    /// Activate a pending V2 market by setting the strike price
+    ///
+    /// Called when a market's trading window starts. Sets the real strike price
+    /// from the current WebSocket feed and changes status from Pending to Open.
+    ///
+    /// # Arguments
+    /// * `strike_price` - The actual strike price (from live price feed)
+    pub fn activate_market_v2(
+        ctx: Context<ActivateMarketV2>,
+        strike_price: u64,
+    ) -> Result<()> {
+        instructions::activate_market_v2(ctx, strike_price)
+    }
+
+    /// Resolve a V2 market with outcome from relayer
+    ///
+    /// Called by keeper after market expiry. The relayer determines the outcome
+    /// by comparing the final price (from Binance/Coinbase) to the strike price.
+    /// After resolution, market enters RESOLVED status, ready for merkle settlement.
+    ///
+    /// # Arguments
+    /// * `args` - Resolution parameters (outcome, final_price)
+    pub fn resolve_market_v2(ctx: Context<ResolveMarketV2>, args: ResolveMarketArgsV2) -> Result<()> {
+        instructions::resolve_market_v2(ctx, args)
+    }
+
+    // =========================================================================
+    // V2 MERKLE SETTLEMENT INSTRUCTIONS
+    // =========================================================================
+
+    /// Post the merkle root to begin batch settlement
+    ///
+    /// After market resolution, the keeper builds a merkle tree off-chain with all
+    /// (recipient, payout) pairs and posts the root here. This transitions the
+    /// market from RESOLVED to SETTLING status.
+    ///
+    /// # Arguments
+    /// * `args` - Merkle root, total amount, and settlement count
+    pub fn post_merkle_root(ctx: Context<PostMerkleRoot>, args: PostMerkleRootArgs) -> Result<()> {
+        instructions::post_merkle_root(ctx, args)
+    }
+
+    /// Batch settle multiple users with merkle proofs
+    ///
+    /// Settles up to 15 users in one transaction. Each settlement is verified
+    /// against the merkle root before payout. A bitmap tracks claimed leaves
+    /// to prevent double-settlement.
+    ///
+    /// # Arguments
+    /// * `settlements` - Vector of settlement entries with proofs
+    pub fn batch_settle_v2<'info>(
+        ctx: Context<'_, '_, 'info, 'info, BatchSettleV2<'info>>,
+        settlements: Vec<SettlementEntry>,
+    ) -> Result<()> {
+        instructions::batch_settle_v2(ctx, settlements)
+    }
+
+    /// Burn remaining share tokens from user ATAs using PermanentDelegate
+    ///
+    /// Called after batch_settle_v2 completes and before finalize_market_v2.
+    /// Burns all YES/NO tokens from the passed remaining_accounts, bringing
+    /// mint supply to 0 so mints can be closed during finalize.
+    pub fn burn_remaining_shares_v2<'info>(
+        ctx: Context<'_, '_, 'info, 'info, BurnRemainingSharesV2<'info>>,
+    ) -> Result<()> {
+        instructions::burn_remaining_shares_v2(ctx)
+    }
+
+    /// Finalize a V2 market after all settlements are complete
+    ///
+    /// This instruction verifies all settlements are done, closes the vault,
+    /// closes YES/NO mints (Token-2022 MintCloseAuthority), recovers all rent,
+    /// and transitions market to SETTLED status.
+    pub fn finalize_market_v2(ctx: Context<FinalizeMarketV2>) -> Result<()> {
+        instructions::finalize_market_v2(ctx)
+    }
+
+    /// Close a V2 market that has no trading activity
+    ///
+    /// For zero-trade markets, this skips the merkle settlement flow and
+    /// directly closes the vault, YES/NO mints (Token-2022), and market PDA.
+    /// Recovers all rent. Market must be RESOLVED with open_interest = 0.
+    pub fn close_market_v2(ctx: Context<CloseMarketV2>) -> Result<()> {
+        instructions::close_market_v2(ctx)
     }
 }

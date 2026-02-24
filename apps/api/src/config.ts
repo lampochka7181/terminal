@@ -43,10 +43,10 @@ export const config = {
   // NOTE: Defaults are intentionally conservative for local/dev to avoid exhausting
   // Supabase pooler / local Postgres under bursty keeper workloads.
   dbPool: {
-    max: parseInt(process.env.DB_POOL_MAX || '30'),
-    min: parseInt(process.env.DB_POOL_MIN || '0'),
+    max: parseInt(process.env.DB_POOL_MAX || '25'),
+    min: parseInt(process.env.DB_POOL_MIN || '2'),
     idleTimeoutMillis: parseInt(process.env.DB_POOL_IDLE_TIMEOUT_MS || '15000'),
-    connectionTimeoutMillis: parseInt(process.env.DB_POOL_CONN_TIMEOUT_MS || '5000'),
+    connectionTimeoutMillis: parseInt(process.env.DB_POOL_CONN_TIMEOUT_MS || '10000'),
   },
   
   // Supabase
@@ -75,6 +75,19 @@ export const config = {
   // Solana
   solanaNetwork: process.env.SOLANA_NETWORK || 'devnet',
   solanaRpcUrl: process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com',
+  // Optional: dedicated RPC endpoint for on-chain execution (sendTransaction, confirm)
+  // Falls back to solanaRpcUrl if not set. Use a separate Helius key to avoid rate contention.
+  solanaExecutionRpcUrl: process.env.SOLANA_EXECUTION_RPC_URL || '',
+  // Additional RPC endpoints for connection pooling (each adds ~50 RPC/s capacity)
+  // The anchor client round-robins TX submission across all available connections
+  solanaRpcUrl2: process.env.SOLANA_RPC_URL_2 || '',
+  solanaRpcUrl3: process.env.SOLANA_RPC_URL_3 || '',
+  // Helius Sender — ultra-low latency TX submission (15 tx/sec vs 5 tx/sec standard)
+  // Dual-routes to validators + Jito. Free, no credits consumed. MAINNET ONLY (Jito required).
+  // Backend: http://ewr-sender.helius-rpc.com/fast  Frontend: https://sender.helius-rpc.com/fast
+  heliusSenderUrl: process.env.HELIUS_SENDER_URL || '',
+  // Jito tip in SOL per TX (minimum 0.0002 SOL required by Sender)
+  jitoTipSol: parseFloat(process.env.JITO_TIP_SOL || '0.0002'),
   programId: process.env.PROGRAM_ID || '5Kq43SR2HUNsyNZWaau1p8kQzAvW2UA2mAvempdchTrk',
   relayerPrivateKey: process.env.RELAYER_PRIVATE_KEY || '',
   // USDC-dev on devnet (use mainnet USDC for production)
@@ -93,7 +106,8 @@ export const config = {
   mmPrivateKey: process.env.MM_PRIVATE_KEY || process.env.MM_WALLET_PRIVATE_KEY || '',
 
   // Temporary: reduce DB usage by not persisting MM orders (they remain in Redis orderbook only)
-  disableMmOrderPersistence: process.env.DISABLE_MM_ORDER_PERSISTENCE === 'true',
+  // Auto-enabled in PERF_TEST_MODE to avoid DB pool saturation from MM order writes
+  disableMmOrderPersistence: process.env.DISABLE_MM_ORDER_PERSISTENCE === 'true' || process.env.PERF_TEST_MODE === 'true',
 
   // Devnet/testing: if the book is empty, force-fill market orders against MM at a reasonable price.
   // DEPRECATED: Now that MM bot is working properly, this should be disabled to use real orderbook matching.
@@ -153,6 +167,38 @@ export const config = {
     maxUserExposurePct: parseFloat(process.env.MAX_USER_EXPOSURE_PCT || '20') / 100, // Max 20% of pool per user
     minPoolReservePct: parseFloat(process.env.MIN_POOL_RESERVE_PCT || '10') / 100,   // Keep 10% always available
   },
+
+  // ============================================================================
+  // V2 TOKENIZED SHARES (Feature Flag)
+  // ============================================================================
+  // Enable V2 flow: tokenized YES/NO shares + merkle batch settlement
+  // When enabled:
+  // - New markets use initialize_market_v2 (creates YES/NO token mints)
+  // - Trades use execute_match_v2 (mints tokens instead of Position PDAs)
+  // - Settlement uses merkle proofs for batch processing
+  // When disabled (default):
+  // - Uses V1 flow with Position PDAs and individual settlements
+  useV2: process.env.USE_V2 === 'true',
+
+  // ============================================================================
+  // AGENT API CONFIGURATION
+  // ============================================================================
+  agent: {
+    enabled: process.env.AGENT_API_ENABLED !== 'false', // Enabled by default
+    defaultFeeDiscountPct: parseInt(process.env.AGENT_DEFAULT_FEE_DISCOUNT_PCT || '25'), // 25% off taker fees
+    defaultDelegationAmount: parseFloat(process.env.AGENT_DEFAULT_DELEGATION_USDC || '100'), // USDC auto-delegation
+    rateLimitPerMinute: parseInt(process.env.AGENT_RATE_LIMIT || '600'), // 600/min (vs 300/min for regular users)
+  },
+
+  // ============================================================================
+  // PERFORMANCE TESTING
+  // ============================================================================
+  // Enable performance test mode:
+  //   - MM places deep liquidity (20 levels, 100k contracts each)
+  //   - POST /perf/* endpoints become available (bypasses auth/signing)
+  //   - Rate limit increased to 10,000/min
+  //   - BullMQ concurrency boosted
+  perfTestMode: process.env.PERF_TEST_MODE === 'true',
 };
 
 

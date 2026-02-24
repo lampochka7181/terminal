@@ -7,6 +7,7 @@ export interface JwtPayload {
   address: string; // Wallet address
   iat: number;     // Issued at
   exp: number;     // Expires at
+  isAgent?: boolean; // True for agent-authenticated JWTs
 }
 
 // Extend FastifyRequest to include user
@@ -98,6 +99,18 @@ export function getCurrentWallet(request: FastifyRequest): string | null {
     return address;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Check if the request is from an authenticated AI agent
+ */
+export function isAgentRequest(request: FastifyRequest): boolean {
+  try {
+    const { isAgent } = request.user as JwtPayload;
+    return isAgent === true;
+  } catch {
+    return false;
   }
 }
 

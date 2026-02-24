@@ -274,6 +274,81 @@ Non-base58 character (after market marked archived)
 
 ## Fixed Bugs
 
+### B13: Token-2022 Migration for YES/NO Mint Rent Recovery (Fixed)
+
+**Date Fixed:** 2026-02-07  
+**Affected:** All V2 markets - YES/NO mint rent was previously unrecoverable
+
+**Issue:** YES/NO token mints used the standard SPL Token program which has no `CloseAccount` instruction for mints. This leaked ~0.003 SOL per market (2 mints × ~0.0015 SOL each) in unrecoverable rent.
+
+**Fix:** Migrated YES/NO share token mints from SPL Token to **Token-2022** with the **MintCloseAuthority** extension. The market PDA is set as the close authority, enabling rent recovery when markets are closed/finalized.
+
+**Changes:**
+| File | Change |
+|------|--------|
+| `initialize_market_v2.rs` | Manual Token-2022 mint creation with MintCloseAuthority extension (replaces Anchor `init` with `mint::`) |
+| `initialize_market_v2.rs` (finalize) | Same for NO mint |
+| `execute_match_v2.rs` | Uses `token_interface::mint_to` with `share_token_program` (Token-2022) for YES/NO minting |
+| `execute_close_v2.rs` | Uses `token_interface::transfer_checked` with `share_token_program` for YES/NO transfers |
+| `close_market_v2.rs` | Closes YES/NO mints via `token_interface::close_account` with MintCloseAuthority |
+| `finalize_market_v2.rs` | Same mint close + vault close |
+| `anchor-client.ts` | Passes `TOKEN_2022_PROGRAM_ID` for share token operations, computes Token-2022 ATAs |
+
+**Rent Recovery After Fix (per market):**
+| Account | Rent (~) | Recovered? |
+|---------|----------|------------|
+| USDC Vault (ATA) | ~0.002 SOL | Yes |
+| MarketV2 PDA | ~0.003 SOL | Yes |
+| YES Mint (Token-2022) | ~0.0015 SOL | **Yes** |
+| NO Mint (Token-2022) | ~0.0015 SOL | **Yes** |
+| **Total** | **~0.009 SOL** | **100%** |
+
+**Note:** Deployed to devnet 2026-02-07. Program ID: `5Kq43SR2HUNsyNZWaau1p8kQzAvW2UA2mAvempdchTrk`
+
+---
+
+### B12: V2 Market PDA Rent Not Recovered on Close/Finalize (Fixed)
+
+**Date Fixed:** 2026-02-07  
+**Affected:** All V2 markets - rent leaked on close/finalize
+
+**Issue:** `close_market_v2` and `finalize_market_v2` only closed the USDC vault, but left the MarketV2 PDA open on-chain. This leaked ~0.003 SOL per market.
+
+**Fix:** Added Anchor `close = rent_recipient` constraint to both instructions. The MarketV2 PDA is now automatically closed after the handler completes.
+
+**Note:** Superseded by B13 (Token-2022 migration) which also recovers YES/NO mint rent.
+
+**Location:**
+- `packages/contracts/programs/degen-terminal/src/instructions/close_market_v2.rs`
+- `packages/contracts/programs/degen-terminal/src/instructions/finalize_market_v2.rs`
+
+---
+
+### B11: FEE_RECIPIENT Undefined Crash in executeCloseV2 (Fixed)
+
+**Date Fixed:** 2026-02-07  
+**Affected:** All V2 closing trades (selling positions)
+
+**Issue:** `buildExecuteCloseV2Instruction()` in `anchor-client.ts` referenced an undefined `FEE_RECIPIENT` constant instead of using `config.feeRecipient` (the pattern used by all other V2 methods). This caused a runtime crash (`ReferenceError: FEE_RECIPIENT is not defined`) whenever a V2 closing trade was attempted.
+
+**Root Cause:** Copy-paste error during V2 implementation. The `buildExecuteMatchV2Instruction` method correctly used:
+```typescript
+const feeRecipientWallet = config.feeRecipient
+  ? new PublicKey(config.feeRecipient)
+  : this.relayerKeypair.publicKey;
+```
+
+But `buildExecuteCloseV2Instruction` incorrectly used:
+```typescript
+const feeRecipientPk = new PublicKey(FEE_RECIPIENT); // undefined!
+```
+
+**Fix:** Replaced with the same `config.feeRecipient` pattern used in other V2 methods.
+
+**Location:** `apps/api/src/lib/anchor-client.ts` (buildExecuteCloseV2Instruction)
+
+---
+
 ### B10: DB Pool Exhaustion Cascade During Market Lifecycle (Fixed)
 
 **Date Fixed:** 2026-01-19  

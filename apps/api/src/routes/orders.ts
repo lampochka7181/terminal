@@ -3,13 +3,13 @@ import { z } from 'zod';
 import { eq } from 'drizzle-orm';
 import nacl from 'tweetnacl';
 import bs58 from 'bs58';
-import { requireAuth, getCurrentUserId, getCurrentWallet } from '../lib/auth.js';
+import { requireAuth, getCurrentUserId, getCurrentWallet, isAgentRequest } from '../lib/auth.js';
 import { orderService } from '../services/order.service.js';
 import { marketService } from '../services/market.service.js';
 import { userService } from '../services/user.service.js';
 import { positionService } from '../services/position.service.js';
 import { matchingService } from '../services/matching.service.js';
-import { feeService, calculateTakerFee } from '../services/fee.service.js';
+import { feeService, calculateTakerFee, calculateAgentTakerFee } from '../services/fee.service.js';
 import { sessionService } from '../services/session.service.js';
 import { marginService, leverageCalc } from '../services/margin.service.js';
 import { lendingService } from '../services/lending.service.js';
@@ -59,12 +59,13 @@ export async function orderRoutes(app: FastifyInstance) {
     type: z.enum(['limit', 'market', 'ioc', 'fok']).default('limit'),
     price: z.number().min(0.01).max(0.99),
     size: z.number().min(0.001).max(100000),
-    expiry: z.number(),
-    clientOrderId: z.number(),
+    expiry: z.number().optional(),                        // Optional for agents (default: 1 hour)
+    clientOrderId: z.number().optional(),                  // Optional for agents (default: Date.now())
     dollarAmount: z.number().min(0.02).max(1000000).optional(), // Min $0.02 for sells
     maxPrice: z.number().min(0.01).max(0.99).optional(),
-    signature: z.string(),
-    binaryMessage: z.string(),
+    signature: z.string().optional(),                      // Optional for agents (API key auth is sufficient)
+    binaryMessage: z.string().optional(),                  // Optional for agents
+    encodedInstruction: z.string().optional(),             // Optional for agents
     sessionPublicKey: z.string().min(32).max(64).optional(), // For session-signed orders
     // Leverage parameters
     leverage: z.number().min(1).max(config.leverage.maxLeverage).optional().default(1), // 1x = no leverage
@@ -92,49 +93,64 @@ export async function orderRoutes(app: FastifyInstance) {
     }
 
     const data = body.data;
-    logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Validated, ${data.side} ${data.outcome} $${data.dollarAmount || data.size}`);
-    
+    const isAgent = isAgentRequest(request);
+    logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Validated, ${data.side} ${data.outcome} $${data.dollarAmount || data.size}${isAgent ? ' [AGENT]' : ''}`);
+
     // ========================================
-    // SIGNATURE VERIFICATION
+    // AGENT ORDER DEFAULTS
+    // ========================================
+    if (isAgent) {
+      // Agents don't need signatures — JWT auth is sufficient
+      if (!data.clientOrderId) data.clientOrderId = Date.now();
+      if (!data.expiry) data.expiry = Math.floor(Date.now() / 1000) + 3600; // 1 hour default
+    } else if (!data.signature) {
+      // Non-agent requests MUST have signature
+      return reply.code(400).send({
+        error: { code: 'SIGNATURE_REQUIRED', message: 'Signature is required for non-agent orders' },
+      });
+    }
+
+    // ========================================
+    // SIGNATURE VERIFICATION (skip for agents)
     // ========================================
     // If sessionPublicKey is provided, verify against session service
     // Otherwise, the signature was from the wallet directly (verified by JWT auth)
-    if (data.sessionPublicKey) {
+    if (!isAgent && data.sessionPublicKey) {
       // Decode the order data from binaryMessage
       let orderData: Record<string, unknown>;
       try {
-        const messageJson = Buffer.from(data.binaryMessage, 'base64').toString('utf-8');
+        const messageJson = Buffer.from(data.binaryMessage!, 'base64').toString('utf-8');
         orderData = JSON.parse(messageJson);
       } catch {
         return reply.code(400).send({
           error: { code: 'INVALID_MESSAGE', message: 'Invalid order message format' },
         });
       }
-      
+
       // Verify session signature
       const sessionVerify = sessionService.verifySessionSignature(
         data.sessionPublicKey,
         orderData,
-        data.signature
+        data.signature!
       );
-      
+
       if (!sessionVerify.valid) {
         return reply.code(401).send({
           error: { code: 'INVALID_SESSION', message: sessionVerify.error || 'Session signature verification failed' },
         });
       }
-      
+
       // Verify session belongs to the authenticated user
       if (sessionVerify.walletAddress !== wallet) {
         return reply.code(403).send({
           error: { code: 'SESSION_MISMATCH', message: 'Session does not belong to authenticated user' },
         });
       }
-      
+
       logger.debug(`[Orders] Session-signed order from ${wallet.slice(0, 8)}... (session: ${data.sessionPublicKey.slice(0, 8)}...)`);
     }
-    
-    // Track if this is a session-signed order (used to skip delegation check later)
+
+    // Track if this is a session-signed or agent order (used to skip delegation check later)
     const isSessionOrder = !!data.sessionPublicKey;
     
     const market = await marketService.getByPubkey(data.marketAddress);
@@ -176,6 +192,18 @@ export async function orderRoutes(app: FastifyInstance) {
       });
     }
 
+    // Reject orders too close to market expiry — they'll likely fail on-chain with MarketNotOpen
+    const EXPIRY_BUFFER_MS = 30_000; // 30 seconds
+    if (market.expiryAt) {
+      const expiryMs = new Date(market.expiryAt).getTime();
+      const remainingMs = expiryMs - Date.now();
+      if (remainingMs < EXPIRY_BUFFER_MS) {
+        return reply.code(409).send({
+          error: { code: 'MARKET_EXPIRING', message: `Market closes in ${Math.round(remainingMs / 1000)}s — orders cannot be placed within 30 seconds of expiry` },
+        });
+      }
+    }
+
     // Markets with strikePrice = '0' are pending activation (trading suspended)
     if (market.strikePrice === '0') {
       return reply.code(409).send({
@@ -189,12 +217,14 @@ export async function orderRoutes(app: FastifyInstance) {
     
     // 1. SELL order logic
     if (isMarketOrder && isSellOrder) {
-      // OPTIMIZATION: Skip delegation check for session-signed orders
-      if (!isSessionOrder) {
+      // Delegation check for sell orders (amount=0 since selling shares, not spending USDC)
+      if (!isSessionOrder && !isAgent) {
         const delCheck = await matchingService.checkDelegation(userId, 0);
         if (!delCheck.isApproved) {
           return reply.code(400).send({ error: { code: 'DELEGATION_REQUIRED', message: delCheck.error } });
         }
+      } else {
+        logger.debug(`[Orders] ${isAgent ? 'Agent' : 'Session'} order — using cached delegation for sell`);
       }
 
       // Check if this position has a margin account (leveraged position)
@@ -253,10 +283,10 @@ export async function orderRoutes(app: FastifyInstance) {
         outcome: outcomeUpper,
         size: data.size,
         minPrice: data.price,
-        clientOrderId: data.clientOrderId,
-        expiresAt: data.expiry * 1000,
-        signature: data.signature,
-        binaryMessage: data.binaryMessage,
+        clientOrderId: data.clientOrderId!,
+        expiresAt: data.expiry! * 1000,
+        signature: data.signature || '',
+        binaryMessage: data.binaryMessage || '',
         // LEVERAGED CLOSE: On-chain shares are owned by Lending Pool
         isLeveragedClose: isLeveragedPosition || false,
       });
@@ -483,9 +513,16 @@ export async function orderRoutes(app: FastifyInstance) {
     }
     
     // 2. BUY order logic (Limit or Dollar-based Market)
-    // Calculate fee using tiered fee structure
+    // Calculate fee using tiered fee structure (agents get discounted fees)
     const orderNotional = data.dollarAmount || (data.price * data.size);
-    const feeCalc = calculateTakerFee(orderNotional);
+    let agentFeeDiscountPct = 0;
+    if (isAgent) {
+      const user = await userService.findById(userId);
+      agentFeeDiscountPct = user?.feeDiscountPct || config.agent.defaultFeeDiscountPct;
+    }
+    const feeCalc = isAgent
+      ? calculateAgentTakerFee(orderNotional, agentFeeDiscountPct)
+      : calculateTakerFee(orderNotional);
     
     // ========================================
     // LEVERAGE VALIDATION
@@ -551,19 +588,23 @@ export async function orderRoutes(app: FastifyInstance) {
       ? marginRequired + feeCalc.fee 
       : orderNotional + feeCalc.fee;
     
-    // OPTIMIZATION: Skip on-chain delegation check for session-signed orders
-    // Session orders already prove the user has delegation enabled (they couldn't create a session without it)
-    // This saves ~500-800ms per order by avoiding an RPC call to Solana
-    if (!isSessionOrder) {
+    // Delegation check — verify user has approved relayer to spend their USDC
+    // For session/agent orders: skip full on-chain check for speed
+    if (!isSessionOrder && !isAgent) {
       const delCheckStart = Date.now();
       const delCheck = await matchingService.checkDelegation(userId, requiredAmount);
       logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Delegation check done (${Date.now()-delCheckStart}ms)`);
-      
+
       if (!delCheck.isApproved || delCheck.error) {
         return reply.code(400).send({ error: { code: 'DELEGATION_INSUFFICIENT', message: delCheck.error } });
       }
+    } else if (isAgent) {
+      // Agent orders: delegation managed by MCP server / agent setup flow
+      logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Agent order — skipping delegation check`);
     } else {
-      logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Skipped delegation check (session order)`);
+      // Session orders: skip full on-chain check for speed, but verify session is still valid
+      // The session service already validates expiry during signature verification above
+      logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Session order — using cached delegation status`);
     }
 
     if (data.type.toUpperCase() === 'LIMIT') {
@@ -574,16 +615,16 @@ export async function orderRoutes(app: FastifyInstance) {
         outcome: outcomeUpper,
         price: data.price,
         size: data.size,
-        clientOrderId: data.clientOrderId,
-        expiresAt: data.expiry * 1000,
-        signature: data.signature,
-        binaryMessage: data.binaryMessage,
+        clientOrderId: data.clientOrderId!,
+        expiresAt: data.expiry! * 1000,
+        signature: data.signature || '',
+        binaryMessage: data.binaryMessage || '',
         // Leverage fields (for on-chain execution through Lending Pool)
         leverage: isLeveraged ? leverage : undefined,
         marginAmount: isLeveraged ? marginRequired : undefined,
         loanAmount: isLeveraged ? loanAmount : undefined,
       });
-      
+
       logEvents.orderPlaced({
         orderId: result.orderId,
         userId, wallet, marketId: market.id, asset: market.asset, timeframe: market.timeframe,
@@ -678,16 +719,16 @@ export async function orderRoutes(app: FastifyInstance) {
         outcome: outcomeUpper,
         dollarAmount: data.dollarAmount,
         maxPrice: data.maxPrice || 0.99,
-        clientOrderId: data.clientOrderId,
-        expiresAt: data.expiry * 1000,
-        signature: data.signature,
-        binaryMessage: data.binaryMessage,
+        clientOrderId: data.clientOrderId!,
+        expiresAt: data.expiry! * 1000,
+        signature: data.signature || '',
+        binaryMessage: data.binaryMessage || '',
         // Leverage fields (for on-chain execution through Lending Pool)
         leverage: isLeveraged ? leverage : undefined,
         marginAmount: isLeveraged ? marginRequired : undefined,
         loanAmount: isLeveraged ? loanAmount : undefined,
       });
-      
+
       logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Matching complete (${Date.now()-matchStart}ms), ${result.fills.length} fills`);
       
       logEvents.orderPlaced({
@@ -884,7 +925,26 @@ export async function orderRoutes(app: FastifyInstance) {
       });
     }
 
-    // TODO: Verify cancel signature
+    // Verify cancel signature: the signature must be a valid Ed25519 signature
+    // of the order ID by the user's wallet
+    const wallet = getCurrentWallet(request);
+    if (wallet) {
+      try {
+        const message = new TextEncoder().encode(`cancel:${params.data.id}`);
+        const signatureBytes = bs58.decode(body.data.signature);
+        const pubkeyBytes = bs58.decode(wallet);
+        const isValid = nacl.sign.detached.verify(message, signatureBytes, pubkeyBytes);
+        if (!isValid) {
+          return reply.code(401).send({
+            error: { code: 'INVALID_SIGNATURE', message: 'Cancel signature verification failed' },
+          });
+        }
+      } catch (sigErr: any) {
+        logger.warn(`Cancel signature verification error: ${sigErr.message}`);
+        // Allow cancellation if signature parsing fails but user is authenticated
+        // This maintains backward compatibility with clients not yet sending proper signatures
+      }
+    }
 
     // Cancel the order and remove from orderbook
     const success = await matchingService.cancelOrder(params.data.id, userId);

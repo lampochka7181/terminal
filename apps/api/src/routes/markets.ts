@@ -2,6 +2,7 @@ import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { marketService } from '../services/market.service.js';
 import { priceFeedService } from '../services/price-feed.service.js';
+import { orderbookService } from '../services/orderbook.service.js';
 import { redis, RedisKeys } from '../db/redis.js';
 import { logger } from '../lib/logger.js';
 import { circuitBreaker } from '../lib/circuit-breaker.js';
@@ -438,46 +439,30 @@ export async function marketRoutes(app: FastifyInstance) {
       });
     }
     
-    // SINGLE ORDERBOOK MODEL: Only fetch YES orderbook from Redis
-    // NO orderbook is derived by frontend as complement (1 - YES price)
-    // NOTE: Bids use NEGATIVE scores (-price * 1M), so zrange (lowest to highest) 
-    // returns highest prices first (e.g., -550000 before -540000 = $0.55 before $0.54)
-    // Asks use POSITIVE scores, so zrange returns lowest prices first (correct)
-    const [
-      yesBidData, yesAskData,
-      sequenceId
-    ] = await Promise.all([
-      redis.zrange(RedisKeys.orderbook(market.id, 'YES', 'BID'), 0, -1, 'WITHSCORES'),
-      redis.zrange(RedisKeys.orderbook(market.id, 'YES', 'ASK'), 0, -1, 'WITHSCORES'),
-      redis.get(RedisKeys.sequence(market.id)),
-    ]);
-    
-    // Parse Redis data into orderbook format
-    // Format: [[price, size], [price, size], ...]
-    const yesBids = parseOrderbookData(yesBidData);
-    const yesAsks = parseOrderbookData(yesAskData);
-    
-    // Calculate mid price and spread for YES
+    // Use orderbookService.getSnapshot() — O(levels) from pre-aggregated data
+    const yesSnap = await orderbookService.getSnapshot(market.id, 'YES');
+
+    const yesBids: [number, number][] = yesSnap.bids.map(l => [l.price, l.size]);
+    const yesAsks: [number, number][] = yesSnap.asks.map(l => [l.price, l.size]);
+
     const yesBestBid = yesBids[0]?.[0] || 0;
     const yesBestAsk = yesAsks[0]?.[0] || 1;
     const yesMidPrice = (yesBestBid + yesBestAsk) / 2;
     const yesSpread = yesBestAsk - yesBestBid;
-    
+
     return {
       // Legacy format (YES only) for backwards compatibility
       bids: yesBids,
       asks: yesAsks,
       midPrice: parseFloat(yesMidPrice.toFixed(2)),
       spread: parseFloat(yesSpread.toFixed(2)),
-      sequenceId: parseInt(sequenceId || '0'),
-      // YES orderbook (the only real orderbook)
+      sequenceId: yesSnap.sequenceId,
       yes: {
         bids: yesBids,
         asks: yesAsks,
         midPrice: parseFloat(yesMidPrice.toFixed(2)),
         spread: parseFloat(yesSpread.toFixed(2)),
       },
-      // NO orderbook - empty, frontend derives from YES
       no: {
         bids: [],
         asks: [],
@@ -533,29 +518,4 @@ export async function marketRoutes(app: FastifyInstance) {
   });
 }
 
-/**
- * Parse Redis ZRANGE WITHSCORES data into orderbook format
- * Member format: {orderId}:{remainingSize}:{createdAt}
- * Score: price * 1000000
- */
-function parseOrderbookData(data: string[]): [number, number][] {
-  const result: [number, number][] = [];
-  
-  // Data comes as [member, score, member, score, ...]
-  // member = "orderId:size:timestamp", score = price * 1000000
-  for (let i = 0; i < data.length; i += 2) {
-    const member = data[i];
-    const scoreStr = data[i + 1];
-    
-    // Extract size from member (format: orderId:size:timestamp)
-    const parts = member.split(':');
-    const size = parts.length >= 2 ? parseFloat(parts[1]) : NaN;
-    const price = Math.abs(parseFloat(scoreStr)) / 1000000;
-    
-    if (!isNaN(price) && !isNaN(size) && size > 0) {
-      result.push([price, size]);
-    }
-  }
-  
-  return result;
-}
+// parseOrderbookData removed — now using orderbookService.getSnapshot()

@@ -18,7 +18,7 @@ import { relations } from 'drizzle-orm';
 // Enums
 // Note: PENDING exists in DB enum but we don't use it - we use strikePrice = '0' to indicate pending
 // This avoids Supabase connection pooler enum caching issues
-export const marketStatusEnum = pgEnum('market_status', ['OPEN', 'CLOSED', 'RESOLVED', 'SETTLED']);
+export const marketStatusEnum = pgEnum('market_status', ['OPEN', 'CLOSED', 'RESOLVED', 'SETTLED', 'SETTLEMENT_FAILED']);
 export const orderSideEnum = pgEnum('order_side', ['BID', 'ASK']);
 export const orderOutcomeEnum = pgEnum('order_outcome', ['YES', 'NO']);
 export const orderTypeEnum = pgEnum('order_type', ['LIMIT', 'MARKET', 'IOC', 'FOK']);
@@ -43,6 +43,11 @@ export const users = pgTable('users', {
   feeTier: smallint('fee_tier').default(0),
   isBanned: boolean('is_banned').default(false),
   metadata: jsonb('metadata'),
+  // Agent fields
+  isAgent: boolean('is_agent').default(false),
+  agentName: varchar('agent_name', { length: 100 }),
+  feeDiscountPct: smallint('fee_discount_pct').default(0), // Agent fee discount percentage (e.g. 25 = 25% off)
+  agentMetadata: jsonb('agent_metadata'), // { description, version, github, etc. }
 });
 
 // Markets table
@@ -100,6 +105,7 @@ export const orders = pgTable('orders', {
   encodedInstruction: text('encoded_instruction'), // Nullable - MM orders don't have this
   binaryMessage: text('binary_message'), // For signature verification (base64 encoded)
   isMmOrder: boolean('is_mm_order').default(false).notNull(), // True for Market Maker bot orders
+  isAgentOrder: boolean('is_agent_order').default(false).notNull(), // True for AI agent orders
   // Leverage fields (for displaying leverage info before margin account exists)
   leverage: numeric('leverage', { precision: 4, scale: 2 }).default('1'),
   marginAmount: numeric('margin_amount', { precision: 20, scale: 6 }),

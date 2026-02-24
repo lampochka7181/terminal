@@ -2,7 +2,7 @@ import { PublicKey, Keypair } from '@solana/web3.js';
 import { BN } from '@coral-xyz/anchor';
 import { config } from '../config.js';
 import { logger } from '../lib/logger.js';
-import { anchorClient, PlaceOrderArgs } from '../lib/anchor-client.js';
+import { anchorClient, PlaceOrderArgs, getYesMintPda, getNoMintPda } from '../lib/anchor-client.js';
 import { orderService } from './order.service.js';
 import { userService } from './user.service.js';
 import { lendingService } from './lending.service.js';
@@ -53,6 +53,10 @@ export interface MatchParams {
   takerSignature?: string;  // Base58 encoded
   makerMessage?: string;    // Base64 encoded binary message
   takerMessage?: string;    // Base64 encoded binary message
+  // V2 tokenized shares (optional - only for V2 markets)
+  yesMint?: string;         // YES token mint pubkey
+  noMint?: string;          // NO token mint pubkey
+  useV2?: boolean;          // Force V2 execution
 }
 
 export interface SettlementParams {
@@ -75,6 +79,10 @@ export interface CloseParams {
   tradeId?: string;  // Optional trade ID to update with tx signature
   makerOrderId?: string;  // For updating trade by order IDs
   takerOrderId?: string;  // For updating trade by order IDs
+  // V2 tokenized shares (optional - only for V2 markets)
+  yesMint?: string;         // YES token mint pubkey
+  noMint?: string;          // NO token mint pubkey
+  useV2?: boolean;          // Force V2 execution
 }
 
 // Leveraged match params - Lending Pool executes on behalf of user
@@ -113,12 +121,20 @@ class TransactionService {
    */
   async executeMatch(params: MatchParams): Promise<TransactionResult> {
     if (!anchorClient.isReady()) {
-      // Simulation mode - just return success without actually submitting
-      logger.debug(`[SIMULATION] Match: ${params.makerOrderId} x ${params.takerOrderId} - ${params.matchSize} @ ${params.price}`);
-      
+      // Anchor client not ready — only allow simulation if explicitly enabled
+      if (!config.perfTestMode) {
+        logger.error(`[TX] Anchor client not ready and PERF_TEST_MODE is off — rejecting match. This should not happen in production.`);
+        return {
+          success: false,
+          error: 'On-chain client not ready — cannot execute trade',
+          errorCode: 'CLIENT_NOT_READY',
+        };
+      }
+      logger.warn(`[SIMULATION] Match: ${params.makerOrderId} x ${params.takerOrderId} - ${params.matchSize} @ ${params.price}`);
+
       // Update trade status in simulation mode
       await this.updateTradeStatus(params.makerOrderId, params.takerOrderId, `sim_${Date.now()}`);
-      
+
       return {
         success: true,
         signature: `sim_${Date.now()}_${Math.random().toString(36).slice(2)}`,
@@ -140,24 +156,59 @@ class TransactionService {
         // Execute on-chain match
         // - User orders: have Order PDAs with escrowed USDC (trustless)
         // - MM orders: no Order PDA, uses delegation for USDC transfer
-        const signature = await anchorClient.executeMatch({
-          marketPubkey: params.marketPubkey,
-          makerWallet,
-          takerWallet,
-          makerSide: params.makerSide,
-          takerSide: params.takerSide,
-          outcome: params.outcome,
-          price: params.price,
-          matchSize: params.matchSize,
-          takerFee: params.takerFee,  // Tiered fee from fee.service.ts
-          makerClientOrderId: params.makerClientOrderId,
-          takerClientOrderId: params.takerClientOrderId,
-          makerExpiryTs: params.makerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
-          takerExpiryTs: params.takerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
-          // Order PDAs for user orders (enables trustless escrow)
-          makerOrderPda: params.makerOrderPda,
-          takerOrderPda: params.takerOrderPda,
-        });
+        let signature: string;
+
+        // Check if V2 mode is enabled (globally or per-request)
+        const useV2 = params.useV2 ?? config.useV2;
+
+        if (useV2) {
+          // V2: Tokenized shares - mint YES/NO tokens instead of creating Position PDAs
+          const marketPubkey = new PublicKey(params.marketPubkey);
+          const yesMint = params.yesMint || getYesMintPda(marketPubkey).toBase58();
+          const noMint = params.noMint || getNoMintPda(marketPubkey).toBase58();
+
+          logger.info(`[V2] Executing match: ${params.matchSize} shares @ $${params.price}`);
+
+          signature = await anchorClient.executeMatchV2({
+            marketPubkey: params.marketPubkey,
+            yesMint,
+            noMint,
+            makerWallet,
+            takerWallet,
+            makerSide: params.makerSide,
+            takerSide: params.takerSide,
+            outcome: params.outcome,
+            price: params.price,
+            matchSize: params.matchSize,
+            takerFee: params.takerFee,
+            makerClientOrderId: params.makerClientOrderId,
+            takerClientOrderId: params.takerClientOrderId,
+            makerExpiryTs: params.makerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
+            takerExpiryTs: params.takerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
+            makerOrderPda: params.makerOrderPda,
+            takerOrderPda: params.takerOrderPda,
+          });
+        } else {
+          // V1: Position PDAs
+          signature = await anchorClient.executeMatch({
+            marketPubkey: params.marketPubkey,
+            makerWallet,
+            takerWallet,
+            makerSide: params.makerSide,
+            takerSide: params.takerSide,
+            outcome: params.outcome,
+            price: params.price,
+            matchSize: params.matchSize,
+            takerFee: params.takerFee,  // Tiered fee from fee.service.ts
+            makerClientOrderId: params.makerClientOrderId,
+            takerClientOrderId: params.takerClientOrderId,
+            makerExpiryTs: params.makerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
+            takerExpiryTs: params.takerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
+            // Order PDAs for user orders (enables trustless escrow)
+            makerOrderPda: params.makerOrderPda,
+            takerOrderPda: params.takerOrderPda,
+          });
+        }
 
         // Update database on success
         await this.handleMatchSuccess(params, signature);
@@ -219,12 +270,19 @@ class TransactionService {
     const lendingPoolWallet = lendingWalletPubkey.toBase58();
 
     if (!anchorClient.isReady()) {
-      // Simulation mode
+      if (!config.perfTestMode) {
+        logger.error(`[TX] Anchor client not ready and PERF_TEST_MODE is off — rejecting leveraged match.`);
+        return {
+          success: false,
+          error: 'On-chain client not ready — cannot execute leveraged trade',
+          errorCode: 'CLIENT_NOT_READY',
+        };
+      }
       const simSignature = `sim_leveraged_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-      logger.debug(`[SIMULATION] Leveraged Match: LendingPool ${lendingPoolWallet.slice(0,8)} buying for user ${params.userWallet.slice(0,8)} - ${params.matchSize} @ ${params.price}`);
-      
+      logger.warn(`[SIMULATION] Leveraged Match: LendingPool ${lendingPoolWallet.slice(0,8)} buying for user ${params.userWallet.slice(0,8)} - ${params.matchSize} @ ${params.price}`);
+
       await this.updateTradeStatus(params.makerOrderId, params.takerOrderId, simSignature);
-      
+
       return {
         success: true,
         signature: simSignature,
@@ -360,12 +418,20 @@ class TransactionService {
    */
   async executeClose(params: CloseParams): Promise<TransactionResult> {
     if (!anchorClient.isReady()) {
+      if (!config.perfTestMode) {
+        logger.error(`[TX] Anchor client not ready and PERF_TEST_MODE is off — rejecting close trade.`);
+        return {
+          success: false,
+          error: 'On-chain client not ready — cannot execute close trade',
+          errorCode: 'CLIENT_NOT_READY',
+        };
+      }
       const simSignature = `sim_close_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-      logger.debug(`[SIMULATION] Close: buyer=${params.buyerWallet} ← seller=${params.sellerWallet} - ${params.matchSize} @ ${params.price}`);
-      
+      logger.warn(`[SIMULATION] Close: buyer=${params.buyerWallet} ← seller=${params.sellerWallet} - ${params.matchSize} @ ${params.price}`);
+
       // Update trade with simulation signature
       await this.updateCloseTradeSignature(params, simSignature);
-      
+
       return {
         success: true,
         signature: simSignature,
@@ -374,17 +440,44 @@ class TransactionService {
 
     let lastError: Error | null = null;
 
+    // Check if V2 mode is enabled (globally or per-request)
+    const useV2 = params.useV2 ?? config.useV2;
+
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const signature = await anchorClient.executeClose({
-          marketPubkey: params.marketPubkey,
-          buyerWallet: params.buyerWallet,
-          sellerWallet: params.sellerWallet,
-          outcome: params.outcome,
-          price: params.price,
-          matchSize: params.matchSize,
-          takerFee: params.takerFee,  // Tiered fee from fee.service.ts
-        });
+        let signature: string;
+
+        if (useV2) {
+          // V2: Tokenized shares - transfer tokens between wallets
+          const marketPubkey = new PublicKey(params.marketPubkey);
+          const yesMint = params.yesMint || getYesMintPda(marketPubkey).toBase58();
+          const noMint = params.noMint || getNoMintPda(marketPubkey).toBase58();
+
+          logger.info(`[V2] Executing close: ${params.matchSize} shares @ $${params.price}`);
+
+          signature = await anchorClient.executeCloseV2({
+            marketPubkey: params.marketPubkey,
+            yesMint,
+            noMint,
+            buyerWallet: params.buyerWallet,
+            sellerWallet: params.sellerWallet,
+            outcome: params.outcome,
+            price: params.price,
+            matchSize: params.matchSize,
+            takerFee: params.takerFee,
+          });
+        } else {
+          // V1: Position PDAs
+          signature = await anchorClient.executeClose({
+            marketPubkey: params.marketPubkey,
+            buyerWallet: params.buyerWallet,
+            sellerWallet: params.sellerWallet,
+            outcome: params.outcome,
+            price: params.price,
+            matchSize: params.matchSize,
+            takerFee: params.takerFee,  // Tiered fee from fee.service.ts
+          });
+        }
 
         logger.debug(`Close trade executed on-chain: ${signature}`);
         
@@ -424,7 +517,15 @@ class TransactionService {
    */
   async executeSettlement(params: SettlementParams): Promise<TransactionResult> {
     if (!anchorClient.isReady()) {
-      logger.debug(`[SIMULATION] Settlement: ${params.positionId} → ${params.payout} USDC`);
+      if (!config.perfTestMode) {
+        logger.error(`[TX] Anchor client not ready and PERF_TEST_MODE is off — rejecting settlement.`);
+        return {
+          success: false,
+          error: 'On-chain client not ready — cannot execute settlement',
+          errorCode: 'CLIENT_NOT_READY',
+        };
+      }
+      logger.warn(`[SIMULATION] Settlement: ${params.positionId} → ${params.payout} USDC`);
       return {
         success: true,
         signature: `sim_settle_${Date.now()}`,

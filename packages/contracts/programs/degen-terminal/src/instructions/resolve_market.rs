@@ -12,9 +12,12 @@ pub struct ResolveMarketArgs {
 
 #[derive(Accounts)]
 pub struct ResolveMarket<'info> {
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = market.authority == authority.key() @ DegenError::Unauthorized
+    )]
     pub market: Account<'info, Market>,
-    
+
     /// Authority (keeper/relayer) that triggers resolution
     pub authority: Signer<'info>,
 }

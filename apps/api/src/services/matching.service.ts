@@ -7,12 +7,16 @@ import { transactionService, MatchParams, CloseParams, LeveragedMatchParams } fr
 import { calculateTakerFee, calculateMakerFee } from './fee.service.js';
 import { getMarketPda, anchorClient } from '../lib/anchor-client.js';
 import { db, trades, type NewTrade } from '../db/index.js';
+import { eq } from 'drizzle-orm';
 import { logger, tradeLogger, orderLogger, logEvents } from '../lib/logger.js';
 import { broadcastOrderbookUpdate, broadcastTrade, broadcastGlobalTrade, broadcastUserFill } from '../lib/broadcasts.js';
 import { config } from '../config.js';
+import { onchainSubmitQueue } from '../queue/queues.js';
 import { mmBotV2 } from '../bot/mm-bot-v2.js';
 import { lendingService } from './lending.service.js';
 import { marginService } from './margin.service.js';
+import { writeBehindService } from './write-behind.service.js';
+import { randomUUID } from 'crypto';
 
 // Get MM bot user ID
 function getMMUserId(): string | null {
@@ -183,6 +187,38 @@ export interface LimitMatchResult {
 }
 
 export class MatchingService {
+  /**
+   * Semaphore to limit concurrent background DB processing.
+   * Prevents 50+ concurrent processFillsInBackground calls from
+   * overwhelming the DB connection pool (25 connections).
+   */
+  private bgDbConcurrency = 0;
+  // In perf mode, allow only 3 concurrent background DB tasks (trade inserts only)
+  // to leave pool capacity for write-behind + on-chain workers.
+  // Normal mode: 10 (includes position/stats updates).
+  private readonly MAX_BG_DB_CONCURRENCY = config.perfTestMode ? 3 : 10;
+  private bgDbQueue: Array<() => void> = [];
+
+  private async acquireBgDbSlot(): Promise<void> {
+    if (this.bgDbConcurrency < this.MAX_BG_DB_CONCURRENCY) {
+      this.bgDbConcurrency++;
+      return;
+    }
+    // Wait for a slot to open
+    return new Promise<void>(resolve => {
+      this.bgDbQueue.push(resolve);
+    });
+  }
+
+  private releaseBgDbSlot(): void {
+    this.bgDbConcurrency--;
+    const next = this.bgDbQueue.shift();
+    if (next) {
+      this.bgDbConcurrency++;
+      next();
+    }
+  }
+
   /**
    * Opt-in perf logging for matching loops.
    * Enable with: PERF_MATCHING_LOGS=true
@@ -444,13 +480,9 @@ export class MatchingService {
       
       fills.push(fill);
       
-      // Update maker order in orderbook
+      // Update maker order in orderbook (atomic: 1 Redis round-trip via Lua)
       const newMakerRemaining = bestOrder.remainingSize - fillSize;
-      if (newMakerRemaining > 0) {
-        await orderbookService.updateOrderSize(bestOrder, newMakerRemaining);
-      } else {
-        await orderbookService.removeOrder(bestOrder);
-      }
+      await orderbookService.consumeOrder(bestOrder, Math.max(0, newMakerRemaining));
       
       // Update remaining taker size
       remainingSize -= fillSize;
@@ -498,9 +530,12 @@ export class MatchingService {
     };
 
     // CONTINUOUS MATCHING CONFIG
-    const MAX_RETRIES = 20;           // Max times to retry when orderbook is empty
-    const RETRY_DELAY_MS = 100;       // Wait 100ms between retries for MM to replenish
-    const MAX_MATCHING_TIME_MS = 5000; // Max 5 seconds total matching time
+    // Retry delays were reduced from 100ms→20ms after profiling showed empty-book
+    // retries were the dominant contributor to matching latency (~1-2s per order).
+    const isPerfMode = config.perfTestMode;
+    const MAX_RETRIES = isPerfMode ? 3 : 10;            // Reduced from 5/20
+    const RETRY_DELAY_MS = isPerfMode ? 10 : 20;        // Reduced from 50/100ms
+    const MAX_MATCHING_TIME_MS = isPerfMode ? 200 : 3000; // Reduced from 500/5000ms
     const startTime = Date.now();
     let emptyBookRetries = 0;
     
@@ -702,16 +737,14 @@ export class MatchingService {
       totalSpent += fillCost;
       remainingDollars -= fillCost;
       
-      // Update maker order in orderbook
+      // Update maker order in orderbook (atomic: 1 Redis round-trip via Lua)
       const newMakerRemaining = bestOrder.remainingSize - fillSize;
+      const tConsume = Date.now();
+      await orderbookService.consumeOrder(bestOrder, Math.max(0, newMakerRemaining));
       if (newMakerRemaining > 0) {
-        const tUpd = Date.now();
-        await orderbookService.updateOrderSize(bestOrder, newMakerRemaining);
-        perf.updateOrderMs += Date.now() - tUpd;
+        perf.updateOrderMs += Date.now() - tConsume;
       } else {
-        const tRem = Date.now();
-        await orderbookService.removeOrder(bestOrder);
-        perf.removeOrderMs += Date.now() - tRem;
+        perf.removeOrderMs += Date.now() - tConsume;
       }
       
       logger.debug(
@@ -766,24 +799,32 @@ export class MatchingService {
   async processMarketOrderByDollar(order: DollarMarketOrder): Promise<DollarMatchResult> {
     const t0 = Date.now();
     
-    // 1. Match against the in-memory orderbook (RAM speed - instant)
+    // 1. Match against the in-memory orderbook (Redis — sub-millisecond)
+    //    NOTE: Market status/expiry is already checked by the REST route (orders.ts)
+    //    and by the on-chain worker (pre-flight check). Don't add DB calls here — hot path.
     const result = await this.matchMarketOrderByDollar(order);
-    logger.info(`[⏱️ MATCHING] T+${Date.now()-t0}ms: Redis matching done, ${result.fills.length} fills`);
     
     if (result.fills.length === 0) {
       return { ...result, orderId: 'cancelled' };
     }
     
-    // 2. Get market data ONCE (cached) - needed for on-chain and DB
+    // 2. Get market data ONCE (cached in memory — instant)
     const market = await marketService.getById(order.marketId);
-    logger.info(`[⏱️ MATCHING] T+${Date.now()-t0}ms: Market lookup done`);
     if (!market) {
       logger.error(`Market ${order.marketId} not found for order processing`);
       return { ...result, orderId: 'cancelled' };
     }
     
-    // 3. Create taker order record (minimal DB touch before response)
-    const takerOrder = await orderService.create({
+    // 3. Generate order ID locally — NO DB ROUND-TRIP
+    //    The actual DB INSERT happens asynchronously via write-behind queue
+    const orderId = randomUUID();
+    const filledSize = result.totalContracts;
+    const remainingSize = 0;
+    const orderStatus = result.unfilledDollars > 0.01 ? 'PARTIAL' : 'FILLED';
+    
+    // Enqueue order for batch DB persistence (write-behind)
+    writeBehindService.enqueueOrder({
+      id: orderId,
       clientOrderId: order.clientOrderId || Date.now(),
       marketId: order.marketId,
       userId: order.userId,
@@ -796,29 +837,32 @@ export class MatchingService {
       encodedInstruction: null,
       isMmOrder: false,
       expiresAt: order.expiresAt ? new Date(order.expiresAt) : new Date(Date.now() + 3600000),
-      status: result.unfilledDollars > 0.01 ? 'PARTIAL' : 'FILLED',
-      filledSize: result.totalContracts,
-      leverage: order.leverage,
-      marginAmount: order.marginAmount,
+      status: orderStatus,
+      filledSize: filledSize.toString(),
+      remainingSize: Math.max(0, remainingSize).toString(),
+      leverage: order.leverage ? order.leverage.toString() : '1',
+      marginAmount: order.marginAmount ? order.marginAmount.toString() : null,
     });
-    logger.info(`[⏱️ MATCHING] T+${Date.now()-t0}ms: Order record created`);
     
-    // Update fills with the real taker order ID
+    // Update fills with the pre-generated order ID
     for (const fill of result.fills) {
-      fill.takerOrderId = takerOrder.id;
+      fill.takerOrderId = orderId;
+    }
+    
+    const matchMs = Date.now() - t0;
+    if (matchMs > 10) {
+      logger.info(`[⏱️ MATCHING] ${matchMs}ms: ${result.fills.length} fills, orderId=${orderId.slice(0,8)} (write-behind)`);
     }
     
     // 4. For LEVERAGED orders: Create taker position SYNCHRONOUSLY
-    // This is required because orders.ts needs the position to create the margin account
-    // For regular orders, positions are created in background for speed
+    //    Required because orders.ts needs the position to create the margin account
+    //    For regular orders, positions are created in background for speed
     if (order.leverage && order.leverage > 1) {
       const takerIsBuy = order.side === 'BID';
-      const takerNotional = result.fills.reduce((sum, f) => sum + f.price * f.size, 0);
-      const takerFeeTotal = result.fills.reduce((sum, f) => sum + f.takerFee, 0);
       
       // Aggregate all fills by outcome for taker position
       const outcomeShares = new Map<'YES' | 'NO', number>();
-    for (const fill of result.fills) {
+      for (const fill of result.fills) {
         const current = outcomeShares.get(fill.outcome) || 0;
         outcomeShares.set(fill.outcome, current + fill.size);
       }
@@ -838,28 +882,27 @@ export class MatchingService {
           takerIsBuy
         );
       }
-      
-      logger.info(`[⏱️ MATCHING] T+${Date.now()-t0}ms: Leveraged position created synchronously`);
     }
     
-    // 5. EXECUTE ON-CHAIN IMMEDIATELY (fire-and-forget)
-    // For leveraged orders: executeFillsOnChain → executeLeveragedMatch handles collateral + execution
-    // For regular orders: executeFillsOnChain → executeMatch does direct on-chain settlement
-    logger.info(`[⏱️ MATCHING] T+${Date.now()-t0}ms: Firing off on-chain + background DB (async)`);
+    // 5. EXECUTE ON-CHAIN (async with error tracking)
+    // If on-chain execution fails, trades are marked with FAILED tx status for reconciliation
     this.executeFillsOnChain(result.fills, order.marketId)
-      .catch(err => logger.error(`Background on-chain execution failed: ${err.message}`));
+      .catch(err => {
+        logger.error(`[CRITICAL] On-chain execution failed for ${result.fills.length} fills: ${err.message}`);
+        // Mark affected trades as FAILED so reconciliation job can detect phantom positions
+        this.markFillsAsFailed(result.fills).catch(e => logger.error(`Failed to mark fills as failed: ${e.message}`));
+      });
     
-    // 6. PROCESS DB UPDATES IN BACKGROUND (batched for efficiency)
-    // This runs async - user doesn't wait for these ~10 queries
-    // Note: For leveraged orders, taker position was already created above, so skip it in background
+    // 6. PROCESS DB UPDATES IN BACKGROUND (trades, positions, stats — batched)
+    //    Trades are also enqueued to write-behind for batch insert
     this.processFillsInBackground(result.fills, order, {
       id: market.id,
       pubkey: market.pubkey,
       asset: market.asset,
       timeframe: market.timeframe,
-    }, order.leverage && order.leverage > 1).catch(err => logger.error(`Background DB processing failed: ${err.message}`));
+    }, !!(order.leverage && order.leverage > 1)).catch(err => logger.error(`Background DB processing failed: ${err.message}`));
     
-    return { ...result, orderId: takerOrder.id };
+    return { ...result, orderId };
   }
 
   /**
@@ -887,9 +930,10 @@ export class MatchingService {
     };
 
     // CONTINUOUS MATCHING CONFIG (same as buy orders for consistency)
-    const MAX_RETRIES = 20;           // Max times to retry when orderbook is empty
-    const RETRY_DELAY_MS = 100;       // Wait 100ms between retries for MM to replenish
-    const MAX_MATCHING_TIME_MS = 5000; // Max 5 seconds total matching time
+    const isPerfMode = config.perfTestMode;
+    const MAX_RETRIES = isPerfMode ? 3 : 10;
+    const RETRY_DELAY_MS = isPerfMode ? 10 : 20;
+    const MAX_MATCHING_TIME_MS = isPerfMode ? 200 : 3000;
     const startTime = Date.now();
     let emptyBookRetries = 0;
     
@@ -1093,16 +1137,14 @@ export class MatchingService {
       totalProceeds += fillProceeds;
       remainingSize -= fillSize;
       
-      // Update maker order in orderbook
+      // Update maker order in orderbook (atomic: 1 Redis round-trip via Lua)
       const newMakerRemaining = bestOrder.remainingSize - fillSize;
+      const tConsume = Date.now();
+      await orderbookService.consumeOrder(bestOrder, Math.max(0, newMakerRemaining));
       if (newMakerRemaining > 0) {
-        const tUpd = Date.now();
-        await orderbookService.updateOrderSize(bestOrder, newMakerRemaining);
-        perf.updateOrderMs += Date.now() - tUpd;
+        perf.updateOrderMs += Date.now() - tConsume;
       } else {
-        const tRem = Date.now();
-        await orderbookService.removeOrder(bestOrder);
-        perf.removeOrderMs += Date.now() - tRem;
+        perf.removeOrderMs += Date.now() - tConsume;
       }
       
       logger.debug(
@@ -1192,10 +1234,13 @@ export class MatchingService {
       fill.takerOrderId = takerOrder.id;
     }
     
-    // 4. EXECUTE ON-CHAIN IMMEDIATELY (fire-and-forget)
+    // 4. EXECUTE ON-CHAIN (async with error tracking)
     // IMPORTANT: Pass isClosingTrade=true because sell orders are ALWAYS closing trades
     this.executeFillsOnChain(result.fills, order.marketId, true)
-      .catch(err => logger.error(`Background on-chain close failed: ${err.message}`));
+      .catch(err => {
+        logger.error(`[CRITICAL] On-chain close execution failed for ${result.fills.length} fills: ${err.message}`);
+        this.markFillsAsFailed(result.fills).catch(e => logger.error(`Failed to mark fills as failed: ${e.message}`));
+      });
     
     // 5. PROCESS DB UPDATES IN BACKGROUND (batched for efficiency)
     const asMarketOrder: DollarMarketOrder = {
@@ -1306,6 +1351,26 @@ export class MatchingService {
    * 
    * @param isClosingTrade - If true, force use of execute_close instruction (user selling existing holdings)
    */
+  /**
+   * Mark fills as FAILED in the database when on-chain execution fails.
+   * This enables reconciliation jobs to detect and clean up phantom positions.
+   */
+  private async markFillsAsFailed(fills: Fill[]): Promise<void> {
+    for (const fill of fills) {
+      try {
+        await db
+          .update(trades)
+          .set({
+            txStatus: 'FAILED' as any,
+            txSignature: `failed_${Date.now()}`,
+          })
+          .where(eq(trades.takerOrderId, fill.takerOrderId));
+      } catch (e: any) {
+        logger.error(`Failed to mark trade ${fill.takerOrderId} as FAILED: ${e.message}`);
+      }
+    }
+  }
+
   private async executeFillsOnChain(fills: Fill[], marketId: string, isClosingTrade: boolean = false): Promise<void> {
     const market = await marketService.getById(marketId);
     if (!market) return;
@@ -1381,14 +1446,13 @@ export class MatchingService {
         takerOrderId: fill.takerOrderId,  // For updating trade with tx signature
       };
       
-      transactionService.executeClose(closeParams).then(result => {
-        if (!result.success) {
-          logger.warn(`On-chain close failed: ${result.error}`);
-        } else {
-          logger.info(`On-chain close success: ${result.signature}${fill.isLeveragedClose ? ' [LEVERAGED]' : ''}`);
-        }
-      }).catch(err => {
-        logger.error(`Failed to execute on-chain close: ${err.message}`);
+      const idempotencyKey = `close-${fill.makerOrderId}-${fill.takerOrderId}`;
+      onchainSubmitQueue.add('close', {
+        type: 'close' as const,
+        idempotencyKey,
+        payload: closeParams,
+      }, { jobId: idempotencyKey }).catch((err: any) => {
+        logger.error(`Failed to enqueue close job: ${err.message}`);
       });
       return;
     }
@@ -1414,12 +1478,13 @@ export class MatchingService {
           takerOrderId: fill.takerOrderId,  // For updating trade with tx signature
         };
         
-        transactionService.executeClose(closeParams).then(result => {
-          if (!result.success) {
-            logger.warn(`On-chain close failed: ${result.error}`);
-          }
-        }).catch(err => {
-          logger.error(`Failed to execute on-chain close: ${err.message}`);
+        const idempotencyKey2 = `close-${fill.makerOrderId}-${fill.takerOrderId}`;
+        onchainSubmitQueue.add('close', {
+          type: 'close' as const,
+          idempotencyKey: idempotencyKey2,
+          payload: closeParams,
+        }, { jobId: idempotencyKey2 }).catch((err: any) => {
+          logger.error(`Failed to enqueue close job: ${err.message}`);
         });
         return;
       }
@@ -1470,15 +1535,25 @@ export class MatchingService {
     }
     
     // Regular opening trade (or fallback) - use execute_match instruction
-    this.executeMatchOnChain(fill, marketPubkey, makerWallet, takerWallet, 'aggregated');
+    // Use a unique tradeId per fill to avoid BullMQ jobId collisions
+    const tradeId = fill.takerOrderId + '-' + Date.now();
+    this.executeMatchOnChain(fill, marketPubkey, makerWallet, takerWallet, tradeId);
   }
 
   /**
-   * Helper to get wallet address for a user
+   * Helper to get wallet address for a user (cached to avoid DB lookups in hot path)
    */
+  private walletCache = new Map<string, { wallet: string; expiresAt: number }>();
   private async getWalletForUser(userId: string): Promise<string> {
+    const cached = this.walletCache.get(userId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.wallet;
+    }
     const user = await userService.findById(userId);
-    return user?.walletAddress || '';
+    const wallet = user?.walletAddress || '';
+    // Cache for 5 minutes (wallet addresses don't change)
+    this.walletCache.set(userId, { wallet, expiresAt: Date.now() + 300_000 });
+    return wallet;
   }
 
   /**
@@ -1553,19 +1628,13 @@ export class MatchingService {
       takerMessage: fill.takerMessage,
     };
 
-    transactionService.executeMatch(matchParams).then(result => {
-      if (!result.success) {
-        const errorMsg = result.error || '';
-        if (errorMsg.includes('AccountNotInitialized') || errorMsg.includes('0xbc4')) {
-          logger.warn(`Market ${marketPubkey} does not exist on-chain. Marking as archived in DB.`);
-          marketService.markArchivedByPubkey(marketPubkey);
-        }
-        logger.warn(`On-chain match failed for trade ${tradeId}: ${errorMsg}`);
-      } else {
-        logger.debug(`On-chain match executed: ${result.signature}`);
-      }
-    }).catch(err => {
-      logger.error(`Failed to execute on-chain match: ${err.message}`);
+    const matchIdempotencyKey = `match-${tradeId}`;
+    onchainSubmitQueue.add('match', {
+      type: 'match' as const,
+      idempotencyKey: matchIdempotencyKey,
+      payload: matchParams,
+    }, { jobId: matchIdempotencyKey }).catch((err: any) => {
+      logger.error(`Failed to enqueue match job: ${err.message}`);
     });
   }
 
@@ -1806,14 +1875,13 @@ export class MatchingService {
               tradeId: trade.id,  // Pass trade ID to update with tx signature
             };
             
-            transactionService.executeClose(closeParams).then(result => {
-              if (!result.success) {
-                logger.warn(`On-chain close failed for trade ${trade.id}: ${result.error}`);
-              } else {
-                logger.debug(`On-chain close executed: ${result.signature}`);
-              }
-            }).catch(err => {
-              logger.error(`Failed to execute on-chain close: ${err.message}`);
+            const closeIdempotencyKey = `close-${trade.id}`;
+            onchainSubmitQueue.add('close', {
+              type: 'close' as const,
+              idempotencyKey: closeIdempotencyKey,
+              payload: closeParams,
+            }, { jobId: closeIdempotencyKey }).catch((err: any) => {
+              logger.error(`Failed to enqueue close job: ${err.message}`);
             });
           } else {
             // Seller doesn't have enough shares - use opening trade
@@ -1912,14 +1980,25 @@ export class MatchingService {
     market: { id: string; pubkey: string; asset?: string; timeframe?: string },
     skipTakerPosition: boolean = false,
   ): Promise<void> {
+    logger.info(`[DEBUG] processFillsInBackground: fills=${fills.length}, market=${order.marketId.slice(0,8)}, perfTestMode=${config.perfTestMode}`);
     if (fills.length === 0) return;
     
+    // Throttle concurrent background DB work to avoid pool exhaustion
+    await this.acquireBgDbSlot();
     const startTime = Date.now();
     
     try {
       // 1. BATCH INSERT ALL TRADES (1 query instead of N)
+      const takerIsBuying = order.side === 'BID';
       const tradeRecords = fills.map(fill => {
-        const notional = fill.price * fill.size;
+        const takerPrice = fill.price;
+        const takerNotional = takerPrice * fill.size;
+        // Maker gets opposite outcome when taker is buying, same when selling
+        const makerOutcome = takerIsBuying
+          ? (fill.outcome === 'YES' ? 'NO' : 'YES')
+          : fill.outcome;
+        const makerPrice = takerIsBuying ? (1 - takerPrice) : takerPrice;
+        const makerNotional = makerPrice * fill.size;
         return {
           marketId: order.marketId,
           makerOrderId: this.tradeOrderIdForDb(fill.makerUserId, fill.makerOrderId),
@@ -1928,64 +2007,131 @@ export class MatchingService {
           takerUserId: fill.takerUserId,
           takerSide: order.side,
           takerOutcome: fill.outcome,
-          takerPrice: fill.price.toString(),
-          takerNotional: notional.toString(),
+          takerPrice: takerPrice.toString(),
+          takerNotional: takerNotional.toString(),
           takerFee: fill.takerFee.toString(),
-          makerOutcome: fill.outcome,
-          makerPrice: fill.price.toString(),
-          makerNotional: notional.toString(),
+          makerOutcome,
+          makerPrice: makerPrice.toString(),
+          makerNotional: makerNotional.toString(),
           makerFee: fill.makerFee.toString(),
           size: fill.size.toString(),
           txStatus: 'PENDING' as const,
           outcome: fill.outcome,
           price: fill.price.toString(),
-          notional: notional.toString(),
+          notional: takerNotional.toString(),
         };
       });
       
-      const insertedTrades = await db.insert(trades).values(tradeRecords).returning();
-      
-      // 2. AGGREGATE POSITION UPDATES (2-4 queries instead of 2N)
-      // Group fills by user+market to minimize position updates
-      const positionUpdates = this.aggregateFillsForPositions(fills, order);
-      
-      for (const update of positionUpdates) {
-        // Skip taker position if already created synchronously (leveraged orders)
-        if (skipTakerPosition && update.userId === order.userId) {
-          continue;
-        }
+      // ── PERF MODE: Use write-behind for trades instead of direct DB insert ──
+      // Direct DB insert competes for pool connections and takes 600-1400ms.
+      // Write-behind batches them efficiently (1 query per batch, not per trade).
+      if (config.perfTestMode) {
+        // Enqueue trades to write-behind (instant — no DB round trip)
+        writeBehindService.enqueueTrades(tradeRecords as any);
         
-        await positionService.updateAfterTrade(
-          update.userId,
-          order.marketId,
-          update.outcome,
-          update.totalShares,
-          update.totalCost,
-          update.isBuy
-        );
+        // Broadcast trades via WebSocket (no DB)
+        const tradeTimestamp = Date.now();
+        for (const fill of fills) {
+          const tradeSide = fill.takerSide === 'BID' ? 'buy' : 'sell';
+          const tradeOutcome = String(fill.outcome).toLowerCase() as 'yes' | 'no';
+          broadcastTrade(market.pubkey, {
+            price: fill.price,
+            size: fill.size,
+            side: tradeSide,
+            outcome: tradeOutcome,
+            timestamp: tradeTimestamp,
+            takerWallet: '',
+          });
+        }
+
+        // CRITICAL: Update market volume stats — required for merkle settlement to work
+        // (Without this, total_volume stays 0 and merkle settler skips the market)
+        const totalVolume = fills.reduce((sum, f) => sum + 2 * f.price * f.size, 0);
+        const lastFill = fills[fills.length - 1];
+        logger.info(`[PERF] Volume update: market=${order.marketId.slice(0,8)}, fills=${fills.length}, volume=${totalVolume.toFixed(2)}`);
+        marketService.incrementStats(order.marketId, totalVolume)
+          .then(() => logger.info(`[PERF] Volume incremented for ${order.marketId.slice(0,8)}: +${totalVolume.toFixed(2)}`))
+          .catch(err => logger.error(`Market stats update failed: ${err.message}`));
+        marketService.updatePrices(order.marketId, lastFill.price, 1 - lastFill.price)
+          .catch(err => logger.error(`Market price update failed: ${err.message}`));
+
+        // ALSO create positions in perf mode (required for settlement testing)
+        const positionUpdates = this.aggregateFillsForPositions(fills, order);
+        for (const update of positionUpdates) {
+          positionService.updateAfterTrade(
+            update.userId,
+            order.marketId,
+            update.outcome,
+            update.totalShares,
+            update.totalCost,
+            update.isBuy
+          ).catch(err => logger.error(`[PERF] Position update failed: ${err.message}`));
+        }
+        logger.info(`[PERF] Created ${positionUpdates.length} position updates for settlement testing`);
+
+        return; // Skip user stats — handled separately for perf mode
       }
       
-      // 3. AGGREGATE USER STATS (2 queries: taker + unique makers)
-      const takerNotional = fills.reduce((sum, f) => sum + f.price * f.size, 0);
-      await userService.updateTradeStats(order.userId, takerNotional);
+      // Ensure the taker order is persisted before inserting trades.
+      // The order was enqueued to write-behind (async) and may not be flushed yet,
+      // which would violate the trades.taker_order_id FK constraint.
+      const takerOrderId = fills[0]?.takerOrderId;
+      if (takerOrderId) {
+        await writeBehindService.flushOrderById(takerOrderId);
+      }
+
+      // Normal mode: Direct DB insert with returning() for trade IDs
+      const insertedTrades = await db.insert(trades).values(tradeRecords).returning();
       
-      // Update maker stats - aggregate by unique maker
+      // 2. AGGREGATE POSITION UPDATES (parallel — not sequential)
+      const positionUpdates = this.aggregateFillsForPositions(fills, order);
+      
+      const positionPromises = positionUpdates
+        .filter(update => !(skipTakerPosition && update.userId === order.userId))
+        .map(update =>
+          positionService.updateAfterTrade(
+            update.userId,
+            order.marketId,
+            update.outcome,
+            update.totalShares,
+            update.totalCost,
+            update.isBuy
+          ).catch(err => logger.error(`Position update failed for ${update.userId}: ${err.message}`))
+        );
+      
+      // 3. AGGREGATE USER STATS (parallel with positions)
+      const takerNotional = fills.reduce((sum, f) => sum + f.price * f.size, 0);
+      const statsPromises: Promise<any>[] = [
+        userService.updateTradeStats(order.userId, takerNotional)
+          .catch(err => logger.error(`Taker stats update failed: ${err.message}`)),
+      ];
+      
       const makerVolumes = new Map<string, number>();
       for (const fill of fills) {
         const current = makerVolumes.get(fill.makerUserId) || 0;
         makerVolumes.set(fill.makerUserId, current + fill.price * fill.size);
       }
       for (const [makerId, volume] of makerVolumes) {
-        if (makerId !== order.userId) { // Don't double-count if self-trade somehow
-          await userService.updateTradeStats(makerId, volume);
+        if (makerId !== order.userId) {
+          statsPromises.push(
+            userService.updateTradeStats(makerId, volume)
+              .catch(err => logger.error(`Maker stats update failed: ${err.message}`))
+          );
         }
       }
       
-      // 4. UPDATE MARKET STATS ONCE (1 query instead of N)
-      const totalVolume = fills.reduce((sum, f) => sum + 2 * f.price * f.size, 0); // Both sides
+      // 4. UPDATE MARKET STATS (parallel with positions + user stats)
+      const totalVolume = fills.reduce((sum, f) => sum + 2 * f.price * f.size, 0);
       const lastFill = fills[fills.length - 1];
-      await marketService.incrementStats(order.marketId, totalVolume);
-      await marketService.updatePrices(order.marketId, lastFill.price, 1 - lastFill.price);
+      const marketPromises = [
+        marketService.incrementStats(order.marketId, totalVolume)
+          .catch(err => logger.error(`Market stats update failed: ${err.message}`)),
+        marketService.updatePrices(order.marketId, lastFill.price, 1 - lastFill.price)
+          .catch(err => logger.error(`Market price update failed: ${err.message}`)),
+      ];
+      
+      // Run ALL background DB work in parallel
+      await Promise.allSettled([...positionPromises, ...statsPromises, ...marketPromises]);
       
       // 5. BROADCAST TRADES (WebSocket - no DB queries)
       const takerWallet = await this.getWalletForUser(order.userId).catch(() => '');
@@ -2049,12 +2195,18 @@ export class MatchingService {
         });
       }
       
-      // 6. UPDATE MAKER ORDERS (only for non-MM synthetic orders)
-      for (const fill of fills) {
-        const makerOrderIsSynthetic = String(fill.makerOrderId || '').startsWith('mm_synth_');
-        if (!makerOrderIsSynthetic && !(config.disableMmOrderPersistence && this.isMarketMaker(fill.makerUserId))) {
-          await orderService.updateAfterFill(fill.makerOrderId, fill.size);
-        }
+      // 6. UPDATE MAKER ORDERS (parallel — only for non-MM synthetic orders)
+      const makerUpdatePromises = fills
+        .filter(fill => {
+          const makerOrderIsSynthetic = String(fill.makerOrderId || '').startsWith('mm_synth_');
+          return !makerOrderIsSynthetic && !(config.disableMmOrderPersistence && this.isMarketMaker(fill.makerUserId));
+        })
+        .map(fill =>
+          orderService.updateAfterFill(fill.makerOrderId, fill.size)
+            .catch(err => logger.error(`Maker order update failed: ${err.message}`))
+        );
+      if (makerUpdatePromises.length > 0) {
+        await Promise.allSettled(makerUpdatePromises);
       }
       
       const elapsed = Date.now() - startTime;
@@ -2063,6 +2215,8 @@ export class MatchingService {
     } catch (err: any) {
       logger.error(`Background fill processing failed: ${err.message}`);
       // Non-fatal: on-chain execution already happened, user has their position
+    } finally {
+      this.releaseBgDbSlot();
     }
   }
 
@@ -2111,15 +2265,30 @@ export class MatchingService {
     }
     
     // Maker position updates (group by maker+outcome)
+    // When taker BIDs (buys), maker ACQUIRES the opposite outcome (e.g., taker buys YES → maker gets NO)
+    // When taker ASKs (sells), maker ACQUIRES the same outcome (e.g., taker sells YES → maker buys YES)
+    // In both cases the maker is always buying (isBuy=true), matching processFill behavior.
     const makerUpdates = new Map<string, { shares: number; cost: number }>();
     
     for (const fill of fills) {
-      const key = `${fill.makerUserId}:${fill.outcome}`;
+      // Maker's outcome depends on taker direction:
+      // BID: maker gets opposite (taker buys YES → maker buys NO)
+      // ASK: maker gets same (taker sells YES → maker buys YES)
+      const makerOutcome: 'YES' | 'NO' = takerIsBuy
+        ? (fill.outcome === 'YES' ? 'NO' : 'YES')
+        : fill.outcome;
+      const key = `${fill.makerUserId}:${makerOutcome}`;
       const current = makerUpdates.get(key) || { shares: 0, cost: 0 };
-      const notional = fill.price * fill.size;
+      if (takerIsBuy) {
+        // Maker pays complement price: (1 - fill.price) * size - makerFee
+        const complementNotional = (1 - fill.price) * fill.size;
+        current.cost += complementNotional - fill.makerFee;
+      } else {
+        // Maker pays fill price: fill.price * size + makerFee
+        const notional = fill.price * fill.size;
+        current.cost += notional + fill.makerFee;
+      }
       current.shares += fill.size;
-      // Maker is opposite side of taker
-      current.cost += takerIsBuy ? notional - fill.makerFee : notional + fill.makerFee;
       makerUpdates.set(key, current);
     }
     
@@ -2130,7 +2299,7 @@ export class MatchingService {
         outcome: outcome as 'YES' | 'NO',
         totalShares: data.shares,
         totalCost: data.cost,
-        isBuy: !takerIsBuy, // Opposite of taker
+        isBuy: true, // Maker always acquires shares (buying)
       });
     }
     
@@ -2192,4 +2361,5 @@ export class MatchingService {
 }
 
 export const matchingService = new MatchingService();
+
 

@@ -3,6 +3,7 @@ import { priceFeedService } from '../services/price-feed.service.js';
 import { anchorClient } from '../lib/anchor-client.js';
 import { logger, logEvents } from '../lib/logger.js';
 import { broadcastMarketActivated } from '../lib/broadcasts.js';
+import { config } from '../config.js';
 
 /**
  * Market Activator Job
@@ -64,11 +65,21 @@ async function activateMarketEntry(market: Awaited<ReturnType<typeof marketServi
   // 2. Activate on-chain (set strike price and change status to OPEN)
   if (anchorClient.isReady()) {
     try {
-      await anchorClient.activateMarket({
-        marketPubkey: pubkey,
-        strikePrice: currentPrice,
-      });
-      logger.info(`✅ Activated on-chain market ${asset}-${timeframe} with strike $${currentPrice.toLocaleString()}`);
+      if (config.useV2) {
+        // V2: Tokenized shares market
+        await anchorClient.activateMarketV2({
+          marketPubkey: pubkey,
+          strikePrice: currentPrice,
+        });
+        logger.info(`✅ Activated on-chain MarketV2 ${asset}-${timeframe} with strike $${currentPrice.toLocaleString()}`);
+      } else {
+        // V1: Position PDAs market
+        await anchorClient.activateMarket({
+          marketPubkey: pubkey,
+          strikePrice: currentPrice,
+        });
+        logger.info(`✅ Activated on-chain market ${asset}-${timeframe} with strike $${currentPrice.toLocaleString()}`);
+      }
     } catch (err: any) {
       const errorMsg = String(err.message || err);
       const errorLogs = err.logs ? err.logs.join(' ') : '';
@@ -150,10 +161,10 @@ async function getCurrentPrice(asset: string): Promise<number | null> {
       }
     }
 
-    // Last resort: placeholder (only for testing, should not happen in production)
-    const fallbackPrices: Record<string, number> = { BTC: 95000, ETH: 3300, SOL: 145 };
-    logger.warn(`Using LAST-RESORT placeholder price for ${asset}`);
-    return fallbackPrices[asset] || null;
+    // No reliable price available — do NOT use hardcoded placeholders
+    // Market activation will be retried on the next activator run
+    logger.error(`No reliable price available for ${asset} — cannot activate market. Will retry.`);
+    return null;
   } catch (err) {
     logger.error(`Failed to get price for ${asset}:`, err);
     return null;

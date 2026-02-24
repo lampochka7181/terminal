@@ -1,7 +1,8 @@
 import { PublicKey } from '@solana/web3.js';
 import { marketService } from '../services/market.service.js';
-import { anchorClient, PROGRAM_ID } from '../lib/anchor-client.js';
+import { anchorClient, PROGRAM_ID, getMarketV2Pda, getNoMintPda } from '../lib/anchor-client.js';
 import { logger, logEvents } from '../lib/logger.js';
+import { config } from '../config.js';
 
 /**
  * Market Creator Job
@@ -90,20 +91,32 @@ async function createPendingMarkets(
     marketExpiry: number;
     expiryTs: number;
     marketPubkey: string;
+    yesMint?: string;  // V2 only
+    noMint?: string;   // V2 only
   }> = [];
-  
+
+  // Use V2 PDA derivation if V2 flag is enabled
+  const useV2 = config.useV2;
+  if (useV2) {
+    logger.info(`[MarketCreator] V2 mode enabled - using tokenized shares model`);
+  }
+
   for (let i = 0; i < MARKETS_LOOK_AHEAD; i++) {
     const marketExpiry = currentIntervalStart + (i * intervalMs) + durationMs;
     const expiryMinute = Math.floor(marketExpiry / 60000);
-    
-    // Skip if market already expired or already exists
-    if (marketExpiry <= now || existingExpiries.has(expiryMinute)) {
+
+    // Skip if market already expired, expires too soon, or already exists.
+    // On-chain program requires expiry_ts > clock.unix_timestamp + 60s,
+    // so add 90s buffer (60s on-chain + 30s for TX propagation/confirmation).
+    if (marketExpiry <= now + 90_000 || existingExpiries.has(expiryMinute)) {
       continue;
     }
-    
+
     const expiryTs = Math.floor(marketExpiry / 1000);
-    const marketPubkey = deriveMarketPda(asset, timeframe, expiryTs);
-    
+    const marketPubkey = useV2
+      ? getMarketV2Pda(asset, timeframe, expiryTs).toBase58()
+      : deriveMarketPda(asset, timeframe, expiryTs);
+
     potentialMarkets.push({ marketExpiry, expiryTs, marketPubkey });
   }
   
@@ -124,30 +137,87 @@ async function createPendingMarkets(
     }
     
     // 1. Create on-chain with strike_price = 0 (PENDING status)
+    let yesMint: string | undefined;
+    let noMint: string | undefined;
+
     if (anchorClient.isReady()) {
       try {
-        await anchorClient.initializeMarket({
-          asset,
-          timeframe,
-          strikePrice: 0, // PENDING - strike price will be set at activation
-          expiryTs,
-        });
-        logger.info(`✅ Created PENDING market on-chain: ${marketPubkey.slice(0, 8)}`);
+        if (useV2) {
+          // V2: Create market with YES/NO token mints
+          const result = await anchorClient.initializeMarketV2({
+            asset,
+            timeframe,
+            strikePrice: 0, // PENDING - strike price will be set at activation
+            expiryTs,
+          });
+          yesMint = result.yesMint;
+          noMint = result.noMint;
+          logger.info(`✅ Created PENDING MarketV2 on-chain: ${marketPubkey.slice(0, 8)}`);
+          logger.info(`   YES mint: ${yesMint}`);
+          logger.info(`   NO mint: ${noMint}`);
+        } else {
+          // V1: Create market with Position PDAs
+          await anchorClient.initializeMarket({
+            asset,
+            timeframe,
+            strikePrice: 0, // PENDING - strike price will be set at activation
+            expiryTs,
+          });
+          logger.info(`✅ Created PENDING market on-chain: ${marketPubkey.slice(0, 8)}`);
+        }
       } catch (err: any) {
         const errorMsg = err.message || '';
         if (errorMsg.includes('already in use') || errorMsg.includes('0x0')) {
           logger.debug(`Market ${marketPubkey.slice(0, 8)} already exists on-chain`);
+        } else if (errorMsg.includes('IllegalOwner') || errorMsg.includes('owner is not allowed')) {
+          // Orphaned market: Phase 1 exists on-chain from a previous session but Phase 2
+          // (vault creation) fails non-recoverably. Save a DB entry so we don't retry every cycle.
+          logger.warn(`⚠️ Orphaned market ${marketPubkey.slice(0, 8)} (Phase 2 non-recoverable) — saving to DB to prevent retries`);
+          try {
+            await marketService.create({
+              pubkey: marketPubkey,
+              asset: asset as any,
+              timeframe: timeframe as any,
+              strikePrice: '0',
+              expiryAt: new Date(marketExpiry),
+              status: 'EXPIRED',
+            });
+          } catch { /* ignore if already exists */ }
+          continue;
         } else {
-          logger.error(`❌ Failed to create market on-chain: ${errorMsg}`);
+          // Log a concise single-line error (detailed simulation logs already logged by submitTransaction)
+          const shortMsg = errorMsg.split('\n')[0].slice(0, 200);
+          logger.error(`❌ Failed to create market on-chain: ${shortMsg}`);
           continue; // Don't create in DB if on-chain failed
         }
       }
-      
+
       // Verify on-chain account exists
       const verified = await verifyOnChainMarket(marketPubkey);
       if (!verified) {
         logger.error(`❌ On-chain market missing after creation: ${marketPubkey}`);
         continue;
+      }
+
+      // V2: Verify NO mint exists (Phase 2 health check)
+      if (useV2) {
+        const noMintOk = await verifyNoMintExists(marketPubkey);
+        if (!noMintOk) {
+          logger.warn(`⚠️ NO mint missing for ${marketPubkey.slice(0, 8)} — attempting Phase 2 recovery...`);
+          try {
+            await anchorClient.completeMarketV2Phase2(new PublicKey(marketPubkey), 0);
+            // Re-verify
+            const recovered = await verifyNoMintExists(marketPubkey);
+            if (!recovered) {
+              logger.error(`❌ Phase 2 recovery failed for ${marketPubkey.slice(0, 8)} — skipping market`);
+              continue;
+            }
+            logger.info(`✅ Phase 2 recovery successful for ${marketPubkey.slice(0, 8)}`);
+          } catch (recoveryErr: any) {
+            logger.error(`❌ Phase 2 recovery threw for ${marketPubkey.slice(0, 8)}: ${recoveryErr.message}`);
+            continue;
+          }
+        }
       }
     } else {
       logger.warn(`Anchor client not ready, creating market ${marketPubkey.slice(0, 8)} in DB only`);
@@ -175,6 +245,24 @@ async function createPendingMarkets(
       strikePrice: 0,
       expiryAt: new Date(marketExpiry),
     });
+  }
+}
+
+/**
+ * Verify the NO mint PDA exists on-chain (i.e., Phase 2 completed)
+ */
+async function verifyNoMintExists(marketPubkey: string): Promise<boolean> {
+  const conn = anchorClient.getConnection();
+  const noMint = getNoMintPda(new PublicKey(marketPubkey));
+  try {
+    const info = await conn.getAccountInfo(noMint, 'confirmed');
+    if (info && info.data.length > 0) {
+      return true;
+    }
+    return false;
+  } catch (e: any) {
+    logger.warn(`Failed to check NO mint for ${marketPubkey.slice(0, 8)}: ${e.message}`);
+    return false;
   }
 }
 

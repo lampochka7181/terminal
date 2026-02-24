@@ -16,14 +16,22 @@ import { redis, checkRedisHealth, connectRedis, closeRedisConnection } from './d
 import { authRoutes } from './routes/auth.js';
 import { marketRoutes } from './routes/markets.js';
 import { orderRoutes } from './routes/orders.js';
+import { perfRoutes } from './routes/perf.js';
 import { userRoutes } from './routes/user.js';
 import { tradesRoutes } from './routes/trades.js';
 import { marginRoutes } from './routes/margin.js';
 import { wsHandler } from './routes/websocket.js';
+import { metricsRoutes } from './routes/metrics.js';
 import { apiLogger } from './lib/logger.js';
 
 // Keeper Jobs
 import { startKeeperJobs, stopKeeperJobs } from './jobs/index.js';
+
+// BullMQ Queue Workers
+import { startQueueWorkers, stopQueueWorkers } from './queue/index.js';
+
+// Write-Behind Batch Queue (decouples DB writes from matching hot path)
+import { writeBehindService } from './services/write-behind.service.js';
 
 // Price Feed
 import { priceFeedService } from './services/price-feed.service.js';
@@ -131,15 +139,22 @@ async function main() {
   });
 
   // Rate Limiting
-  // 300/minute is generous for development (React StrictMode + multiple components)
-  // In production, consider lowering to 100-150/minute
+  // 300/minute for regular users, 600/minute for agents (configurable)
   await app.register(rateLimit, {
     global: true,
-    max: 300,
+    max: (request, key) => {
+      if (config.perfTestMode) return 10000;
+      // Agents get higher rate limits
+      const user = request.user as { sub?: string; isAgent?: boolean } | undefined;
+      if (user?.isAgent) return config.agent.rateLimitPerMinute;
+      return 300;
+    },
     timeWindow: '1 minute',
     keyGenerator: (request) => {
       // Use user ID for authenticated requests, IP for anonymous
-      const user = request.user as { sub?: string } | undefined;
+      // Agents get their own bucket prefix for separate tracking
+      const user = request.user as { sub?: string; isAgent?: boolean } | undefined;
+      if (user?.isAgent) return `agent:${user.sub}`;
       return user?.sub || request.ip;
     },
     errorResponseBuilder: (request, context) => ({
@@ -230,6 +245,11 @@ async function main() {
         { minVolume: 100000, makerDiscount: 0, takerDiscount: 0.10 },
         { minVolume: 1000000, makerDiscount: 0, takerDiscount: 0.25 },
       ],
+    },
+    agent: {
+      enabled: config.agent.enabled,
+      defaultFeeDiscountPct: config.agent.defaultFeeDiscountPct,
+      description: 'AI agents get reduced trading fees. Authenticate via POST /auth/agent.',
     },
   }));
 
@@ -373,9 +393,11 @@ async function main() {
   await app.register(authRoutes, { prefix: '/auth' });
   await app.register(marketRoutes, { prefix: '/markets' });
   await app.register(orderRoutes, { prefix: '/orders' });
+  await app.register(perfRoutes, { prefix: '/perf' });
   await app.register(userRoutes, { prefix: '/user' });
   await app.register(tradesRoutes, { prefix: '/trades' });
   await app.register(marginRoutes, { prefix: '/margin' });
+  await app.register(metricsRoutes);  // Metrics at /metrics
 
   // Public config endpoint (relayer address for delegation)
   app.get('/config', async () => {
@@ -494,6 +516,7 @@ async function main() {
       await mmBotV2.stop();
       priceFeedService.stop();
       stopKeeperJobs();
+      await stopQueueWorkers();
       await app.close();
       await closeRedisConnection();
       await closeDatabaseConnection();
@@ -507,6 +530,15 @@ async function main() {
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+
+  // Prevent crashes from unhandled promise rejections (e.g., network timeouts)
+  process.on('unhandledRejection', (reason, promise) => {
+    logger.error(`Unhandled promise rejection: ${reason}`);
+  });
+  process.on('uncaughtException', (err) => {
+    logger.error(`Uncaught exception (non-fatal): ${err.message}`);
+    // Don't exit — keep the server running
+  });
 
   // ========================
   // Start Server
@@ -533,6 +565,14 @@ async function main() {
     // Start keeper jobs (market creator, resolver, settler, etc.)
     startKeeperJobs();
     logger.info('⚙️  Keeper jobs started');
+
+    // Start write-behind batch queue (decouples DB writes from matching)
+    writeBehindService.start();
+    logger.info('✍️  Write-behind queue started (50ms flush interval)');
+
+    // Start BullMQ queue workers (on-chain submit, db-sync, ws-events)
+    await startQueueWorkers();
+    logger.info('📦 BullMQ queue workers started');
     
     // Start Market Maker Bot (if enabled)
     if (config.mmEnabled) {

@@ -33,9 +33,12 @@ pub struct SettlePositions<'info> {
     )]
     pub user_usdc: Account<'info, TokenAccount>,
     
-    /// Authority (keeper) that triggers settlement
+    /// Authority (keeper) that triggers settlement - must be market authority
+    #[account(
+        constraint = market.authority == authority.key() @ DegenError::Unauthorized
+    )]
     pub authority: Signer<'info>,
-    
+
     pub token_program: Program<'info, Token>,
 }
 

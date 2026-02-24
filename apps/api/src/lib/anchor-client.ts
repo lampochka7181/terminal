@@ -7,12 +7,15 @@ import {
   ComputeBudgetProgram,
   SystemProgram,
   SYSVAR_INSTRUCTIONS_PUBKEY,
+  LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 import {
   getAssociatedTokenAddress,
   getAccount,
   createAssociatedTokenAccountInstruction,
+  createAssociatedTokenAccountIdempotentInstruction,
   TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import { BN } from '@coral-xyz/anchor';
@@ -215,21 +218,128 @@ export function getOrderPda(marketPubkey: PublicKey, owner: PublicKey, clientOrd
   return pda;
 }
 
+// ============================================================================
+// V2 PDA DERIVATION FUNCTIONS (Tokenized Shares Model)
+// ============================================================================
+
+export function getMarketV2Pda(asset: string, timeframe: string, expiryTs: number): PublicKey {
+  // Seeds: [b"market_v2", asset.as_bytes(), timeframe.as_bytes(), expiry_ts.to_le_bytes()]
+  const expiryBuffer = Buffer.alloc(8);
+  expiryBuffer.writeBigInt64LE(BigInt(expiryTs), 0);
+
+  const [pda] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from('market_v2'),
+      Buffer.from(asset),
+      Buffer.from(timeframe),
+      expiryBuffer,
+    ],
+    PROGRAM_ID
+  );
+  return pda;
+}
+
+export function getYesMintPda(marketV2Pubkey: PublicKey): PublicKey {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('yes_mint'), marketV2Pubkey.toBuffer()],
+    PROGRAM_ID
+  );
+  return pda;
+}
+
+export function getNoMintPda(marketV2Pubkey: PublicKey): PublicKey {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('no_mint'), marketV2Pubkey.toBuffer()],
+    PROGRAM_ID
+  );
+  return pda;
+}
+
+export function getSettlementBitmapPda(marketV2Pubkey: PublicKey, chunkIndex: number): PublicKey {
+  const chunkBuffer = Buffer.alloc(2);
+  chunkBuffer.writeUInt16LE(chunkIndex, 0);
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('settlement_bitmap'), marketV2Pubkey.toBuffer(), chunkBuffer],
+    PROGRAM_ID
+  );
+  return pda;
+}
+
 /**
  * Solana client for interacting with the Degen Terminal program
  * Uses raw instruction building for maximum compatibility
  */
 export class AnchorClient {
   private connection: Connection;
+  private executionConnection: Connection;  // Dedicated connection for TX submission (avoids rate contention)
   private relayerKeypair: Keypair | null = null;
   private mmKeypair: Keypair | null = null;
   private relayerUsdcAtaReady: boolean | null = null;
+
+  // ── RPC Connection Pool ──
+  // Round-robins TX submission across multiple RPC endpoints for higher throughput.
+  // Each endpoint has its own rate limit (~50 RPC/s on Helius Dev), so 3 endpoints = ~150 RPC/s.
+  private execConnectionPool: Connection[] = [];
+  private execPoolIndex = 0;
+
+  // ── Blockhash cache (saves 1 RPC call per TX) ──
+  private cachedBlockhash: { blockhash: string; lastValidBlockHeight: number; fetchedAt: number } | null = null;
+  private blockhashInflight: Promise<{ blockhash: string; lastValidBlockHeight: number }> | null = null;
+  private readonly BLOCKHASH_CACHE_TTL_MS = 5000; // Reuse blockhash for 5s (valid for ~60-90s, saves RPC calls under sustained load)
+
+  // ── Helius Sender (15 tx/sec via Jito dual-routing) ──
+  private readonly heliusSenderUrl: string;
+  private readonly jitoTipLamports: number;
+  // Official Jito tip accounts (mainnet-beta) — full list from Helius docs
+  private readonly JITO_TIP_ACCOUNTS = [
+    '4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE',
+    'D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ',
+    '9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta',
+    '5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn',
+    '2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD',
+    '2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ',
+    'wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF',
+    '3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT',
+    '4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey',
+    '4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or',
+  ];
 
   constructor() {
     this.connection = new Connection(
       config.solanaRpcUrl,
       { commitment: 'confirmed' }
     );
+
+    // Build execution connection pool from all available RPC URLs
+    const execUrl = config.solanaExecutionRpcUrl || config.solanaRpcUrl;
+    this.executionConnection = new Connection(execUrl, { commitment: 'confirmed' });
+    this.execConnectionPool.push(this.executionConnection);
+
+    // Add additional RPC endpoints to the pool
+    const additionalUrls = [config.solanaRpcUrl2, config.solanaRpcUrl3].filter(u => u);
+    for (const url of additionalUrls) {
+      this.execConnectionPool.push(new Connection(url, { commitment: 'confirmed' }));
+    }
+
+    if (this.execConnectionPool.length > 1) {
+      logger.info(`🔗 RPC connection pool: ${this.execConnectionPool.length} endpoints (${this.execConnectionPool.length * 50} est. RPC/s)`);
+    } else if (config.solanaExecutionRpcUrl) {
+      logger.info(`🔗 Separate execution RPC configured: ${execUrl.slice(0, 50)}...`);
+    }
+
+    // Helius Sender setup (mainnet ONLY: 15 tx/sec via Jito dual-routing)
+    // Sender requires Jito which doesn't exist on devnet — auto-disable for devnet
+    const isDevnet = config.solanaRpcUrl.includes('devnet');
+    if (config.heliusSenderUrl && isDevnet) {
+      logger.warn(`⚠️  Helius Sender disabled: Jito (required by Sender) is not available on devnet`);
+      this.heliusSenderUrl = '';
+    } else {
+      this.heliusSenderUrl = config.heliusSenderUrl;
+    }
+    this.jitoTipLamports = Math.floor(config.jitoTipSol * LAMPORTS_PER_SOL);
+    if (this.heliusSenderUrl) {
+      logger.info(`🚀 Helius Sender enabled: ${this.heliusSenderUrl} (tip: ${config.jitoTipSol} SOL/tx)`);
+    }
 
     // Load relayer keypair
     if (config.relayerPrivateKey) {
@@ -288,10 +398,146 @@ export class AnchorClient {
   }
 
   /**
-   * Get connection
+   * Get read connection (for account lookups, balance checks, etc.)
    */
   getConnection(): Connection {
     return this.connection;
+  }
+
+  /**
+   * Get execution connection (for sending transactions — may use separate RPC)
+   */
+  getExecutionConnection(): Connection {
+    return this.executionConnection;
+  }
+
+  /**
+   * Whether Helius Sender is effectively enabled (mainnet + configured).
+   * Worker uses this to set appropriate concurrency/rate limits.
+   */
+  get isSenderEnabled(): boolean {
+    return !!this.heliusSenderUrl;
+  }
+
+  /**
+   * Get next execution connection from the pool (round-robin).
+   * Each connection points to a different RPC endpoint with its own rate limit.
+   * This multiplies our effective RPC throughput: N endpoints × 50 RPC/s each.
+   */
+  private getNextExecConnection(): Connection {
+    const conn = this.execConnectionPool[this.execPoolIndex % this.execConnectionPool.length];
+    this.execPoolIndex++;
+    return conn;
+  }
+
+  /**
+   * Send a serialized TX via Helius Sender (15 tx/sec, dual-routed to validators + Jito).
+   * Returns the signature string on success, or null to fall back to standard send.
+   */
+  private async sendViaHeliusSender(serializedTx: Buffer): Promise<string | null> {
+    if (!this.heliusSenderUrl) return null;
+
+    try {
+      const response = await fetch(this.heliusSenderUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: Date.now().toString(),
+          method: 'sendTransaction',
+          params: [
+            serializedTx.toString('base64'),
+            {
+              encoding: 'base64',
+              skipPreflight: true,
+              maxRetries: 0,
+            },
+          ],
+        }),
+      });
+
+      const json = await response.json() as any;
+      if (json.error) {
+        logger.warn(`[Sender] Helius Sender error: ${json.error.message}`);
+        return null; // Fall back to standard send
+      }
+
+      return json.result as string;
+    } catch (err: any) {
+      logger.warn(`[Sender] Helius Sender fetch failed: ${err.message}`);
+      return null; // Fall back to standard send
+    }
+  }
+
+  /**
+   * Poll-based TX confirmation (used with Helius Sender since we can't use confirmTransaction
+   * on a different endpoint than the one that sent the TX).
+   *
+   * Timeout: 10 seconds (20 attempts * 500ms) for good UX.
+   * If not confirmed within timeout, returns null and caller should retry.
+   */
+  private async pollConfirmation(
+    signature: string,
+    connection: Connection,
+    maxAttempts = 20,  // 20 * 500ms = 10 seconds max
+    intervalMs = 500
+  ): Promise<{ err: any } | null> {
+    for (let i = 0; i < maxAttempts; i++) {
+      try {
+        const status = await connection.getSignatureStatuses([signature]);
+        const result = status?.value?.[0];
+        if (result) {
+          if (result.confirmationStatus === 'confirmed' || result.confirmationStatus === 'finalized') {
+            return { err: result.err };
+          }
+        }
+      } catch {
+        // Ignore polling errors, retry
+      }
+      await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+    // Timed out — return null (treat as unknown)
+    return null;
+  }
+
+  /**
+   * Get a random Jito tip instruction (SOL transfer to a random tip account).
+   * Required by Helius Sender for dual-routing to Jito validators.
+   */
+  private getJitoTipInstruction(): TransactionInstruction {
+    const tipAccount = this.JITO_TIP_ACCOUNTS[
+      Math.floor(Math.random() * this.JITO_TIP_ACCOUNTS.length)
+    ];
+    return SystemProgram.transfer({
+      fromPubkey: this.relayerKeypair!.publicKey,
+      toPubkey: new PublicKey(tipAccount),
+      lamports: this.jitoTipLamports,
+    });
+  }
+
+  /**
+   * Get a recent blockhash, with caching + single-flight to minimize RPC calls.
+   * Multiple concurrent callers share the same fetch; result is cached for 2s.
+   */
+  private async getCachedBlockhash(): Promise<{ blockhash: string; lastValidBlockHeight: number }> {
+    const now = Date.now();
+    if (this.cachedBlockhash && (now - this.cachedBlockhash.fetchedAt) < this.BLOCKHASH_CACHE_TTL_MS) {
+      return { blockhash: this.cachedBlockhash.blockhash, lastValidBlockHeight: this.cachedBlockhash.lastValidBlockHeight };
+    }
+    // Single-flight: if someone is already fetching, wait for them
+    if (this.blockhashInflight) {
+      return this.blockhashInflight;
+    }
+    this.blockhashInflight = (async () => {
+      try {
+        const result = await this.executionConnection.getLatestBlockhash('confirmed');
+        this.cachedBlockhash = { ...result, fetchedAt: Date.now() };
+        return result;
+      } finally {
+        this.blockhashInflight = null;
+      }
+    })();
+    return this.blockhashInflight;
   }
 
   /**
@@ -560,7 +806,8 @@ export class AnchorClient {
   }
 
   /**
-   * Submit a transaction with compute budget and confirmation
+   * Submit a transaction with compute budget and confirmation.
+   * Routes via Helius Sender (15 tx/sec) when configured, otherwise standard RPC (5 tx/sec).
    */
   async submitTransaction(
     instructions: TransactionInstruction[],
@@ -584,54 +831,180 @@ export class AnchorClient {
       transaction.add(ix);
     }
 
-    // Get recent blockhash
-    const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+    // Add Jito tip instruction when using Helius Sender (required for dual-routing)
+    if (this.heliusSenderUrl) {
+      transaction.add(this.getJitoTipInstruction());
+    }
+
+    // Get recent blockhash (cached to save RPC calls under high throughput)
+    const { blockhash, lastValidBlockHeight } = await this.getCachedBlockhash();
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = this.relayerKeypair.publicKey;
 
     // Sign with relayer
     transaction.sign(this.relayerKeypair, ...additionalSigners);
 
-    // Send transaction
+    const serializedTx = transaction.serialize();
+    const execConn = this.getNextExecConnection();
+
     try {
-      const signature = await this.connection.sendRawTransaction(
-        transaction.serialize(),
-        { skipPreflight: false, preflightCommitment: 'confirmed' }
-      );
+      let signature: string;
 
-      // Confirm transaction
-      const confirmation = await this.connection.confirmTransaction(
-        { signature, blockhash, lastValidBlockHeight },
-        'confirmed'
-      );
+      // ── Try Helius Sender first (15 tx/sec, dual-routed to validators + Jito) ──
+      const senderSig = await this.sendViaHeliusSender(serializedTx as Buffer);
 
-      // IMPORTANT: confirmTransaction does NOT throw if the tx executed and failed.
-      // We must explicitly check `err` and surface a real failure so callers don't
-      // assume the transaction succeeded (e.g. market creation).
-      if (confirmation?.value?.err) {
-        // Best-effort fetch logs for debugging (may be null depending on RPC)
-        let logMessages: string[] | undefined;
-        try {
-          const tx = await this.connection.getTransaction(signature, {
-            commitment: 'confirmed',
-            maxSupportedTransactionVersion: 0,
-          } as any);
-          logMessages = (tx as any)?.meta?.logMessages;
-        } catch {
-          // ignore
+      if (senderSig) {
+        signature = senderSig;
+        // Sender uses a different endpoint — confirm via polling on our RPC connection
+        const pollResult = await this.pollConfirmation(signature, execConn);
+        if (pollResult === null) {
+          // Timeout — TX may have landed but we can't confirm. Treat as success (caller retries if needed)
+          logger.warn(`[Sender] ${contextLabel}: confirmation timed out for ${signature.slice(0, 16)}...`);
+          return signature;
         }
-        const errJson = JSON.stringify(confirmation.value.err);
-        const logsStr = logMessages ? JSON.stringify(logMessages, null, 2) : 'No logs available';
-        const error = new Error(`[${contextLabel}] CONFIRMED BUT FAILED: ${errJson}\nLogs: ${logsStr}`);
-        // Attach logs for existing error handler formatting
-        (error as any).logs = logMessages;
-        throw error;
+        if (pollResult.err) {
+          // TX confirmed but failed on-chain
+          let logMessages: string[] | undefined;
+          try {
+            const tx = await this.connection.getTransaction(signature, {
+              commitment: 'confirmed',
+              maxSupportedTransactionVersion: 0,
+            } as any);
+            logMessages = (tx as any)?.meta?.logMessages;
+          } catch { /* ignore */ }
+          const errJson = JSON.stringify(pollResult.err);
+          const logsStr = logMessages ? JSON.stringify(logMessages, null, 2) : 'No logs available';
+          const error = new Error(`[${contextLabel}] CONFIRMED BUT FAILED: ${errJson}\nLogs: ${logsStr}`);
+          (error as any).logs = logMessages;
+          throw error;
+        }
+        return signature;
+      }
+
+      // ── Fallback: standard sendRawTransaction with aggressive resend loop ──
+      // On devnet (no Helius Sender) the RPC's built-in retry is insufficient.
+      // We resend the same signed TX every 2s to reach new leaders as they rotate,
+      // while confirmTransaction waits for inclusion or block-height expiry.
+
+      // Run preflight simulation FIRST to fail fast on invalid transactions
+      // instead of waiting ~60s for block height to expire.
+      try {
+        const simResult = await execConn.simulateTransaction(transaction);
+        if (simResult.value.err) {
+          const simLogs = simResult.value.logs || [];
+          const errJson = JSON.stringify(simResult.value.err);
+          const logText = simLogs.join(' ');
+
+          // Map simulation errors to recognizable keywords that downstream handlers check for.
+          // Without this, the preflight wraps errors in a new message format that breaks
+          // idempotent "already in use" / "AccountNotInitialized" detection.
+          if (logText.includes('already in use') || errJson.includes('"Custom":0}')) {
+            logger.debug(`[${contextLabel}] Preflight: account already in use (idempotent)`);
+            const error = new Error(`already in use (0x0)`);
+            (error as any).logs = simLogs;
+            throw error;
+          }
+          if (logText.includes('AccountNotInitialized') || errJson.includes('"Custom":3012')) {
+            logger.debug(`[${contextLabel}] Preflight: AccountNotInitialized (race condition)`);
+            const error = new Error(`AccountNotInitialized (0xbc4)`);
+            (error as any).logs = simLogs;
+            throw error;
+          }
+
+          // Genuinely unexpected failure — log full details at ERROR
+          logger.error(`[${contextLabel}] Preflight simulation FAILED: ${errJson}`);
+          if (simLogs.length > 0) {
+            logger.error(`[${contextLabel}] Simulation logs:\n${simLogs.join('\n')}`);
+          }
+          const error = new Error(`[${contextLabel}] Preflight simulation failed: ${errJson}`);
+          (error as any).logs = simLogs;
+          throw error;
+        }
+        logger.debug(`[${contextLabel}] Preflight simulation OK (units: ${simResult.value.unitsConsumed})`);
+      } catch (simErr: any) {
+        // Re-throw errors from our own preflight handling above
+        if (simErr.logs !== undefined) throw simErr;
+        // Network errors — log and proceed with send anyway (simulation endpoint might be down)
+        logger.warn(`[${contextLabel}] Preflight simulation request failed (proceeding anyway): ${simErr.message?.slice(0, 100)}`);
+      }
+
+      signature = await execConn.sendRawTransaction(
+        serializedTx,
+        { skipPreflight: true, maxRetries: 0 } // We manage retries ourselves
+      );
+
+      // Aggressive resend: keep forwarding the TX to new leaders every 2 seconds
+      // across ALL connections in the pool for maximum propagation.
+      const resendIntervalMs = 2000;
+      const resendTimer = setInterval(async () => {
+        for (const conn of this.execConnectionPool) {
+          try {
+            await conn.sendRawTransaction(serializedTx, { skipPreflight: true, maxRetries: 0 });
+          } catch { /* ignore — TX may already be confirmed or blockhash expired */ }
+        }
+      }, resendIntervalMs);
+
+      try {
+        // Confirm transaction with a hard timeout to avoid waiting 60+ seconds on devnet.
+        // Solana's confirmTransaction waits for block height expiry (~151 blocks = ~60s on devnet).
+        // For good UX, we timeout after 10 seconds - if not confirmed, BullMQ will retry.
+        const MAX_CONFIRM_TIMEOUT_MS = 10_000;
+
+        const confirmationPromise = execConn.confirmTransaction(
+          { signature, blockhash, lastValidBlockHeight },
+          'confirmed'
+        );
+
+        const timeoutPromise = new Promise<{ value: { err: null }, timedOut: true }>((resolve) => {
+          setTimeout(() => resolve({ value: { err: null }, timedOut: true }), MAX_CONFIRM_TIMEOUT_MS);
+        });
+
+        const confirmation = await Promise.race([confirmationPromise, timeoutPromise]) as any;
+
+        // If timed out, return signature - tx may still confirm later, caller can retry via BullMQ
+        if (confirmation.timedOut) {
+          logger.warn(`[${contextLabel}] Confirmation timeout (${MAX_CONFIRM_TIMEOUT_MS}ms) for ${signature.slice(0, 16)}... — will retry`);
+          // Clear resend timer before returning
+          clearInterval(resendTimer);
+          // Throw to trigger BullMQ retry
+          throw new Error(`Confirmation timeout after ${MAX_CONFIRM_TIMEOUT_MS}ms`);
+        }
+
+        // IMPORTANT: confirmTransaction does NOT throw if the tx executed and failed.
+        // We must explicitly check `err` and surface a real failure so callers don't
+        // assume the transaction succeeded (e.g. market creation).
+        if (confirmation?.value?.err) {
+          // Best-effort fetch logs for debugging (may be null depending on RPC)
+          let logMessages: string[] | undefined;
+          try {
+            const tx = await this.connection.getTransaction(signature, {
+              commitment: 'confirmed',
+              maxSupportedTransactionVersion: 0,
+            } as any);
+            logMessages = (tx as any)?.meta?.logMessages;
+          } catch {
+            // ignore
+          }
+          const errJson = JSON.stringify(confirmation.value.err);
+          const logsStr = logMessages ? JSON.stringify(logMessages, null, 2) : 'No logs available';
+          const error = new Error(`[${contextLabel}] CONFIRMED BUT FAILED: ${errJson}\nLogs: ${logsStr}`);
+          // Attach logs for existing error handler formatting
+          (error as any).logs = logMessages;
+          throw error;
+        }
+      } finally {
+        clearInterval(resendTimer);
       }
 
       return signature;
     } catch (err: any) {
       const logsStr = err.logs ? JSON.stringify(err.logs, null, 2) : 'No logs available';
       const errorMsg = err.message || '';
+
+      // Invalidate blockhash cache on expiry errors so retries get a fresh one
+      if (errorMsg.includes('block height exceeded') || errorMsg.includes('Blockhash not found') || errorMsg.includes('expired')) {
+        this.cachedBlockhash = null;
+      }
       
       // Downgrade common "drift" errors to DEBUG level to avoid terminal noise
       const isCommonError = 
@@ -1395,6 +1768,1083 @@ export class AnchorClient {
    */
   getRelayerKeypair(): Keypair | null {
     return this.relayerKeypair;
+  }
+
+  // ============================================================================
+  // V2 INSTRUCTIONS (Tokenized Shares Model)
+  // ============================================================================
+
+  /**
+   * Build initialize_market_v2 instruction
+   * Creates a V2 market with YES/NO token mints
+   */
+  /**
+   * Build initialize_market_v2 instruction (Phase 1)
+   * Creates MarketV2 account and YES mint only
+   */
+  async buildInitializeMarketV2Instruction(params: {
+    asset: string;
+    timeframe: string;
+    strikePrice: number;
+    expiryTs: number;
+  }): Promise<TransactionInstruction> {
+    if (!this.relayerKeypair) {
+      throw new Error('Relayer not initialized');
+    }
+
+    const market = getMarketV2Pda(params.asset, params.timeframe, params.expiryTs);
+    const yesMint = getYesMintPda(market);
+
+    const discriminator = computeDiscriminator('initialize_market_v2');
+
+    const assetBytes = Buffer.from(params.asset);
+    const assetLenBuffer = Buffer.alloc(4);
+    assetLenBuffer.writeUInt32LE(assetBytes.length, 0);
+
+    const timeframeBytes = Buffer.from(params.timeframe);
+    const timeframeLenBuffer = Buffer.alloc(4);
+    timeframeLenBuffer.writeUInt32LE(timeframeBytes.length, 0);
+
+    const strikePriceU64 = BigInt(Math.floor(params.strikePrice * 100_000_000));
+    const strikePriceBuffer = Buffer.alloc(8);
+    strikePriceBuffer.writeBigUInt64LE(strikePriceU64, 0);
+
+    const expiryTsBuffer = Buffer.alloc(8);
+    expiryTsBuffer.writeBigInt64LE(BigInt(params.expiryTs), 0);
+
+    const data = Buffer.concat([
+      discriminator,
+      assetLenBuffer,
+      assetBytes,
+      timeframeLenBuffer,
+      timeframeBytes,
+      strikePriceBuffer,
+      expiryTsBuffer,
+    ]);
+
+    logger.info(`initialize_market_v2 (phase 1): market=${market.toBase58()}, yesMint=${yesMint.toBase58()} (Token-2022)`);
+
+    // Phase 1: market + yes_mint + authority + token_program + share_token_program + system_program
+    return new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: market, isSigner: false, isWritable: true },
+        { pubkey: yesMint, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },  // share_token_program (Token-2022)
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data,
+    });
+  }
+
+  /**
+   * Build initialize_market_v2_finalize instruction (Phase 2)
+   * Creates NO mint and USDC vault
+   */
+  async buildInitializeMarketV2FinalizeInstruction(params: {
+    marketPubkey: PublicKey;
+    strikePrice: number;
+  }): Promise<TransactionInstruction> {
+    if (!this.relayerKeypair) {
+      throw new Error('Relayer not initialized');
+    }
+
+    const noMint = getNoMintPda(params.marketPubkey);
+    // Use PDA vault instead of ATA to avoid "Provided owner is not allowed" error with PDAs
+    const [vault] = PublicKey.findProgramAddressSync(
+      [Buffer.from('vault'), params.marketPubkey.toBuffer()],
+      PROGRAM_ID
+    );
+
+    const discriminator = computeDiscriminator('initialize_market_v2_finalize');
+
+    const strikePriceU64 = BigInt(Math.floor(params.strikePrice * 100_000_000));
+    const strikePriceBuffer = Buffer.alloc(8);
+    strikePriceBuffer.writeBigUInt64LE(strikePriceU64, 0);
+
+    const data = Buffer.concat([discriminator, strikePriceBuffer]);
+
+    logger.info(`initialize_market_v2_finalize (phase 2): market=${params.marketPubkey.toBase58()}, noMint=${noMint.toBase58()} (Token-2022)`);
+
+    // Phase 2: market + no_mint + usdc_mint + vault + authority + programs
+    return new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: params.marketPubkey, isSigner: false, isWritable: true },
+        { pubkey: noMint, isSigner: false, isWritable: true },
+        { pubkey: USDC_MINT, isSigner: false, isWritable: false },
+        { pubkey: vault, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },  // share_token_program (Token-2022)
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data,
+    });
+  }
+
+  /**
+   * Initialize a V2 market on-chain with YES/NO token mints
+   * Uses two-phase initialization to avoid stack overflow:
+   * - Phase 1: Create market + YES mint
+   * - Phase 2: Create NO mint + vault (with retries to ensure completion)
+   */
+  async initializeMarketV2(params: {
+    asset: string;
+    timeframe: string;
+    strikePrice: number;
+    expiryTs: number;
+  }): Promise<{ signature: string; marketPubkey: string; yesMint: string; noMint: string }> {
+    const market = getMarketV2Pda(params.asset, params.timeframe, params.expiryTs);
+    const yesMint = getYesMintPda(market);
+    const noMint = getNoMintPda(market);
+
+    // Measure SOL spent on market creation (rent + tx fees)
+    let balanceBefore = 0;
+    try {
+      balanceBefore = await this.connection.getBalance(this.relayerKeypair!.publicKey, 'confirmed');
+    } catch { /* ignore */ }
+
+    // Phase 1: Create market + YES mint (idempotent — skip if already exists)
+    // Retries on transient failures (e.g. block height exceeded / expired blockhash)
+    const PHASE1_MAX_RETRIES = 3;
+    for (let attempt = 1; attempt <= PHASE1_MAX_RETRIES; attempt++) {
+      try {
+        const ix1 = await this.buildInitializeMarketV2Instruction(params);
+        const sig1 = await this.submitTransaction([ix1], [], `Init MarketV2 ${params.asset}-${params.timeframe} (phase 1)`);
+        logger.info(`MarketV2 phase 1 complete: ${market.toBase58()} (tx: ${sig1})`);
+        break; // Success
+      } catch (err: any) {
+        const msg = err.message || '';
+        if (msg.includes('already in use') || msg.includes('0x0')) {
+          logger.info(`MarketV2 phase 1 already exists: ${market.toBase58()} — proceeding to phase 2`);
+          break;
+        }
+        // Retry on transient errors (expired blockhash, timeout, network issues)
+        const isTransient =
+          msg.includes('block height exceeded') ||
+          msg.includes('Blockhash not found') ||
+          msg.includes('expired') ||
+          msg.includes('timeout') ||
+          msg.includes('ETIMEDOUT') ||
+          msg.includes('ECONNREFUSED') ||
+          msg.includes('socket hang up');
+        if (isTransient && attempt < PHASE1_MAX_RETRIES) {
+          logger.warn(`MarketV2 phase 1 attempt ${attempt}/${PHASE1_MAX_RETRIES} failed (transient): ${msg.slice(0, 120)}`);
+          // Exponential backoff: 2s, 4s — fresh blockhash on next submitTransaction call
+          await new Promise(r => setTimeout(r, 2000 * Math.pow(2, attempt - 1)));
+          continue;
+        }
+        if (attempt === PHASE1_MAX_RETRIES) {
+          logger.error(`MarketV2 phase 1 FAILED after ${PHASE1_MAX_RETRIES} attempts for ${market.toBase58()}`);
+        }
+        throw err; // Non-idempotent / non-transient error — Phase 1 genuinely failed
+      }
+    }
+
+    // Phase 2: Create NO mint + vault (with retries — Phase 1 is already on-chain)
+    const PHASE2_MAX_RETRIES = 3;
+    let signature = '';
+    for (let attempt = 1; attempt <= PHASE2_MAX_RETRIES; attempt++) {
+      try {
+        // Check if Phase 2 is already complete by checking if NO mint account exists
+        // This prevents "InvalidMarketParams" errors when retrying a finalized market
+        try {
+          const noMintInfo = await this.connection.getAccountInfo(noMint, 'confirmed');
+          // If NO mint account exists and has data, Phase 2 is already done
+          if (noMintInfo && noMintInfo.data.length > 0) {
+            logger.info(`MarketV2 phase 2 already completed for ${market.toBase58()} (noMint account exists)`);
+            signature = 'already_initialized';
+            break;
+          }
+        } catch (fetchErr) {
+          // Ignore fetch errors — proceed to attempt Phase 2
+        }
+
+        const ix2 = await this.buildInitializeMarketV2FinalizeInstruction({
+          marketPubkey: market,
+          strikePrice: params.strikePrice,
+        });
+        signature = await this.submitTransaction([ix2], [], `Init MarketV2 ${params.asset}-${params.timeframe} (phase 2)`);
+        logger.info(`MarketV2 phase 2 complete: ${market.toBase58()} (tx: ${signature})`);
+        break; // Success
+      } catch (err: any) {
+        const msg = err.message || '';
+        // If "already in use" → Phase 2 was already completed (idempotent)
+        if (msg.includes('already in use') || msg.includes('0x0')) {
+          logger.info(`MarketV2 phase 2 already completed for ${market.toBase58()}`);
+          signature = 'already_initialized';
+          break;
+        }
+        // Don't retry non-transient program errors (they'll never succeed)
+        const isNonRecoverable =
+          msg.includes('IllegalOwner') ||
+          msg.includes('owner is not allowed') ||
+          msg.includes('InvalidExpiry') ||
+          msg.includes('InvalidAsset') ||
+          msg.includes('InvalidTimeframe') ||
+          msg.includes('InvalidMarketParams');
+        if (isNonRecoverable) {
+          logger.error(`MarketV2 phase 2 FAILED (non-recoverable) for ${market.toBase58()}: ${msg.split('\n')[0].slice(0, 150)}`);
+          throw err;
+        }
+
+        logger.warn(`MarketV2 phase 2 attempt ${attempt}/${PHASE2_MAX_RETRIES} failed: ${msg.split('\n')[0].slice(0, 150)}`);
+        if (attempt === PHASE2_MAX_RETRIES) {
+          logger.error(`MarketV2 phase 2 FAILED after ${PHASE2_MAX_RETRIES} attempts for ${market.toBase58()} — market has NO mint missing!`);
+          throw err; // Re-throw so caller knows Phase 2 failed
+        }
+        // Exponential backoff: 2s, 4s, 8s
+        await new Promise(r => setTimeout(r, 2000 * Math.pow(2, attempt - 1)));
+      }
+    }
+
+    // Log SOL cost for market creation
+    let costLog = '';
+    if (balanceBefore > 0) {
+      try {
+        const balanceAfter = await this.connection.getBalance(this.relayerKeypair!.publicKey, 'confirmed');
+        const spent = balanceBefore - balanceAfter;
+        costLog = `, cost: -${(spent / LAMPORTS_PER_SOL).toFixed(6)} SOL`;
+      } catch { /* ignore */ }
+    }
+
+    const status = params.strikePrice > 0 ? 'OPEN' : 'PENDING';
+    logger.info(`MarketV2 initialized: ${market.toBase58()} (status=${status}${costLog})`);
+    logger.info(`  YES mint: ${yesMint.toBase58()}`);
+    logger.info(`  NO mint: ${noMint.toBase58()}`);
+
+    return {
+      signature,
+      marketPubkey: market.toBase58(),
+      yesMint: yesMint.toBase58(),
+      noMint: noMint.toBase58(),
+    };
+  }
+
+  /**
+   * Complete Phase 2 for a market that only has Phase 1 done.
+   * Called by the market creator as a recovery step for orphaned markets.
+   */
+  async completeMarketV2Phase2(marketPubkey: PublicKey, strikePrice: number = 0): Promise<string> {
+    logger.info(`[Recovery] Attempting Phase 2 completion for market ${marketPubkey.toBase58()}`);
+    try {
+      const ix2 = await this.buildInitializeMarketV2FinalizeInstruction({
+        marketPubkey,
+        strikePrice,
+      });
+      const sig = await this.submitTransaction([ix2], [], `Recovery Phase 2: ${marketPubkey.toBase58().slice(0, 8)}`);
+      logger.info(`[Recovery] Phase 2 complete for ${marketPubkey.toBase58()} (tx: ${sig})`);
+      return sig;
+    } catch (err: any) {
+      const msg = err.message || '';
+      if (msg.includes('already in use') || msg.includes('0x0')) {
+        logger.info(`[Recovery] Phase 2 already done for ${marketPubkey.toBase58()}`);
+        return 'already_initialized';
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Build execute_match_v2 instruction (tokenized shares)
+   * Mints YES/NO tokens instead of updating Position PDAs
+   */
+  async buildExecuteMatchV2Instruction(params: {
+    marketPubkey: PublicKey;
+    yesMint: PublicKey;
+    noMint: PublicKey;
+    makerWallet: PublicKey;
+    takerWallet: PublicKey;
+    makerArgs: PlaceOrderArgs;
+    takerArgs: PlaceOrderArgs;
+    matchSize: number;
+    takerFee: number;
+    makerOrderPda?: PublicKey | null;
+    takerOrderPda?: PublicKey | null;
+  }): Promise<TransactionInstruction> {
+    if (!this.relayerKeypair) {
+      throw new Error('Relayer not initialized');
+    }
+
+    const globalState = getGlobalStatePda();
+    const market = params.marketPubkey;
+    // Vault is a PDA, NOT an ATA (created in Phase 2 with seeds ["vault", market])
+    const [vault] = PublicKey.findProgramAddressSync(
+      [Buffer.from('vault'), market.toBuffer()],
+      PROGRAM_ID
+    );
+
+    // Get fee recipient
+    const feeRecipientWallet = config.feeRecipient
+      ? new PublicKey(config.feeRecipient)
+      : this.relayerKeypair.publicKey;
+    const feeRecipient = await getAssociatedTokenAddress(USDC_MINT, feeRecipientWallet);
+
+    // Get USDC ATAs
+    const makerUsdc = await getAssociatedTokenAddress(USDC_MINT, params.makerWallet);
+    const takerUsdc = await getAssociatedTokenAddress(USDC_MINT, params.takerWallet);
+
+    // Get YES/NO ATAs for both parties (Token-2022 program for share tokens)
+    const makerYesAta = await getAssociatedTokenAddress(params.yesMint, params.makerWallet, false, TOKEN_2022_PROGRAM_ID);
+    const makerNoAta = await getAssociatedTokenAddress(params.noMint, params.makerWallet, false, TOKEN_2022_PROGRAM_ID);
+    const takerYesAta = await getAssociatedTokenAddress(params.yesMint, params.takerWallet, false, TOKEN_2022_PROGRAM_ID);
+    const takerNoAta = await getAssociatedTokenAddress(params.noMint, params.takerWallet, false, TOKEN_2022_PROGRAM_ID);
+
+    // Build instruction data
+    const discriminator = computeDiscriminator('execute_match_v2');
+    const makerArgsBuffer = this.encodePlaceOrderArgs(params.makerArgs);
+    const takerArgsBuffer = this.encodePlaceOrderArgs(params.takerArgs);
+    const matchSizeBuffer = Buffer.alloc(8);
+    matchSizeBuffer.writeBigUInt64LE(BigInt(params.matchSize), 0);
+    const takerFeeBuffer = Buffer.alloc(8);
+    takerFeeBuffer.writeBigUInt64LE(BigInt(params.takerFee), 0);
+
+    const data = Buffer.concat([discriminator, makerArgsBuffer, takerArgsBuffer, matchSizeBuffer, takerFeeBuffer]);
+
+    // Optional Order PDAs
+    const makerOrderAccount = params.makerOrderPda || PROGRAM_ID;
+    const takerOrderAccount = params.takerOrderPda || PROGRAM_ID;
+
+    logger.info(`execute_match_v2: market=${market.toBase58()}`);
+    logger.info(`execute_match_v2: maker=${params.makerWallet.toBase58()}, taker=${params.takerWallet.toBase58()}`);
+
+    // NOTE: ATAs must be pre-created before this instruction is called
+    // The instruction no longer uses init_if_needed for stack optimization
+    return new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: globalState, isSigner: false, isWritable: false },
+        { pubkey: market, isSigner: false, isWritable: true },
+        { pubkey: params.yesMint, isSigner: false, isWritable: true },
+        { pubkey: params.noMint, isSigner: false, isWritable: true },
+        { pubkey: vault, isSigner: false, isWritable: true },
+        { pubkey: feeRecipient, isSigner: false, isWritable: true },
+        // Maker accounts
+        { pubkey: params.makerWallet, isSigner: false, isWritable: false },
+        { pubkey: makerUsdc, isSigner: false, isWritable: true },
+        { pubkey: makerYesAta, isSigner: false, isWritable: true },
+        { pubkey: makerNoAta, isSigner: false, isWritable: true },
+        { pubkey: makerOrderAccount, isSigner: false, isWritable: params.makerOrderPda ? true : false },
+        // Taker accounts
+        { pubkey: params.takerWallet, isSigner: false, isWritable: false },
+        { pubkey: takerUsdc, isSigner: false, isWritable: true },
+        { pubkey: takerYesAta, isSigner: false, isWritable: true },
+        { pubkey: takerNoAta, isSigner: false, isWritable: true },
+        { pubkey: takerOrderAccount, isSigner: false, isWritable: params.takerOrderPda ? true : false },
+        // Common accounts
+        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },           // USDC operations
+        { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },      // share_token_program (Token-2022 for YES/NO mint)
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data,
+    });
+  }
+
+  /**
+   * Execute a V2 match on-chain (tokenized shares)
+   * Mints YES tokens to YES buyer, NO tokens to NO buyer
+   */
+  async executeMatchV2(params: {
+    marketPubkey: string;
+    yesMint: string;
+    noMint: string;
+    makerWallet: string;
+    takerWallet: string;
+    makerSide: 'BID' | 'ASK';
+    takerSide: 'BID' | 'ASK';
+    outcome: 'YES' | 'NO';
+    price: number;
+    matchSize: number;
+    takerFee: number;
+    makerClientOrderId: number;
+    takerClientOrderId: number;
+    makerExpiryTs: number;
+    takerExpiryTs: number;
+    makerOrderPda?: string;
+    takerOrderPda?: string;
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const yesMint = new PublicKey(params.yesMint);
+    const noMint = new PublicKey(params.noMint);
+    const makerWallet = new PublicKey(params.makerWallet);
+    const takerWallet = new PublicKey(params.takerWallet);
+
+    // Convert to 6 decimals
+    const priceU64 = Math.floor(params.price * 1_000_000);
+    const sizeU64 = Math.floor(params.matchSize * 1_000_000);
+    const feeU64 = Math.floor(params.takerFee * 1_000_000);
+
+    const makerArgs: PlaceOrderArgs = {
+      side: params.makerSide,
+      outcome: params.outcome,
+      orderType: 'LIMIT',
+      price: priceU64,
+      size: sizeU64,
+      expiryTs: params.makerExpiryTs,
+      clientOrderId: params.makerClientOrderId,
+    };
+
+    const takerArgs: PlaceOrderArgs = {
+      side: params.takerSide,
+      outcome: params.outcome,
+      orderType: 'LIMIT',
+      price: priceU64,
+      size: sizeU64,
+      expiryTs: params.takerExpiryTs,
+      clientOrderId: params.takerClientOrderId,
+    };
+
+    const makerOrderPda = params.makerOrderPda ? new PublicKey(params.makerOrderPda) : null;
+    const takerOrderPda = params.takerOrderPda ? new PublicKey(params.takerOrderPda) : null;
+
+    // Pre-create ATAs for both parties (idempotent - skips if already exists)
+    // Token-2022 program for YES/NO share tokens
+    const makerYesAta = await getAssociatedTokenAddress(yesMint, makerWallet, false, TOKEN_2022_PROGRAM_ID);
+    const makerNoAta = await getAssociatedTokenAddress(noMint, makerWallet, false, TOKEN_2022_PROGRAM_ID);
+    const takerYesAta = await getAssociatedTokenAddress(yesMint, takerWallet, false, TOKEN_2022_PROGRAM_ID);
+    const takerNoAta = await getAssociatedTokenAddress(noMint, takerWallet, false, TOKEN_2022_PROGRAM_ID);
+
+    // Check which ATAs need to be created (avoid idempotent instruction bug with Token-2022)
+    const createAtaIxs: TransactionInstruction[] = [];
+    const conn = this.getConnection();
+
+    // Helper to check if ATA exists and add creation instruction if needed
+    const maybeCreateAta = async (ata: PublicKey, owner: PublicKey, mint: PublicKey) => {
+      try {
+        const info = await conn.getAccountInfo(ata);
+        if (!info) {
+          // Account doesn't exist - add creation instruction
+          createAtaIxs.push(
+            createAssociatedTokenAccountIdempotentInstruction(
+              this.relayerKeypair!.publicKey,
+              ata,
+              owner,
+              mint,
+              TOKEN_2022_PROGRAM_ID,
+              ASSOCIATED_TOKEN_PROGRAM_ID
+            )
+          );
+        }
+        // If account exists, skip - no instruction needed
+      } catch {
+        // Error checking account - add creation instruction to be safe
+        createAtaIxs.push(
+          createAssociatedTokenAccountIdempotentInstruction(
+            this.relayerKeypair!.publicKey,
+            ata,
+            owner,
+            mint,
+            TOKEN_2022_PROGRAM_ID,
+            ASSOCIATED_TOKEN_PROGRAM_ID
+          )
+        );
+      }
+    };
+
+    // Check all 4 ATAs in parallel
+    await Promise.all([
+      maybeCreateAta(makerYesAta, makerWallet, yesMint),
+      maybeCreateAta(makerNoAta, makerWallet, noMint),
+      maybeCreateAta(takerYesAta, takerWallet, yesMint),
+      maybeCreateAta(takerNoAta, takerWallet, noMint),
+    ]);
+
+    const matchIx = await this.buildExecuteMatchV2Instruction({
+      marketPubkey: market,
+      yesMint,
+      noMint,
+      makerWallet,
+      takerWallet,
+      makerArgs,
+      takerArgs,
+      matchSize: sizeU64,
+      takerFee: feeU64,
+      makerOrderPda,
+      takerOrderPda,
+    });
+
+    // Combine ATA creation with match in single transaction
+    const allIxs = [...createAtaIxs, matchIx];
+    const signature = await this.submitTransaction(allIxs, [], `MatchV2 ${params.matchSize} shares`);
+    logger.info(`MatchV2 executed on-chain: ${signature}`);
+
+    return signature;
+  }
+
+  /**
+   * Build activate_market_v2 instruction
+   */
+  async buildActivateMarketV2Instruction(params: {
+    marketPubkey: string;
+    strikePrice: number;
+  }): Promise<TransactionInstruction> {
+    if (!this.relayerKeypair) {
+      throw new Error('Relayer not initialized');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const discriminator = computeDiscriminator('activate_market_v2');
+
+    const strikePriceU64 = BigInt(Math.floor(params.strikePrice * 100_000_000));
+    const strikePriceBuffer = Buffer.alloc(8);
+    strikePriceBuffer.writeBigUInt64LE(strikePriceU64, 0);
+
+    const data = Buffer.concat([discriminator, strikePriceBuffer]);
+
+    return new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: market, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
+      ],
+      data,
+    });
+  }
+
+  /**
+   * Activate a pending V2 market
+   */
+  async activateMarketV2(params: {
+    marketPubkey: string;
+    strikePrice: number;
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
+    }
+
+    const instruction = await this.buildActivateMarketV2Instruction(params);
+    const signature = await this.submitTransaction([instruction], [], `Activate MarketV2 ${params.marketPubkey.slice(0, 8)}`);
+
+    logger.info(`MarketV2 activated on-chain: ${params.marketPubkey} (strike=${params.strikePrice}, tx: ${signature})`);
+
+    return signature;
+  }
+
+  /**
+   * Build resolve_market_v2 instruction
+   */
+  async buildResolveMarketV2Instruction(params: {
+    marketPubkey: string;
+    outcome: 'YES' | 'NO';
+    finalPrice: number;
+  }): Promise<TransactionInstruction> {
+    if (!this.relayerKeypair) {
+      throw new Error('Relayer not initialized');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const discriminator = computeDiscriminator('resolve_market_v2');
+
+    // ResolveMarketArgsV2: outcome (u8) + final_price (u64)
+    const argsBuffer = Buffer.alloc(9);
+    argsBuffer.writeUInt8(params.outcome === 'YES' ? 0 : 1, 0);
+    const finalPriceU64 = BigInt(Math.floor(params.finalPrice * 100_000_000));
+    argsBuffer.writeBigUInt64LE(finalPriceU64, 1);
+
+    const data = Buffer.concat([discriminator, argsBuffer]);
+
+    return new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: market, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: false },
+      ],
+      data,
+    });
+  }
+
+  /**
+   * Resolve a V2 market
+   */
+  async resolveMarketV2(params: {
+    marketPubkey: string;
+    outcome: 'YES' | 'NO';
+    finalPrice: number;
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
+    }
+
+    const instruction = await this.buildResolveMarketV2Instruction(params);
+    const signature = await this.submitTransaction([instruction], [], `Resolve MarketV2 ${params.marketPubkey.slice(0, 8)} (${params.outcome})`);
+
+    logger.info(`MarketV2 resolved on-chain: ${signature} (outcome=${params.outcome}, price=${params.finalPrice})`);
+
+    return signature;
+  }
+
+  /**
+   * Build execute_close_v2 instruction
+   */
+  async buildExecuteCloseV2Instruction(params: {
+    marketPubkey: PublicKey;
+    yesMint: PublicKey;
+    noMint: PublicKey;
+    buyerWallet: PublicKey;
+    sellerWallet: PublicKey;
+    outcome: 'YES' | 'NO';
+    price: number;      // 6 decimals
+    size: number;       // 6 decimals
+    takerFee: number;   // 6 decimals
+  }): Promise<TransactionInstruction> {
+    if (!this.relayerKeypair) {
+      throw new Error('Relayer not initialized');
+    }
+
+    const globalState = getGlobalStatePda();
+
+    // Get fee recipient (same pattern as buildExecuteMatchV2Instruction)
+    const feeRecipientWallet = config.feeRecipient
+      ? new PublicKey(config.feeRecipient)
+      : this.relayerKeypair.publicKey;
+    const feeRecipientAta = await getAssociatedTokenAddress(USDC_MINT, feeRecipientWallet);
+
+    // Buyer accounts (USDC: regular Token, YES/NO: Token-2022)
+    const buyerUsdc = await getAssociatedTokenAddress(USDC_MINT, params.buyerWallet);
+    const buyerYesAta = await getAssociatedTokenAddress(params.yesMint, params.buyerWallet, false, TOKEN_2022_PROGRAM_ID);
+    const buyerNoAta = await getAssociatedTokenAddress(params.noMint, params.buyerWallet, false, TOKEN_2022_PROGRAM_ID);
+
+    // Seller accounts (USDC: regular Token, YES/NO: Token-2022)
+    const sellerUsdc = await getAssociatedTokenAddress(USDC_MINT, params.sellerWallet);
+    const sellerYesAta = await getAssociatedTokenAddress(params.yesMint, params.sellerWallet, false, TOKEN_2022_PROGRAM_ID);
+    const sellerNoAta = await getAssociatedTokenAddress(params.noMint, params.sellerWallet, false, TOKEN_2022_PROGRAM_ID);
+
+    const discriminator = computeDiscriminator('execute_close_v2');
+
+    // CloseTradeArgsV2: outcome (u8) + price (u64) + size (u64) + taker_fee (u64) = 25 bytes
+    const argsBuffer = Buffer.alloc(25);
+    argsBuffer.writeUInt8(params.outcome === 'YES' ? 0 : 1, 0);
+    argsBuffer.writeBigUInt64LE(BigInt(params.price), 1);
+    argsBuffer.writeBigUInt64LE(BigInt(params.size), 9);
+    argsBuffer.writeBigUInt64LE(BigInt(params.takerFee), 17);
+
+    const data = Buffer.concat([discriminator, argsBuffer]);
+
+    // NOTE: Buyer ATAs must be pre-created before this instruction is called
+    // The instruction no longer uses init_if_needed for stack optimization
+    return new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: globalState, isSigner: false, isWritable: false },
+        { pubkey: params.marketPubkey, isSigner: false, isWritable: true },
+        { pubkey: params.yesMint, isSigner: false, isWritable: false },
+        { pubkey: params.noMint, isSigner: false, isWritable: false },
+        { pubkey: feeRecipientAta, isSigner: false, isWritable: true },
+        { pubkey: params.buyerWallet, isSigner: false, isWritable: false },
+        { pubkey: buyerUsdc, isSigner: false, isWritable: true },
+        { pubkey: buyerYesAta, isSigner: false, isWritable: true },
+        { pubkey: buyerNoAta, isSigner: false, isWritable: true },
+        { pubkey: params.sellerWallet, isSigner: false, isWritable: false },
+        { pubkey: sellerUsdc, isSigner: false, isWritable: true },
+        { pubkey: sellerYesAta, isSigner: false, isWritable: true },
+        { pubkey: sellerNoAta, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },           // USDC operations
+        { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },      // share_token_program (Token-2022 for YES/NO transfers)
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data,
+    });
+  }
+
+  /**
+   * Execute a close trade in a V2 market (tokenized shares)
+   */
+  async executeCloseV2(params: {
+    marketPubkey: string;
+    yesMint: string;
+    noMint: string;
+    buyerWallet: string;
+    sellerWallet: string;
+    outcome: 'YES' | 'NO';
+    price: number;      // Price in dollars (e.g., 0.52)
+    matchSize: number;  // Number of shares (e.g., 100)
+    takerFee: number;   // Fee in USD (e.g., 0.02)
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const yesMint = new PublicKey(params.yesMint);
+    const noMint = new PublicKey(params.noMint);
+    const buyerWallet = new PublicKey(params.buyerWallet);
+    const sellerWallet = new PublicKey(params.sellerWallet);
+
+    // Convert to 6 decimals
+    const priceU64 = Math.floor(params.price * 1_000_000);
+    const sizeU64 = Math.floor(params.matchSize * 1_000_000);
+    const feeU64 = Math.floor(params.takerFee * 1_000_000);
+
+    // Pre-create buyer ATAs (idempotent - skips if already exists)
+    // Token-2022 program for YES/NO share tokens
+    const buyerYesAta = await getAssociatedTokenAddress(yesMint, buyerWallet, false, TOKEN_2022_PROGRAM_ID);
+    const buyerNoAta = await getAssociatedTokenAddress(noMint, buyerWallet, false, TOKEN_2022_PROGRAM_ID);
+
+    const createAtaIxs: TransactionInstruction[] = [
+      createAssociatedTokenAccountIdempotentInstruction(
+        this.relayerKeypair!.publicKey, // payer
+        buyerYesAta,
+        buyerWallet,
+        yesMint,
+        TOKEN_2022_PROGRAM_ID  // Token-2022 for share tokens
+      ),
+      createAssociatedTokenAccountIdempotentInstruction(
+        this.relayerKeypair!.publicKey,
+        buyerNoAta,
+        buyerWallet,
+        noMint,
+        TOKEN_2022_PROGRAM_ID
+      ),
+    ];
+
+    const closeIx = await this.buildExecuteCloseV2Instruction({
+      marketPubkey: market,
+      yesMint,
+      noMint,
+      buyerWallet,
+      sellerWallet,
+      outcome: params.outcome,
+      price: priceU64,
+      size: sizeU64,
+      takerFee: feeU64,
+    });
+
+    // Combine ATA creation with close in single transaction
+    const allIxs = [...createAtaIxs, closeIx];
+    const signature = await this.submitTransaction(allIxs, [], `CloseV2 ${params.matchSize} shares`);
+    logger.info(`CloseV2 executed on-chain: ${signature}`);
+
+    return signature;
+  }
+
+  /**
+   * Build close_market_v2 instruction (for zero-trade V2 markets)
+   * This closes a V2 market that has no trading activity (open_interest = 0)
+   */
+  async buildCloseMarketV2Instruction(params: {
+    marketPubkey: string;
+    yesMint: string;
+    noMint: string;
+  }): Promise<TransactionInstruction> {
+    if (!this.relayerKeypair) {
+      throw new Error('Relayer not initialized');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const yesMint = new PublicKey(params.yesMint);
+    const noMint = new PublicKey(params.noMint);
+    // Vault is a PDA, NOT an ATA (created in Phase 2 with seeds ["vault", market])
+    const [vault] = PublicKey.findProgramAddressSync(
+      [Buffer.from('vault'), market.toBuffer()],
+      PROGRAM_ID
+    );
+
+    const discriminator = computeDiscriminator('close_market_v2');
+
+    return new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: market, isSigner: false, isWritable: true },
+        { pubkey: yesMint, isSigner: false, isWritable: true },       // writable - closed via Token-2022 MintCloseAuthority
+        { pubkey: noMint, isSigner: false, isWritable: true },        // writable - closed via Token-2022 MintCloseAuthority
+        { pubkey: vault, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
+        { pubkey: this.relayerKeypair.publicKey, isSigner: false, isWritable: true }, // rent_recipient
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },             // USDC vault close
+        { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },        // share_token_program (Token-2022 for mint close)
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: discriminator,
+    });
+  }
+
+  /**
+   * Close a zero-trade V2 market
+   * For markets with no trades (open_interest = 0), this directly closes the market
+   * without going through the merkle settlement flow.
+   */
+  async closeMarketV2(params: {
+    marketPubkey: string;
+    yesMint: string;
+    noMint: string;
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
+    }
+
+    const ix = await this.buildCloseMarketV2Instruction(params);
+    const signature = await this.submitTransaction([ix], [], `CloseMarketV2 ${params.marketPubkey.slice(0,8)}`);
+    logger.info(`CloseMarketV2 executed: ${signature}`);
+
+    return signature;
+  }
+
+  // =========================================================================
+  // V2 Merkle Settlement Instructions
+  // =========================================================================
+
+  /**
+   * Post merkle root to begin batch settlement.
+   * Transitions market from RESOLVED → SETTLING on-chain.
+   */
+  async postMerkleRoot(params: {
+    marketPubkey: string;
+    merkleRoot: Uint8Array;    // 32 bytes
+    totalAmount: bigint;       // USDC native units (6 decimals)
+    totalSettlements: number;
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const bitmapPda = getSettlementBitmapPda(market, 0);
+
+    const discriminator = computeDiscriminator('post_merkle_root');
+
+    // Args: merkle_root [u8;32] + total_amount u64 + total_settlements u64
+    const argsBuffer = Buffer.alloc(48);
+    Buffer.from(params.merkleRoot).copy(argsBuffer, 0, 0, 32);
+    argsBuffer.writeBigUInt64LE(params.totalAmount, 32);
+    argsBuffer.writeBigUInt64LE(BigInt(params.totalSettlements), 40);
+
+    const data = Buffer.concat([discriminator, argsBuffer]);
+
+    const instruction = new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: market, isSigner: false, isWritable: true },
+        { pubkey: bitmapPda, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair!.publicKey, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data,
+    });
+
+    const signature = await this.submitTransaction(
+      [instruction], [],
+      `PostMerkleRoot ${params.marketPubkey.slice(0, 8)} (${params.totalSettlements} settlements)`,
+    );
+    logger.info(`PostMerkleRoot executed: ${signature}`);
+    return signature;
+  }
+
+  /**
+   * Batch settle V2 — submit up to 15 settlements with merkle proofs.
+   * Recipient USDC ATAs must exist (pass createAta instructions separately).
+   */
+  async batchSettleV2(params: {
+    marketPubkey: string;
+    bitmapChunkIndex: number;
+    settlements: Array<{
+      recipient: string;       // pubkey base58
+      amount: bigint;          // USDC native units
+      index: number;           // leaf index in merkle tree
+      proof: Uint8Array[];     // array of 32-byte hashes
+    }>;
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    // Vault is a PDA, NOT an ATA (created in Phase 2 with seeds ["vault", market])
+    const [vault] = PublicKey.findProgramAddressSync(
+      [Buffer.from('vault'), market.toBuffer()],
+      PROGRAM_ID
+    );
+    const bitmapPda = getSettlementBitmapPda(market, params.bitmapChunkIndex);
+
+    const discriminator = computeDiscriminator('batch_settle_v2');
+
+    // Borsh-serialize Vec<SettlementEntry>
+    // u32 LE vec length, then per entry: pubkey(32) + amount(u64) + index(u64) + proof_vec(u32_len + N*32)
+    const entries = params.settlements;
+    const bufParts: Buffer[] = [];
+
+    // Vec length prefix
+    const vecLen = Buffer.alloc(4);
+    vecLen.writeUInt32LE(entries.length, 0);
+    bufParts.push(vecLen);
+
+    for (const entry of entries) {
+      // recipient pubkey (32 bytes)
+      bufParts.push(Buffer.from(new PublicKey(entry.recipient).toBytes()));
+      // amount u64 LE
+      const amountBuf = Buffer.alloc(8);
+      amountBuf.writeBigUInt64LE(entry.amount, 0);
+      bufParts.push(amountBuf);
+      // index u64 LE
+      const indexBuf = Buffer.alloc(8);
+      indexBuf.writeBigUInt64LE(BigInt(entry.index), 0);
+      bufParts.push(indexBuf);
+      // proof Vec<[u8;32]>: u32 length prefix + N * 32 bytes
+      const proofLen = Buffer.alloc(4);
+      proofLen.writeUInt32LE(entry.proof.length, 0);
+      bufParts.push(proofLen);
+      for (const proofElement of entry.proof) {
+        bufParts.push(Buffer.from(proofElement));
+      }
+    }
+
+    const argsBuffer = Buffer.concat(bufParts);
+    const data = Buffer.concat([discriminator, argsBuffer]);
+
+    // Build remaining accounts — recipient USDC ATAs in same order as settlements
+    const remainingAccounts = await Promise.all(
+      entries.map(async (entry) => {
+        const recipientPubkey = new PublicKey(entry.recipient);
+        const ata = await getAssociatedTokenAddress(USDC_MINT, recipientPubkey);
+        return { pubkey: ata, isSigner: false, isWritable: true };
+      }),
+    );
+
+    // Pre-create ATAs if needed (idempotent)
+    const createAtaIxs: TransactionInstruction[] = [];
+    for (const entry of entries) {
+      const recipientPubkey = new PublicKey(entry.recipient);
+      createAtaIxs.push(
+        createAssociatedTokenAccountIdempotentInstruction(
+          this.relayerKeypair!.publicKey,
+          await getAssociatedTokenAddress(USDC_MINT, recipientPubkey),
+          recipientPubkey,
+          USDC_MINT,
+        ),
+      );
+    }
+
+    const instruction = new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: market, isSigner: false, isWritable: true },
+        { pubkey: vault, isSigner: false, isWritable: true },
+        { pubkey: bitmapPda, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair!.publicKey, isSigner: true, isWritable: true },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        ...remainingAccounts,
+      ],
+      data,
+    });
+
+    const allIxs = [...createAtaIxs, instruction];
+    const signature = await this.submitTransaction(
+      allIxs, [],
+      `BatchSettleV2 ${entries.length} entries (Market ${params.marketPubkey.slice(0, 8)})`,
+    );
+    logger.info(`BatchSettleV2 executed: ${signature} (${entries.length} settlements)`);
+    return signature;
+  }
+
+  /**
+   * Burn remaining share tokens from user ATAs using PermanentDelegate.
+   * Called after batch_settle_v2 completes and before finalize_market_v2.
+   * Burns all YES/NO tokens from the passed user ATAs, bringing mint supply to 0
+   * so mints can be closed during finalize to recover rent.
+   */
+  async burnRemainingSharesV2(params: {
+    marketPubkey: string;
+    yesMint: string;
+    noMint: string;
+    userShareAtas: string[]; // pubkeys of user YES/NO ATAs with tokens to burn
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const yesMint = new PublicKey(params.yesMint);
+    const noMint = new PublicKey(params.noMint);
+
+    const discriminator = computeDiscriminator('burn_remaining_shares_v2');
+
+    // Fixed accounts
+    const keys = [
+      { pubkey: market, isSigner: false, isWritable: false },
+      { pubkey: yesMint, isSigner: false, isWritable: true },
+      { pubkey: noMint, isSigner: false, isWritable: true },
+      { pubkey: this.relayerKeypair!.publicKey, isSigner: true, isWritable: false },
+      { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false }, // share_token_program
+    ];
+
+    // Remaining accounts: user share ATAs
+    for (const ata of params.userShareAtas) {
+      keys.push({ pubkey: new PublicKey(ata), isSigner: false, isWritable: true });
+    }
+
+    const instruction = new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys,
+      data: discriminator,
+    });
+
+    const signature = await this.submitTransaction(
+      [instruction], [],
+      `BurnRemainingSharesV2 ${params.userShareAtas.length} ATAs (Market ${params.marketPubkey.slice(0, 8)})`,
+    );
+    logger.info(`BurnRemainingSharesV2 executed: ${signature} (${params.userShareAtas.length} ATAs burned)`);
+    return signature;
+  }
+
+  /**
+   * Finalize a V2 market after all merkle settlements are complete.
+   * Closes vault, recovers rent, transitions to SETTLED.
+   */
+  async finalizeMarketV2(params: {
+    marketPubkey: string;
+    yesMint: string;
+    noMint: string;
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const yesMint = new PublicKey(params.yesMint);
+    const noMint = new PublicKey(params.noMint);
+    // Vault is a PDA, NOT an ATA (created in Phase 2 with seeds ["vault", market])
+    const [vault] = PublicKey.findProgramAddressSync(
+      [Buffer.from('vault'), market.toBuffer()],
+      PROGRAM_ID
+    );
+
+    const discriminator = computeDiscriminator('finalize_market_v2');
+
+    // Authority's USDC ATA to receive vault dust
+    const authorityAta = await getAssociatedTokenAddress(USDC_MINT, this.relayerKeypair!.publicKey);
+
+    const instruction = new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: market, isSigner: false, isWritable: true },
+        { pubkey: yesMint, isSigner: false, isWritable: true },       // closed via Token-2022 MintCloseAuthority
+        { pubkey: noMint, isSigner: false, isWritable: true },        // closed via Token-2022 MintCloseAuthority
+        { pubkey: vault, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair!.publicKey, isSigner: true, isWritable: true },
+        { pubkey: authorityAta, isSigner: false, isWritable: true }, // authority_ata for dust
+        { pubkey: this.relayerKeypair!.publicKey, isSigner: false, isWritable: true }, // rent_recipient
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },             // USDC vault operations
+        { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },        // share_token_program (Token-2022 for mint close)
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: discriminator,
+    });
+
+    const signature = await this.submitTransaction(
+      [instruction], [],
+      `FinalizeMarketV2 ${params.marketPubkey.slice(0, 8)}`,
+    );
+    logger.info(`FinalizeMarketV2 executed: ${signature}`);
+    return signature;
   }
 }
 

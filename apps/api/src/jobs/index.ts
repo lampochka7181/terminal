@@ -6,6 +6,9 @@ import { positionSettlerJob } from './position-settler.js';
 import { orderExpirerJob } from './order-expirer.js';
 import { marketCloserJob } from './market-closer.js';
 import { liquidationCheckerJob, lendingPoolSyncJob } from './liquidation-checker.js';
+import { merkleSettlerJob } from './merkle-settler.js';
+import { reconciliationJob } from '../queue/jobs/reconciliation.job.js';
+import { relayerPoolService } from '../services/relayer-pool.service.js';
 import { db, pool } from '../db/index.js'; // To check pool load directly
 import { config } from '../config.js';
 
@@ -35,62 +38,85 @@ interface JobConfig {
  * Delays are spread across 60 seconds to avoid DB connection pool contention at boot.
  * Each job also adds random jitter to its interval to prevent synchronization.
  */
+const isPerfMode = config.perfTestMode;
+
 const jobs: JobConfig[] = [
   {
     name: 'Lending Pool Sync',
-    intervalMs: 60 * 1000, // Every 60 seconds
+    intervalMs: 60 * 1000,
     job: lendingPoolSyncJob,
-    enabled: !!config.lendingWalletPrivateKey,
-    startupDelayMs: 2000, // Run early to init lending pool state
+    enabled: !isPerfMode && !!config.lendingWalletPrivateKey,
+    startupDelayMs: 2000,
   },
   {
     name: 'Market Activator',
-    intervalMs: 5 * 1000, // Every 5 seconds (activates markets when they go live)
+    intervalMs: isPerfMode ? 10 * 1000 : 5 * 1000, // Slower in perf mode
     job: marketActivatorJob,
     enabled: true,
-    startupDelayMs: 5000, // Wait 5s after boot
+    startupDelayMs: 5000,
   },
   {
     name: 'Market Resolver',
-    intervalMs: 3 * 1000, // Every 3 seconds (slightly slower to reduce DB load)
+    intervalMs: isPerfMode ? 10 * 1000 : 3 * 1000, // Slower in perf mode
     job: marketResolverJob,
     enabled: true,
-    startupDelayMs: 12000, // Wait 12s - no markets to resolve at boot anyway
+    startupDelayMs: 12000,
   },
   {
     name: 'Liquidation Checker',
-    intervalMs: 2 * 1000, // Every 2 seconds (was 1s - 2s is still fast enough)
+    intervalMs: 2 * 1000,
     job: liquidationCheckerJob,
-    enabled: !!config.lendingWalletPrivateKey,
-    startupDelayMs: 20000, // Wait 20s - no leveraged positions at boot anyway
+    enabled: !isPerfMode && !!config.lendingWalletPrivateKey,
+    startupDelayMs: 20000,
   },
   {
     name: 'Position Settler',
-    intervalMs: 5 * 1000, // Every 5 seconds (fast settlement for better UX)
+    intervalMs: isPerfMode ? 15 * 1000 : 5 * 1000,
     job: positionSettlerJob,
     enabled: true,
-    startupDelayMs: 28000, // Wait 28s - no positions to settle at boot
+    startupDelayMs: isPerfMode ? 60000 : 28000, // Later in perf mode
   },
   {
     name: 'Market Creator',
-    intervalMs: 30 * 1000, // Every 30 seconds (pre-creates PENDING markets in DB)
+    intervalMs: isPerfMode ? 60 * 1000 : 30 * 1000,
     job: marketCreatorJob,
     enabled: true,
-    startupDelayMs: 35000, // Wait 35s after boot - not urgent
+    startupDelayMs: isPerfMode ? 60000 : 35000,
   },
   {
     name: 'Order Expirer',
-    intervalMs: 10 * 1000, // Every 10 seconds
+    intervalMs: 10 * 1000,
     job: orderExpirerJob,
-    enabled: true,
-    startupDelayMs: 45000, // Wait 45s - not urgent at boot
+    enabled: !isPerfMode,
+    startupDelayMs: 45000,
+  },
+  {
+    name: 'Merkle Settler V2',
+    intervalMs: isPerfMode ? 30 * 1000 : 10 * 1000,
+    job: merkleSettlerJob,
+    enabled: config.useV2,
+    startupDelayMs: isPerfMode ? 90000 : 30000, // Much later in perf mode
   },
   {
     name: 'Market Closer',
-    intervalMs: 30 * 1000, // Every 30 seconds (was 20s - not urgent)
+    intervalMs: 30 * 1000,
     job: marketCloserJob,
-    enabled: true,
-    startupDelayMs: 55000, // Wait 55s - definitely not urgent at boot
+    enabled: !isPerfMode,
+    startupDelayMs: 55000,
+  },
+  {
+    name: 'Trade Reconciliation',
+    intervalMs: 60 * 1000,
+    job: reconciliationJob,
+    enabled: !isPerfMode,
+    startupDelayMs: 60000,
+  },
+  {
+    name: 'Relayer Pool Funder',
+    intervalMs: 30 * 1000,
+    job: () => relayerPoolService.autoFundKeeper(),
+    enabled: !isPerfMode,
+    startupDelayMs: 40000,
   },
 ];
 

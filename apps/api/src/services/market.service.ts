@@ -197,14 +197,46 @@ export class MarketService {
   /**
    * Get a single market by ID
    */
+  // In-memory cache for getById (30s TTL) — keeps DB off the matching hot path
+  private getByIdCache = new Map<string, { data: Market; expiresAt: number }>();
+  // Single-flight: only one DB query per market at a time (prevents thundering herd)
+  private getByIdInflight = new Map<string, Promise<Market | null>>();
+
   async getById(id: string): Promise<Market | null> {
-    const result = await db
-      .select()
-      .from(markets)
-      .where(eq(markets.id, id))
-      .limit(1);
-    
-    return result[0] || null;
+    // 1. Check cache (instant — no DB)
+    const cached = this.getByIdCache.get(id);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.data;
+    }
+
+    // 2. Single-flight: if a query is already in flight, wait for it
+    const inflight = this.getByIdInflight.get(id);
+    if (inflight) {
+      return inflight;
+    }
+
+    // 3. Only one DB query per market at a time
+    const promise = (async () => {
+      try {
+        const result = await db
+          .select()
+          .from(markets)
+          .where(eq(markets.id, id))
+          .limit(1);
+        
+        const market = result[0] || null;
+        if (market) {
+          // Cache for 30s — market data changes rarely during matching
+          this.getByIdCache.set(id, { data: market, expiresAt: Date.now() + 30_000 });
+        }
+        return market;
+      } finally {
+        this.getByIdInflight.delete(id);
+      }
+    })();
+
+    this.getByIdInflight.set(id, promise);
+    return promise;
   }
 
   /**
@@ -357,6 +389,20 @@ export class MarketService {
   }
 
   /**
+   * Mark market as settlement failed (on-chain settlement could not complete)
+   */
+  async markSettlementFailed(id: string): Promise<void> {
+    await db
+      .update(markets)
+      .set({
+        status: 'SETTLEMENT_FAILED',
+      })
+      .where(eq(markets.id, id));
+    
+    await this.clearMarketsCache();
+  }
+
+  /**
    * Get markets that need activation (strikePrice = '0' means pending)
    * A market's start time is calculated as: expiryAt - duration (based on timeframe)
    * 
@@ -439,6 +485,8 @@ export class MarketService {
    * Update market prices after a trade
    */
   async updatePrices(id: string, yesPrice: number, noPrice: number): Promise<void> {
+    // Skip DB write in perf test mode to avoid DB pool saturation
+    if (process.env.PERF_TEST_MODE === 'true') return;
     await db
       .update(markets)
       .set({

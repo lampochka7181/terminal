@@ -200,11 +200,23 @@ pub fn execute_match(
         );
     }
     
-    // Validate relayer-specified fee
-    // Fee must be at least MIN_TAKER_FEE (prevents relayer from under-charging)
-    // Note: FeeTooHigh check removed - relayer is trusted and fee aggregation
-    // for multiple fills can legitimately exceed per-trade percentage limits
+    // Validate relayer-specified fee (minimum and maximum bounds)
     require!(taker_fee >= MIN_TAKER_FEE, DegenError::FeeTooLow);
+    // Cap fee at 5% of the taker's cost to prevent fee extraction attacks
+    let max_fee = no_cost.max(yes_cost)
+        .checked_mul(5).ok_or(DegenError::MathOverflow)?
+        .checked_div(100).ok_or(DegenError::DivisionByZero)?;
+    require!(taker_fee <= max_fee.max(MIN_TAKER_FEE), DegenError::FeeTooHigh);
+
+    // Validate match_size doesn't exceed order remaining size (prevent overfill)
+    if let Some(ref order) = ctx.accounts.maker_order {
+        let remaining = order.size.checked_sub(order.filled_size).ok_or(DegenError::MathOverflow)?;
+        require!(match_size <= remaining, DegenError::InvalidSize);
+    }
+    if let Some(ref order) = ctx.accounts.taker_order {
+        let remaining = order.size.checked_sub(order.filled_size).ok_or(DegenError::MathOverflow)?;
+        require!(match_size <= remaining, DegenError::InvalidSize);
+    }
     
     // Calculate costs
     let (maker_cost, taker_cost) = if is_maker_yes_buyer {

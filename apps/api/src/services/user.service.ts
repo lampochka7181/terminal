@@ -103,6 +103,23 @@ export class UserService {
   }
 
   /**
+   * Update user fields by ID
+   */
+  async update(id: string, fields: Partial<{
+    isAgent: boolean;
+    agentName: string | null;
+    feeDiscountPct: number;
+    agentMetadata: unknown;
+    isBanned: boolean;
+    metadata: unknown;
+  }>): Promise<void> {
+    await db
+      .update(users)
+      .set(fields as any)
+      .where(eq(users.id, id));
+  }
+
+  /**
    * Update user stats after a trade
    */
   async updateTradeStats(userId: string, volume: number): Promise<void> {

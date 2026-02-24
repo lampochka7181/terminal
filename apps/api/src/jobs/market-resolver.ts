@@ -6,6 +6,7 @@ import { logger, marketLogger, logEvents } from '../lib/logger.js';
 import { broadcastMarketResolved } from '../lib/broadcasts.js';
 import { anchorClient, getMarketPda } from '../lib/anchor-client.js';
 import { prepareSettlementData, settleMarketWithData, type SettlementPrepData } from './position-settler.js';
+import { config } from '../config.js';
 
 /**
  * Market Resolver Job
@@ -182,12 +183,24 @@ async function resolveMarket(
   // Helper to attempt on-chain resolution with retry for clock skew
   const attemptResolve = async (retryCount = 0): Promise<string | null> => {
     try {
-      const sig = await anchorClient.resolveMarket({
-        marketPubkey: market.pubkey,
-        outcome,
-        finalPrice,
-      });
-      logger.info(`✅ Market resolved on-chain: ${sig}`);
+      let sig: string;
+      if (config.useV2) {
+        // V2: Tokenized shares market
+        sig = await anchorClient.resolveMarketV2({
+          marketPubkey: market.pubkey,
+          outcome,
+          finalPrice,
+        });
+        logger.info(`✅ MarketV2 resolved on-chain: ${sig}`);
+      } else {
+        // V1: Position PDAs market
+        sig = await anchorClient.resolveMarket({
+          marketPubkey: market.pubkey,
+          outcome,
+          finalPrice,
+        });
+        logger.info(`✅ Market resolved on-chain: ${sig}`);
+      }
       return sig;
     } catch (err: any) {
       const errorMsg = err.message || '';
@@ -266,27 +279,28 @@ async function resolveMarket(
 async function getFinalPrice(asset: string): Promise<number | null> {
   try {
     const priceData = await priceFeedService.getPrice(asset);
-    
+
     if (priceData) {
       // Check if price is fresh enough (within 60 seconds)
       const priceAge = Date.now() - priceData.timestamp;
       if (priceAge < 60000) {
         return priceData.price;
       }
-      
-      logger.warn(`Price for ${asset} is stale (${priceAge}ms old), using anyway`);
-      return priceData.price;
+
+      // Allow stale prices up to 5 minutes for resolution (markets already expired)
+      if (priceAge < 300000) {
+        logger.warn(`Price for ${asset} is stale (${priceAge}ms old), using for resolution since market already expired`);
+        return priceData.price;
+      }
+
+      logger.error(`Price for ${asset} is too stale (${priceAge}ms old) — refusing to resolve with unreliable price`);
+      return null;
     }
-    
-    // Fallback for development (when Binance not connected)
-    const fallbackPrices: Record<string, number> = {
-      BTC: 95000 + (Math.random() - 0.5) * 1000,
-      ETH: 3300 + (Math.random() - 0.5) * 100,
-      SOL: 145 + (Math.random() - 0.5) * 10,
-    };
-    
-    logger.warn(`Using fallback price for ${asset} resolution`);
-    return fallbackPrices[asset] || null;
+
+    // No price data available — do NOT use random/hardcoded fallbacks
+    // Markets will be retried on the next resolver run when prices are available
+    logger.error(`No price data available for ${asset} — cannot resolve. Will retry on next run.`);
+    return null;
   } catch (err) {
     logger.error(`Failed to get final price for ${asset}:`, err);
     return null;

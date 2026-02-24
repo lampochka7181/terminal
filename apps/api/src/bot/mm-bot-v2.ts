@@ -167,30 +167,40 @@ export interface FairValuePoint {
 
 // Load configuration from environment
 function loadConfig(): MMConfigV2 {
+  const isPerfTest = process.env.PERF_TEST_MODE === 'true';
+
+  if (isPerfTest) {
+    console.log('🏎️  [MM] PERF_TEST_MODE: Deep liquidity enabled (20 levels × 100K contracts)');
+  }
+
   return {
     // Spread
-    baseSpread: parseFloat(process.env.MM_BASE_SPREAD || '0.04'),
-    minSpread: parseFloat(process.env.MM_MIN_SPREAD || '0.02'),
-    maxSpread: parseFloat(process.env.MM_MAX_SPREAD || '0.20'),
+    baseSpread: isPerfTest ? 0.01 : parseFloat(process.env.MM_BASE_SPREAD || '0.04'),
+    minSpread: isPerfTest ? 0.005 : parseFloat(process.env.MM_MIN_SPREAD || '0.02'),
+    maxSpread: isPerfTest ? 0.05 : parseFloat(process.env.MM_MAX_SPREAD || '0.20'),
     
-    // Size
-    baseSize: parseFloat(process.env.MM_BASE_SIZE || '100'),
-    maxSize: parseFloat(process.env.MM_MAX_SIZE || '1000'),
-    minSize: parseFloat(process.env.MM_MIN_SIZE || '10'),
-    levels: parseInt(process.env.MM_LEVELS || '3'),
-    levelSpacing: parseFloat(process.env.MM_LEVEL_SPACING || '0.01'),
+    // Size — perf test: massive fills at many levels
+    baseSize: isPerfTest ? 100000 : parseFloat(process.env.MM_BASE_SIZE || '100'),
+    maxSize: isPerfTest ? 1000000 : parseFloat(process.env.MM_MAX_SIZE || '1000'),
+    minSize: isPerfTest ? 1000 : parseFloat(process.env.MM_MIN_SIZE || '10'),
+    levels: isPerfTest ? 20 : parseInt(process.env.MM_LEVELS || '3'),
+    levelSpacing: isPerfTest ? 0.005 : parseFloat(process.env.MM_LEVEL_SPACING || '0.01'),
     
-    // Inventory
-    maxPositionPerMarket: parseFloat(process.env.MM_MAX_POSITION || '10000'),
-    maxImbalance: parseFloat(process.env.MM_MAX_IMBALANCE || '5000'),
+    // Inventory — perf test: unlimited
+    maxPositionPerMarket: isPerfTest ? 100000000 : parseFloat(process.env.MM_MAX_POSITION || '10000'),
+    maxImbalance: isPerfTest ? 100000000 : parseFloat(process.env.MM_MAX_IMBALANCE || '5000'),
     skewFactor: parseFloat(process.env.MM_SKEW_FACTOR || '0.02'),
     rebalanceStartPct: parseFloat(process.env.MM_REBALANCE_START_PCT || '0.70'),
     criticalRebalancePct: parseFloat(process.env.MM_CRITICAL_REBALANCE_PCT || '0.90'),
     
     // Time
-    quoteUpdateMs: parseInt(process.env.MM_QUOTE_UPDATE_MS || '250'),
+    // In perf mode, keep fast replenishment so sustained load never hits empty book.
+    // Deep liquidity (100K/level × 20 levels) means each refresh is cheap.
+    quoteUpdateMs: parseInt(process.env.MM_QUOTE_UPDATE_MS || (config.perfTestMode ? '500' : '250')),
     closeBeforeExpiryMs: parseInt(process.env.MM_CLOSE_BEFORE_EXPIRY_MS || '2000'),
-    stopQuotingLoserPct: parseFloat(process.env.MM_STOP_QUOTING_LOSER_PCT || '0.10'),
+    // In perf mode, never stop quoting any side — ensures both BID/ASK have liquidity
+    // even when fair value is extreme (e.g., YES=0.02 → still quote YES BIDs)
+    stopQuotingLoserPct: isPerfTest ? 0 : parseFloat(process.env.MM_STOP_QUOTING_LOSER_PCT || '0.10'),
     
     // Volatility (annualized)
     defaultVolatility: parseFloat(process.env.MM_DEFAULT_VOLATILITY || '0.50'),
@@ -405,35 +415,48 @@ function xQuotesToProbability(
 ): { p_bid: number; p_ask: number; spread: number } {
   let p_bid = logOddsToProb(x_bid);
   let p_ask = logOddsToProb(x_ask);
-  
+
   // Ensure ask > bid
   if (p_ask <= p_bid) {
     const mid = (p_bid + p_ask) / 2;
     p_bid = mid - minSpread / 2;
     p_ask = mid + minSpread / 2;
   }
-  
+
   // Clamp to valid range
   p_bid = Math.max(0.01, Math.min(0.98, p_bid));
   p_ask = Math.max(0.02, Math.min(0.99, p_ask));
-  
+
+  // Round to 2 decimals (cent precision)
+  p_bid = Math.round(p_bid * 100) / 100;
+  p_ask = Math.round(p_ask * 100) / 100;
+
   let spread = p_ask - p_bid;
-  
-  // Enforce spread constraints
+
+  // CRITICAL: Enforce minimum spread AFTER rounding
+  // This is essential for boundary cases where x-space spread compresses
+  // to less than 1 cent in p-space after the sigmoid transform
   if (spread < minSpread) {
     const mid = (p_bid + p_ask) / 2;
-    p_bid = Math.max(0.01, mid - minSpread / 2);
-    p_ask = Math.min(0.99, mid + minSpread / 2);
+    // Round outward to ensure we hit the minimum spread
+    p_bid = Math.floor((mid - minSpread / 2) * 100) / 100;
+    p_ask = Math.ceil((mid + minSpread / 2) * 100) / 100;
+    // Clamp again after adjustment
+    p_bid = Math.max(0.01, p_bid);
+    p_ask = Math.min(0.99, p_ask);
     spread = p_ask - p_bid;
   }
-  
+
+  // Enforce maximum spread
   if (spread > maxSpread) {
     const mid = (p_bid + p_ask) / 2;
-    p_bid = Math.max(0.01, mid - maxSpread / 2);
-    p_ask = Math.min(0.99, mid + maxSpread / 2);
+    p_bid = Math.round((mid - maxSpread / 2) * 100) / 100;
+    p_ask = Math.round((mid + maxSpread / 2) * 100) / 100;
+    p_bid = Math.max(0.01, p_bid);
+    p_ask = Math.min(0.99, p_ask);
     spread = p_ask - p_bid;
   }
-  
+
   return { p_bid, p_ask, spread };
 }
 
@@ -1325,74 +1348,88 @@ function generateQuotesAS(
   // Generate quotes in x-space then convert
   const yesBids: Quote[] = [];
   const yesAsks: Quote[] = [];
-  
+
   // Boundary-aware max position
   const boundaryMaxPos = getBoundaryAwareMaxPosition(fairValueYes, config.maxPositionPerMarket);
-  
-  // Level spacing in x-space - smaller = tighter book
-  // 0.04 ≈ 1 cent at p=0.50, scales with boundary
-  const levelSpacingX = 0.04;
-  
+
+  // Calculate the FIRST level using xQuotesToProbability to enforce minSpread
+  // This is critical: x-space spread compresses at boundaries, so we MUST
+  // enforce minimum spread in p-space after conversion and rounding
+  const x_bid_0 = r_x - halfSpreadX;
+  const x_ask_0 = r_x + halfSpreadX;
+
+  // Use xQuotesToProbability which handles rounding AND enforces min/max spread
+  const { p_bid: baseBid, p_ask: baseAsk } = xQuotesToProbability(
+    x_bid_0,
+    x_ask_0,
+    config.minSpread,
+    config.maxSpread
+  );
+
+  // Level spacing in p-space (config.levelSpacing, typically 0.01 = 1 cent)
+  const levelSpacingP = config.levelSpacing;
+
   for (let i = 0; i < config.levels; i++) {
-    const levelOffsetX = i * levelSpacingX;
-    
-    // Check if we should quote this side
+    // Size scales with level and boundary factor
+    // In perf mode, always use full size regardless of fair value boundary
+    const boundaryFactor = config.baseSize >= 100000 ? 1.0 : sigmoidDerivative(fairValueYes) / 0.25;
+
+    // Check if we should quote bids
     if (shouldQuoteSide(fairValueYes, timeRemainingPct, 'bid', 'YES', config)) {
-      // Bid in x-space
-      const x_bid = r_x - halfSpreadX - levelOffsetX;
-      const p_bid = logOddsToProb(x_bid);
-      
-      // Size scales with level and boundary factor
-      const boundaryFactor = sigmoidDerivative(fairValueYes) / 0.25;
-      let bidSize = config.baseSize * Math.pow(0.7, i) * boundaryFactor;
-      
+      // Offset from base bid price (move down for deeper levels)
+      const bidPrice = Math.round((baseBid - i * levelSpacingP) * 100) / 100;
+
+      // In perf mode, use flat sizing across all levels (no decay)
+      const levelDecay = config.baseSize >= 100000 ? 1.0 : Math.pow(0.7, i);
+      let bidSize = config.baseSize * levelDecay * boundaryFactor;
+
       // Reduce size if approaching position limit
       const positionUtilization = Math.abs(yesPosition) / boundaryMaxPos;
       if (positionUtilization > 0.5 && yesPosition > 0) {
         bidSize *= Math.max(0.1, 1 - positionUtilization);
       }
-      
+
       bidSize = Math.max(config.minSize, Math.min(config.maxSize, Math.round(bidSize)));
-      
-      if (p_bid >= 0.01 && p_bid <= 0.98) {
+
+      if (bidPrice >= 0.01 && bidPrice <= 0.98) {
         yesBids.push({
-          price: Math.round(p_bid * 100) / 100,
+          price: bidPrice,
           size: bidSize,
         });
       }
     }
-    
+
+    // Check if we should quote asks
     if (shouldQuoteSide(fairValueYes, timeRemainingPct, 'ask', 'YES', config)) {
-      // Ask in x-space
-      const x_ask = r_x + halfSpreadX + levelOffsetX;
-      const p_ask = logOddsToProb(x_ask);
-      
-      // Size scales with level and boundary factor
-      const boundaryFactor = sigmoidDerivative(fairValueYes) / 0.25;
-      let askSize = config.baseSize * Math.pow(0.7, i) * boundaryFactor;
-      
+      // Offset from base ask price (move up for deeper levels)
+      const askPrice = Math.round((baseAsk + i * levelSpacingP) * 100) / 100;
+
+      // In perf mode, use flat sizing across all levels (no decay)
+      const askLevelDecay = config.baseSize >= 100000 ? 1.0 : Math.pow(0.7, i);
+      let askSize = config.baseSize * askLevelDecay * boundaryFactor;
+
       // Reduce size if approaching position limit
       const positionUtilization = Math.abs(noPosition) / boundaryMaxPos;
       if (positionUtilization > 0.5 && noPosition > 0) {
         askSize *= Math.max(0.1, 1 - positionUtilization);
       }
-      
+
       askSize = Math.max(config.minSize, Math.min(config.maxSize, Math.round(askSize)));
-      
-      if (p_ask >= 0.02 && p_ask <= 0.99) {
+
+      if (askPrice >= 0.02 && askPrice <= 0.99) {
         yesAsks.push({
-          price: Math.round(p_ask * 100) / 100,
+          price: askPrice,
           size: askSize,
         });
       }
     }
   }
-  
+
   // Calculate effective spread and skew for reporting
   const p_mid = logOddsToProb(r_x);
   const spread = yesBids.length > 0 && yesAsks.length > 0
     ? yesAsks[0].price - yesBids[0].price
-    : config.baseSpread;
+    : config.minSpread;
   const skew = fairValueYes - p_mid; // How much we shifted due to inventory
   
   return {
@@ -1468,7 +1505,12 @@ function generateQuotes(
     // YES bid (we buy YES / user sells YES / user buys NO)
     // When user buys NO @ (1-bid), they match against this YES bid
     if (shouldQuoteSide(fairValueYes, timeRemainingPct, 'bid', 'YES', config)) {
-      const bidPrice = fairValueYes - halfSpread - levelOffset - skew;
+      let bidPrice = fairValueYes - halfSpread - levelOffset - skew;
+      // In perf mode, clamp bid to min $0.01 even when fair value is extreme
+      // (e.g., YES=0.02 with spread=0.05 → bid=-0.005 → clamp to 0.01)
+      if (config.baseSize >= 100000 && bidPrice < 0.01) {
+        bidPrice = 0.01 + i * 0.005; // Stack bids at floor prices in perf mode
+      }
       const bidSize = calculateDynamicSize(fairValueYes, timeRemainingPct, yesPosition, 'bid', 'YES', config);
       
       if (bidPrice >= 0.01 && bidPrice <= 0.98) {
@@ -1607,7 +1649,7 @@ class MarketMakerBotV2 {
   
   // Market sync cache to avoid repeated DB queries
   private marketsSyncCacheTime: number = 0;
-  private marketsSyncCacheTTL: number = 5000; // 5 seconds
+  private marketsSyncCacheTTL: number = config.perfTestMode ? 10000 : 5000; // 10s in perf mode (faster market discovery), 5s normally
   
   // WebSocket connection
   private ws: WebSocket | null = null;
@@ -2053,6 +2095,18 @@ class MarketMakerBotV2 {
   // MARKET SYNC
   // ============================================================================
 
+  /**
+   * Force immediate market sync, bypassing cache.
+   * Use after creating test markets to ensure MM discovers them immediately.
+   */
+  async forceMarketSync(): Promise<void> {
+    this.marketsSyncCacheTime = 0;  // Reset cache to force sync
+    await this.syncMarkets();
+    // Immediately update quotes on newly discovered markets
+    await this.updateAllQuotes();
+    mmLogger.info(`[MM] Forced market sync complete. Active markets: ${this.markets.size}`);
+  }
+
   async syncMarkets(): Promise<void> {
     // Use cache to avoid hammering DB on every quote cycle
     const now = Date.now();
@@ -2287,9 +2341,12 @@ class MarketMakerBotV2 {
       // Apply spread multiplier
       const spreadMultiplier = quoteDecision.yes.spreadMultiplier;
       if (spreadMultiplier !== 1.0) {
-        const adjustedHalfSpread = (quotes.spread * spreadMultiplier) / 2;
+        // Ensure we use at least minSpread as the base, then apply multiplier
+        const baseSpread = Math.max(quotes.spread, this.config.minSpread);
+        const adjustedSpread = baseSpread * spreadMultiplier;
+        const adjustedHalfSpread = adjustedSpread / 2;
         const fairMid = fairValue;
-        
+
         // Recalculate bid/ask prices with wider spread
         for (let i = 0; i < quotes.yesBids.length; i++) {
           const levelOffset = i * this.config.levelSpacing;
@@ -2299,9 +2356,30 @@ class MarketMakerBotV2 {
           const levelOffset = i * this.config.levelSpacing;
           quotes.yesAsks[i].price = Math.min(0.99, Math.round((fairMid + adjustedHalfSpread + levelOffset - quotes.skew) * 100) / 100);
         }
-        quotes.spread = quotes.spread * spreadMultiplier;
+        quotes.spread = adjustedSpread;
       }
-      
+
+      // CRITICAL: Enforce minimum spread after velocity adjustments
+      // Rounding can still cause zero spread at extreme fair values
+      if (quotes.yesBids.length > 0 && quotes.yesAsks.length > 0) {
+        const actualSpread = quotes.yesAsks[0].price - quotes.yesBids[0].price;
+        if (actualSpread < this.config.minSpread) {
+          const mid = (quotes.yesAsks[0].price + quotes.yesBids[0].price) / 2;
+          // Round outward to ensure minimum spread
+          quotes.yesBids[0].price = Math.max(0.01, Math.floor((mid - this.config.minSpread / 2) * 100) / 100);
+          quotes.yesAsks[0].price = Math.min(0.99, Math.ceil((mid + this.config.minSpread / 2) * 100) / 100);
+          quotes.spread = quotes.yesAsks[0].price - quotes.yesBids[0].price;
+
+          // Adjust subsequent levels to maintain spacing from the corrected first level
+          for (let i = 1; i < quotes.yesBids.length; i++) {
+            quotes.yesBids[i].price = Math.max(0.01, Math.round((quotes.yesBids[0].price - i * this.config.levelSpacing) * 100) / 100);
+          }
+          for (let i = 1; i < quotes.yesAsks.length; i++) {
+            quotes.yesAsks[i].price = Math.min(0.99, Math.round((quotes.yesAsks[0].price + i * this.config.levelSpacing) * 100) / 100);
+          }
+        }
+      }
+
       // Apply size multiplier
       const sizeMultiplier = quoteDecision.yes.sizeMultiplier;
       if (sizeMultiplier !== 1.0) {
@@ -2312,7 +2390,7 @@ class MarketMakerBotV2 {
           ask.size = Math.max(this.config.minSize, Math.round(ask.size * sizeMultiplier));
         }
       }
-      
+
       // Remove quotes based on decision
       if (!quoteDecision.yes.shouldQuoteBids) {
         quotes.yesBids = [];
@@ -2321,7 +2399,27 @@ class MarketMakerBotV2 {
         quotes.yesAsks = [];
       }
     }
-    
+
+    // FINAL SAFETY: Always enforce minimum spread before placing orders
+    // This catches any edge cases from rounding, boundary effects, or adjustments
+    if (quotes.yesBids.length > 0 && quotes.yesAsks.length > 0) {
+      const finalSpread = quotes.yesAsks[0].price - quotes.yesBids[0].price;
+      if (finalSpread < this.config.minSpread) {
+        const mid = (quotes.yesAsks[0].price + quotes.yesBids[0].price) / 2;
+        quotes.yesBids[0].price = Math.max(0.01, Math.floor((mid - this.config.minSpread / 2) * 100) / 100);
+        quotes.yesAsks[0].price = Math.min(0.99, Math.ceil((mid + this.config.minSpread / 2) * 100) / 100);
+        quotes.spread = quotes.yesAsks[0].price - quotes.yesBids[0].price;
+
+        // Adjust subsequent levels
+        for (let i = 1; i < quotes.yesBids.length; i++) {
+          quotes.yesBids[i].price = Math.max(0.01, Math.round((quotes.yesBids[0].price - i * this.config.levelSpacing) * 100) / 100);
+        }
+        for (let i = 1; i < quotes.yesAsks.length; i++) {
+          quotes.yesAsks[i].price = Math.min(0.99, Math.round((quotes.yesAsks[0].price + i * this.config.levelSpacing) * 100) / 100);
+        }
+      }
+    }
+
     state.lastSpread = quotes.spread;
     state.lastSkew = quotes.skew;
     state.lastQuoteTime = now;
@@ -2459,24 +2557,34 @@ class MarketMakerBotV2 {
         binaryMessage: binaryMessageBase64,
       };
       
-      const result = await matchingService.processOrder(orderbookOrder);
-      
-      if (result.addedToBook) {
+      // In PERF_TEST_MODE, skip processOrder (which does DB writes + on-chain) and
+      // just add directly to Redis orderbook. This avoids all DB pressure from MM.
+      if (config.perfTestMode) {
+        const addResult = await orderbookService.addOrder(orderbookOrder);
         state.orders.set(order.id, { id: order.id, side, outcome, price, size });
         mmLogger.debug(
-          `[MM] Added to book: ${side} ${outcome} @ $${price.toFixed(2)}`
+          `[MM] Added to book (perf-direct): ${side} ${outcome} @ $${price.toFixed(2)} seq=${addResult.sequenceId}`
         );
       } else {
-        // DEBUG: Log when order was NOT added - this helps diagnose price mismatch
-        mmLogger.warn(
-          `[MM] NOT added to book: ${side} ${outcome} @ $${price.toFixed(2)} ` +
-          `(fills=${result.fills.length}, seq=${result.sequenceId})`
-        );
-      }
-      
-      // Track fills
-      for (const fill of result.fills) {
-        this.onFill({ marketId, side, outcome, size: fill.size });
+        const result = await matchingService.processOrder(orderbookOrder);
+        
+        if (result.addedToBook) {
+          state.orders.set(order.id, { id: order.id, side, outcome, price, size });
+          mmLogger.debug(
+            `[MM] Added to book: ${side} ${outcome} @ $${price.toFixed(2)}`
+          );
+        } else {
+          // DEBUG: Log when order was NOT added - this helps diagnose price mismatch
+          mmLogger.warn(
+            `[MM] NOT added to book: ${side} ${outcome} @ $${price.toFixed(2)} ` +
+            `(fills=${result.fills.length}, seq=${result.sequenceId})`
+          );
+        }
+        
+        // Track fills
+        for (const fill of result.fills) {
+          this.onFill({ marketId, side, outcome, size: fill.size });
+        }
       }
       
       // Log order

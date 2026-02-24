@@ -253,6 +253,163 @@ export async function authRoutes(app: FastifyInstance) {
   });
 
   // ============================================
+  // AGENT AUTH ENDPOINTS (programmatic auth for AI agents / bots)
+  // ============================================
+
+  const agentNonceSchema = z.object({
+    address: z.string().min(32).max(44),
+  });
+
+  const agentVerifySchema = z.object({
+    address: z.string().min(32).max(44),
+    signature: z.string().min(1),
+    message: z.string().min(1),
+    agentName: z.string().max(100).optional(),
+  });
+
+  /**
+   * POST /auth/agent
+   * Get a nonce for programmatic agent authentication.
+   * Same as GET /nonce but accepts POST body (easier for bots).
+   */
+  app.post('/agent', async (request: FastifyRequest, reply: FastifyReply) => {
+    const body = agentNonceSchema.safeParse(request.body);
+
+    if (!body.success) {
+      return reply.code(400).send({
+        error: { code: 'INVALID_REQUEST', message: 'Invalid address', details: body.error.flatten() },
+      });
+    }
+
+    const { address } = body.data;
+
+    if (await userService.isBanned(address)) {
+      return reply.code(403).send({
+        error: { code: 'UNAUTHORIZED', message: 'Account is suspended' },
+      });
+    }
+
+    const nonce = randomBytes(32).toString('hex');
+    const message = `${MESSAGE_PREFIX} ${nonce}`;
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+    await userService.getOrCreate(address);
+    await userService.setNonce(address, nonce, expiresAt);
+
+    logger.debug(`[Agent] Generated nonce for ${address}`);
+
+    return { nonce: message, expiresAt: expiresAt.toISOString() };
+  });
+
+  /**
+   * POST /auth/agent/verify
+   * Verify signature and issue JWT with isAgent flag.
+   * Auto-creates user with isAgent=true on first login.
+   */
+  app.post('/agent/verify', async (request: FastifyRequest, reply: FastifyReply) => {
+    const body = agentVerifySchema.safeParse(request.body);
+
+    if (!body.success) {
+      return reply.code(400).send({
+        error: { code: 'INVALID_REQUEST', message: 'Invalid request body', details: body.error.flatten() },
+      });
+    }
+
+    const { address, signature, message, agentName } = body.data;
+
+    // Get stored nonce
+    const storedNonce = await userService.getNonce(address);
+
+    if (!storedNonce) {
+      return reply.code(401).send({
+        error: { code: 'NONCE_EXPIRED', message: 'No active login session. Call POST /auth/agent first.' },
+      });
+    }
+
+    if (new Date() > storedNonce.expiresAt) {
+      return reply.code(401).send({
+        error: { code: 'NONCE_EXPIRED', message: 'Login session expired. Call POST /auth/agent again.' },
+      });
+    }
+
+    const expectedMessage = `${MESSAGE_PREFIX} ${storedNonce.nonce}`;
+    if (message !== expectedMessage) {
+      return reply.code(401).send({
+        error: { code: 'INVALID_MESSAGE', message: 'Message does not match expected format.' },
+      });
+    }
+
+    // Verify Ed25519 signature
+    try {
+      const publicKey = bs58.decode(address);
+      const signatureBytes = bs58.decode(signature);
+      const messageBytes = new TextEncoder().encode(message);
+
+      const isValid = nacl.sign.detached.verify(messageBytes, signatureBytes, publicKey);
+
+      if (!isValid) {
+        return reply.code(401).send({
+          error: { code: 'INVALID_SIGNATURE', message: 'Signature verification failed.' },
+        });
+      }
+    } catch (err) {
+      logger.error('[Agent] Signature verification error:', err);
+      return reply.code(401).send({
+        error: { code: 'INVALID_SIGNATURE', message: 'Invalid signature format.' },
+      });
+    }
+
+    // Get or create user
+    let user = await userService.findByWallet(address);
+    const isNewAgent = !user;
+
+    if (!user) {
+      user = await userService.getOrCreate(address);
+    }
+
+    if (!user) {
+      return reply.code(500).send({
+        error: { code: 'INTERNAL_ERROR', message: 'Failed to create user.' },
+      });
+    }
+
+    // Mark user as agent (idempotent)
+    if (!user.isAgent) {
+      await userService.update(user.id, {
+        isAgent: true,
+        agentName: agentName || null,
+        feeDiscountPct: 25, // Default 25% fee discount for agents
+      });
+    } else if (agentName && agentName !== user.agentName) {
+      await userService.update(user.id, { agentName });
+    }
+
+    // Clear nonce
+    await userService.clearNonce(address);
+
+    // Issue JWT with isAgent flag
+    const token = app.jwt.sign(
+      { sub: user.id, address, isAgent: true },
+      { expiresIn: '24h' }
+    );
+
+    const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
+
+    logger.info(`[Agent] Authenticated: ${address} (name: ${agentName || 'unnamed'})`);
+
+    return {
+      token,
+      expiresAt,
+      isNewAgent,
+      agent: {
+        address,
+        name: agentName || user.agentName || null,
+        feeDiscountPct: user.feeDiscountPct || 25,
+      },
+    };
+  });
+
+  // ============================================
   // SESSION KEY ENDPOINTS (for one-click trading)
   // ============================================
 

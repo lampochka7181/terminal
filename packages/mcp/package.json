@@ -1,0 +1,27 @@
+{
+  "name": "@degen-terminal/mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for AI agents to trade on Degen Terminal prediction markets",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "degen-terminal-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "@solana/web3.js": "^1.95.0",
+    "@solana/spl-token": "^0.4.0",
+    "tweetnacl": "^1.0.3",
+    "bs58": "^5.0.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "tsx": "^4.7.0",
+    "@types/node": "^20.0.0"
+  }
+}

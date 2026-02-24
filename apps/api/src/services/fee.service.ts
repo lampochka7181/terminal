@@ -163,10 +163,44 @@ export function getFeeConfig() {
   };
 }
 
+/**
+ * Agent fee calculation result (extends standard FeeCalculation)
+ */
+export interface AgentFeeCalculation extends FeeCalculation {
+  baseFee: number;        // Original fee before discount
+  discountPct: number;    // Discount % applied
+  discountAmount: number; // Dollar amount saved
+}
+
+/**
+ * Calculate taker fee with agent discount applied
+ *
+ * @param notionalValue - The dollar value of the order
+ * @param discountPct - Discount percentage (e.g. 25 = 25% off)
+ * @returns AgentFeeCalculation with discounted fee and breakdown
+ */
+export function calculateAgentTakerFee(
+  notionalValue: number,
+  discountPct: number
+): AgentFeeCalculation {
+  const base = calculateTakerFee(notionalValue);
+  const discountAmount = base.fee * (discountPct / 100);
+  const discountedFee = base.fee - discountAmount;
+
+  return {
+    ...base,
+    fee: discountedFee,
+    baseFee: base.fee,
+    discountPct,
+    discountAmount,
+  };
+}
+
 export const feeService = {
   calculateTakerFee,
   calculateMakerFee,
   calculateOrderFee,
+  calculateAgentTakerFee,
   validateOrderMinimum,
   getFeeConfig,
 };

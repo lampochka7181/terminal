@@ -6,7 +6,7 @@ CREATE TYPE order_side AS ENUM ('BID', 'ASK');
 CREATE TYPE order_outcome AS ENUM ('YES', 'NO');
 CREATE TYPE order_type AS ENUM ('LIMIT', 'MARKET', 'IOC', 'FOK');
 CREATE TYPE order_status AS ENUM ('OPEN', 'PARTIAL', 'FILLED', 'CANCELLED');
-CREATE TYPE market_status AS ENUM ('OPEN', 'CLOSED', 'RESOLVED', 'SETTLED');
+CREATE TYPE market_status AS ENUM ('OPEN', 'CLOSED', 'RESOLVED', 'SETTLED', 'SETTLEMENT_FAILED');
 CREATE TYPE tx_status AS ENUM ('PENDING', 'CONFIRMED', 'FAILED');
 CREATE TYPE ledger_type AS ENUM ('DEPOSIT', 'WITHDRAW', 'TRADE', 'SETTLE', 'FEE');
 
@@ -22,7 +22,12 @@ CREATE TABLE users (
     total_trades INTEGER DEFAULT 0,
     fee_tier SMALLINT DEFAULT 0,
     is_banned BOOLEAN DEFAULT FALSE,
-    metadata JSONB
+    metadata JSONB,
+    -- Agent API fields
+    is_agent BOOLEAN DEFAULT FALSE,
+    agent_name VARCHAR(100),
+    fee_discount_pct SMALLINT DEFAULT 0,
+    agent_metadata JSONB
 );
 
 CREATE INDEX idx_users_wallet ON users(wallet_address);
@@ -78,6 +83,7 @@ CREATE TABLE orders (
     encoded_instruction TEXT,
     binary_message TEXT,
     is_mm_order BOOLEAN DEFAULT FALSE NOT NULL,
+    is_agent_order BOOLEAN DEFAULT FALSE NOT NULL,
     -- Leverage fields (for displaying leverage info before margin account exists)
     leverage DECIMAL(4,2) DEFAULT 1,
     margin_amount DECIMAL(20,6),
@@ -370,6 +376,70 @@ SELECT
 FROM users u
 LEFT JOIN positions p ON u.id = p.user_id
 GROUP BY u.id, u.wallet_address;
+
+-- Relayer pool wallets (Phase 6)
+CREATE TABLE relayer_wallets (
+  pubkey TEXT PRIMARY KEY,
+  secret_key TEXT NOT NULL,
+  balance_lamports BIGINT DEFAULT 0,
+  active_jobs INT DEFAULT 0,
+  total_submitted INT DEFAULT 0,
+  total_failed INT DEFAULT 0,
+  consecutive_failures INT DEFAULT 0,
+  status TEXT DEFAULT 'active' CHECK (status IN ('active', 'cooldown', 'disabled')),
+  cooldown_until TIMESTAMPTZ,
+  last_used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_relayer_wallets_selection ON relayer_wallets (status, active_jobs) WHERE status = 'active';
+
+-- Settlement jobs for parallel batch settlement (Phase 7)
+CREATE TABLE settlement_jobs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  market_id UUID NOT NULL,
+  batch_index INT NOT NULL,
+  recipients JSONB NOT NULL,
+  amounts JSONB NOT NULL,
+  proofs JSONB NOT NULL,
+  status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'SUBMITTED', 'COMPLETED', 'FAILED')),
+  relayer_pubkey TEXT,
+  tx_signature TEXT,
+  attempts INT DEFAULT 0,
+  error_message TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  completed_at TIMESTAMPTZ,
+  UNIQUE (market_id, batch_index)
+);
+CREATE INDEX idx_settlement_jobs_market ON settlement_jobs (market_id, status);
+CREATE INDEX idx_settlement_jobs_pending ON settlement_jobs (status) WHERE status = 'PENDING';
+
+-- Chat messages for live chatroom (Supabase Realtime)
+CREATE TABLE chat_messages (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  wallet_address TEXT NOT NULL,
+  message TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE chat_messages ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Anyone can read" ON chat_messages FOR SELECT USING (true);
+CREATE POLICY "Anyone can insert" ON chat_messages FOR INSERT WITH CHECK (true);
+ALTER publication supabase_realtime ADD TABLE chat_messages;
+CREATE INDEX idx_chat_messages_created ON chat_messages (created_at);
+GRANT SELECT, INSERT ON chat_messages TO anon;
+GRANT SELECT, INSERT ON chat_messages TO authenticated;
+
+-- =============================================
+-- MIGRATIONS (for existing databases only)
+-- These are safe to re-run (IF NOT EXISTS).
+-- New installs get these columns from CREATE TABLE above.
+-- =============================================
+
+-- Agent API columns (2026-02-23)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_agent BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS agent_name VARCHAR(100);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS fee_discount_pct SMALLINT DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS agent_metadata JSONB;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_agent_order BOOLEAN DEFAULT FALSE NOT NULL;
 
 -- Grant permissions (for local dev)
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO postgres;

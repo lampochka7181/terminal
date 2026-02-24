@@ -174,4 +174,47 @@ pub enum DegenError {
     
     #[msg("Signature does not match the expected signer")]
     SignerMismatch,
+
+    // =========================================================================
+    // Merkle Settlement Errors (6120-6139)
+    // =========================================================================
+
+    #[msg("Market is not in SETTLING status")]
+    MarketNotSettling,
+
+    #[msg("Merkle root has already been set")]
+    MerkleRootAlreadySet,
+
+    #[msg("Merkle root has not been set")]
+    MerkleRootNotSet,
+
+    #[msg("Invalid merkle root - cannot be zero")]
+    InvalidMerkleRoot,
+
+    #[msg("Invalid merkle proof - verification failed")]
+    InvalidMerkleProof,
+
+    #[msg("Settlement already claimed")]
+    AlreadyClaimed,
+
+    #[msg("Wrong bitmap chunk for this settlement index")]
+    WrongBitmapChunk,
+
+    #[msg("Invalid batch size - must be 1-15 settlements")]
+    InvalidBatchSize,
+
+    #[msg("Invalid account count - must match settlements")]
+    InvalidAccountCount,
+
+    #[msg("Invalid recipient - token account owner mismatch")]
+    InvalidRecipient,
+
+    #[msg("Invalid settlement amount - exceeds open interest")]
+    InvalidSettlementAmount,
+
+    #[msg("Settlement not complete - cannot finalize")]
+    SettlementNotComplete,
+
+    #[msg("Market has open interest - cannot close directly, use merkle settlement")]
+    MarketHasOpenInterest,
 }
