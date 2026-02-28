@@ -173,8 +173,9 @@ export class WebSocketService {
   private ws: WebSocket | null = null;
   private url: string;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
+  private maxReconnectAttempts = Infinity;  // Never give up reconnecting
   private reconnectDelay = 1000;
+  private maxReconnectDelay = 30000;       // Cap backoff at 30s
   private pingInterval: NodeJS.Timeout | null = null;
   private messageHandlers: Set<MessageHandler> = new Set();
   private connectHandlers: Set<ConnectionHandler> = new Set();
@@ -186,6 +187,17 @@ export class WebSocketService {
 
   constructor(url: string = WS_URL) {
     this.url = url;
+
+    // Re-connect when tab becomes visible again (browser may have killed the WS)
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && this.ws?.readyState !== WebSocket.OPEN) {
+          console.log('[WS] Tab visible — reconnecting');
+          this.reconnectAttempts = 0; // Reset backoff
+          this.connect().catch(console.error);
+        }
+      });
+    }
   }
 
   connect(): Promise<void> {
@@ -297,13 +309,11 @@ export class WebSocketService {
   }
 
   private attemptReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('[WS] Max reconnect attempts reached');
-      return;
-    }
-
     this.reconnectAttempts++;
-    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+    const delay = Math.min(
+      this.reconnectDelay * Math.pow(2, Math.min(this.reconnectAttempts - 1, 5)),
+      this.maxReconnectDelay,
+    );
     console.log(`[WS] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
 
     setTimeout(() => {

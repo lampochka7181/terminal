@@ -15,6 +15,7 @@ const CANDLE_SEC = 5;
 const VISIBLE_WINDOW = 500; // seconds — matches Lite chart's WINDOW_SEC
 const ROUND_SEC = 5 * 60;
 const RIGHT_PAD_BARS = 8; // bars of padding past latest candle
+const STALE_THRESHOLD_MS = 15_000; // re-fetch if no WS price for 15s
 
 function formatLocalTime(epochSec: number): string {
   const d = new Date(epochSec * 1000);
@@ -62,6 +63,12 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
 
   const rafRef = useRef(0);
   const cleanupRef = useRef<(() => void) | null>(null);
+
+  // Refs to expose setup() closure internals for cross-effect coordination
+  const candlesRef = useRef<{ time: number; open: number; high: number; low: number; close: number }[]>([]);
+  const extendFnRef = useRef<((price: number) => void) | null>(null);
+  const pushFnRef = useRef<(() => void) | null>(null);
+  const lastWsPriceRef = useRef(Date.now());
 
   const updateOverlays = useCallback(() => {
     const chart = chartRef.current;
@@ -223,6 +230,7 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
     // Auto-resets after 10s of inactivity so the chart resumes following price.
     let userInteracted = false;
     let interactTimer: ReturnType<typeof setTimeout> | null = null;
+    let marketTransitionTimer: ReturnType<typeof setTimeout> | null = null;
     const markInteracted = () => {
       userInteracted = true;
       if (interactTimer) clearTimeout(interactTimer);
@@ -233,10 +241,12 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
 
     // Mutable candle array — only real data (API + WS), no padding
     const candles: { time: number; open: number; high: number; low: number; close: number }[] = [];
+    candlesRef.current = candles;
 
     function pushToChart() {
       series.setData(candles as any);
     }
+    pushFnRef.current = pushToChart;
 
     function extendTimeAxis(price: number) {
       const { roundStart, roundEnd } = roundTimesRef.current;
@@ -257,6 +267,7 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
       pts.sort((a, b) => (a.time as number) - (b.time as number));
       helperSeries.setData(pts as any);
     }
+    extendFnRef.current = extendTimeAxis;
 
     function updateCurrentPrice(price: number) {
       if (currentPriceLine) {
@@ -435,6 +446,7 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
         }
 
         if (!price || price <= 0) return;
+        lastWsPriceRef.current = Date.now();
 
         const now = Math.floor(Date.now() / 1000);
         const bucket = now - (now % CANDLE_SEC);
@@ -533,7 +545,9 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
             strikeLineRef.current = null;
           }
         }
-        setTimeout(() => {
+        if (marketTransitionTimer) clearTimeout(marketTransitionTimer);
+        marketTransitionTimer = setTimeout(() => {
+          if (cancelled) return;
           computeRoundTimes();
           userInteracted = false;
           const { roundStart: rs, roundEnd: re } = roundTimesRef.current;
@@ -543,10 +557,12 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
             anchoredRange = { from: rs - padB, to: re + padA };
             const lastP = candles.length > 0 ? candles[candles.length - 1].close : 0;
             if (lastP > 0) extendTimeAxis(lastP);
-            chart.timeScale().setVisibleRange({
-              from: anchoredRange.from as any,
-              to: anchoredRange.to as any,
-            });
+            try {
+              chart.timeScale().setVisibleRange({
+                from: anchoredRange.from as any,
+                to: anchoredRange.to as any,
+              });
+            } catch { /* chart not ready */ }
           }
           updateOverlays();
         }, 500);
@@ -567,8 +583,12 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
       container.removeEventListener('mousedown', markInteracted);
       container.removeEventListener('wheel', markInteracted);
       if (interactTimer) clearTimeout(interactTimer);
+      if (marketTransitionTimer) clearTimeout(marketTransitionTimer);
       cancelAnimationFrame(rafRef.current);
       chartCoordsRef.current = null;
+      extendFnRef.current = null;
+      pushFnRef.current = null;
+      candlesRef.current = [];
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -595,7 +615,8 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
     }
   }, [strikePrice]);
 
-  // When market expiry changes (new round), recalculate round times and re-anchor the view.
+  // When market expiry changes (new round), recalculate round times, re-fetch candles,
+  // extend the helper series, and re-anchor the visible range.
   // Skip the initial load — init() already handles the first framing.
   useEffect(() => {
     if (!marketExpiry || !chartRef.current || !seriesRef.current) return;
@@ -619,13 +640,129 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
     const from = roundTimesRef.current.roundStart - padB;
     const to = roundTimesRef.current.roundEnd + padA;
 
+    // Extend helper series so the new time window has data points for the time axis
+    const lastP = candlesRef.current.length > 0
+      ? candlesRef.current[candlesRef.current.length - 1].close
+      : 0;
+    if (lastP > 0 && extendFnRef.current) {
+      extendFnRef.current(lastP);
+    }
+
     try {
       chartRef.current.timeScale().setVisibleRange({ from: from as any, to: to as any });
       initExpiryRef.current = marketExpiry;
     } catch {
       // Chart series not yet populated — init() will set the range once data loads
     }
+
+    // Re-fetch candles to fill the new time window (fire-and-forget)
+    let stale = false;
+    api.getCandles({
+      asset: selectedAssetRef.current as any,
+      intervalSec: CANDLE_SEC,
+      lookbackSec: 600,
+    }).then((result) => {
+      if (stale || !result.candles?.length) return;
+      const candles = candlesRef.current;
+      const seen = new Set(candles.map(c => c.time));
+      let added = 0;
+      for (const c of result.candles) {
+        if (c.open <= 0 || c.close <= 0 || c.high <= 0 || c.low <= 0) continue;
+        if (seen.has(c.time)) continue;
+        seen.add(c.time);
+        candles.push({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close });
+        added++;
+      }
+      if (added > 0) {
+        candles.sort((a, b) => a.time - b.time);
+        // Dedupe
+        for (let i = candles.length - 1; i > 0; i--) {
+          if (candles[i].time === candles[i - 1].time) candles.splice(i, 1);
+        }
+        if (candles.length > 300) candles.splice(0, candles.length - 300);
+        pushFnRef.current?.();
+        console.log(`[Chart] Re-fetched ${added} new candles for market transition`);
+      }
+    }).catch(() => { /* ignore */ });
+
+    return () => { stale = true; };
   }, [marketExpiry]);
+
+  // Watchdog: detect stale WS data and re-fetch candles + re-anchor chart.
+  // Also handles tab visibility changes — when user returns to the tab after
+  // it was backgrounded, the WS may have dropped so we re-fetch and re-anchor.
+  useEffect(() => {
+    let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+
+    function recover() {
+      if (!chartRef.current || !seriesRef.current) return;
+      console.log('[Chart] Recovering — re-fetching candles');
+
+      api.getCandles({
+        asset: selectedAssetRef.current as any,
+        intervalSec: CANDLE_SEC,
+        lookbackSec: 600,
+      }).then((result) => {
+        if (!result.candles?.length || !chartRef.current) return;
+        const candles = candlesRef.current;
+        const seen = new Set(candles.map(c => c.time));
+        let added = 0;
+        for (const c of result.candles) {
+          if (c.open <= 0 || c.close <= 0 || c.high <= 0 || c.low <= 0) continue;
+          if (seen.has(c.time)) continue;
+          seen.add(c.time);
+          candles.push({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close });
+          added++;
+        }
+        if (added > 0 || candles.length === 0) {
+          candles.sort((a, b) => a.time - b.time);
+          for (let i = candles.length - 1; i > 0; i--) {
+            if (candles[i].time === candles[i - 1].time) candles.splice(i, 1);
+          }
+          if (candles.length > 300) candles.splice(0, candles.length - 300);
+          pushFnRef.current?.();
+        }
+
+        // Re-anchor visible range to current round
+        const { roundStart: rs, roundEnd: re } = roundTimesRef.current;
+        if (rs && re && chartRef.current) {
+          const lastP = candles.length > 0 ? candles[candles.length - 1].close : 0;
+          if (lastP > 0 && extendFnRef.current) extendFnRef.current(lastP);
+          const padA = Math.round((VISIBLE_WINDOW - ROUND_SEC) * 0.25);
+          const padB = VISIBLE_WINDOW - ROUND_SEC - padA;
+          try {
+            chartRef.current.timeScale().setVisibleRange({
+              from: (rs - padB) as any,
+              to: (re + padA) as any,
+            });
+          } catch { /* chart not ready */ }
+        }
+        lastWsPriceRef.current = Date.now(); // reset watchdog
+      }).catch(() => { /* ignore */ });
+    }
+
+    // Periodic watchdog: if no WS price for 15s, re-fetch
+    watchdogTimer = setInterval(() => {
+      if (Date.now() - lastWsPriceRef.current > STALE_THRESHOLD_MS) {
+        recover();
+      }
+    }, STALE_THRESHOLD_MS);
+
+    // Tab visibility: re-fetch when user returns
+    function onVisibility() {
+      if (document.visibilityState === 'visible') {
+        // Small delay to let WS reconnect first
+        setTimeout(recover, 1000);
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      if (watchdogTimer) clearInterval(watchdogTimer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const tickSize = useChartToolbarStore((s) => s.tickSize);
   tickSizeRef.current = tickSize;
