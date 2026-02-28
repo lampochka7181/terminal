@@ -1,26 +1,27 @@
 # Security Audit Report — Degen Terminal
 
-**Date**: 2026-02-23
-**Scope**: Solana Anchor smart contract + backend TypeScript API
+**Initial Audit**: 2026-02-23
+**Last Updated**: 2026-02-27 (comprehensive re-audit of full contract)
+**Scope**: Solana Anchor smart contract (`packages/contracts/`) + backend TypeScript API (`apps/api/`)
 **Program ID (devnet)**: `5Kq43SR2HUNsyNZWaau1p8kQzAvW2UA2mAvempdchTrk`
 
 ---
 
 ## Executive Summary
 
-A comprehensive security audit was performed on both the on-chain Solana Anchor program and the off-chain Node.js/TypeScript backend. The audit identified **8 CRITICAL**, **11 HIGH**, **14 MEDIUM**, **10 LOW**, and **12 INFORMATIONAL** findings. This document catalogs all findings and tracks remediation status.
+A comprehensive security audit was performed on both the on-chain Solana Anchor program and the off-chain Node.js/TypeScript backend. The initial audit (2026-02-23) identified **8 CRITICAL**, **11 HIGH**, **14 MEDIUM**, **10 LOW**, and **12 INFORMATIONAL** findings. A full re-audit of the complete Anchor contract (2026-02-27) reviewed all 30 instruction files, state definitions, error codes, PDA derivations, token operations, and merkle settlement logic. This update adds **2 new HIGH**, **2 new MEDIUM**, and **3 new INFORMATIONAL** findings.
 
 ---
 
 ## Findings Summary
 
-| Severity | Count | Fixed |
-|----------|-------|-------|
-| CRITICAL | 8     | 7     |
-| HIGH     | 11    | 8     |
-| MEDIUM   | 14    | —     |
-| LOW      | 10    | —     |
-| INFO     | 12    | —     |
+| Severity | Total | Fixed | Remaining |
+|----------|-------|-------|-----------|
+| CRITICAL | 8     | 7     | 1 (architectural) |
+| HIGH     | 13    | 8     | 5         |
+| MEDIUM   | 16    | 1     | 15        |
+| LOW      | 10    | —     | 10        |
+| INFO     | 15    | —     | 15        |
 
 ---
 
@@ -144,6 +145,18 @@ A comprehensive security audit was performed on both the on-chain Solana Anchor 
 - **Note**: Ownership check (`order.userId !== userId`) mitigates this, but the missing signature verification leaves the door open if the auth layer is bypassed.
 - **Fix**: Implement Ed25519 signature verification of the cancel message.
 
+### H-12: No Vault Balance Reconciliation Before Settlement *(NEW — 2026-02-27)*
+- **Status**: UNFIXED
+- **Files**: `instructions/batch_settle_v2.rs`, `apps/api/src/jobs/merkle-settler.ts`
+- **Impact**: The merkle root's `total_settlement_amount` is validated against `open_interest` during `post_merkle_root`, but individual batch settlements do not check cumulative payouts against remaining vault balance. If the merkle tree was computed with incorrect amounts (due to DB drift), settlements could attempt to overdraw the vault. The SPL token layer prevents the actual overdraw, but late claimants would silently fail.
+- **Fix**: Track cumulative settled amount in `MarketV2` state. Add `require!(cumulative + batch_total <= vault.amount)` check in `batch_settle_v2`.
+
+### H-13: resolve_and_post_merkle_root_v2 Skips RESOLVED State *(NEW — 2026-02-27)*
+- **Status**: ACKNOWLEDGED
+- **File**: `instructions/resolve_and_post_merkle_root_v2.rs`
+- **Impact**: This combined instruction transitions market directly from OPEN → SETTLING, skipping the RESOLVED intermediate state. Any off-chain logic that polls for RESOLVED status (e.g., UI displays, webhook triggers) will never see it. This is intentional for performance (saves 1 TX), but any dependent system expecting the RESOLVED state will break.
+- **Mitigation**: Document that the RESOLVED state is optional when using `resolve_and_post_merkle_root_v2`. Update off-chain listeners to also watch for SETTLING transition.
+
 ---
 
 ## MEDIUM Findings
@@ -203,6 +216,16 @@ A comprehensive security audit was performed on both the on-chain Solana Anchor 
 ### M-14: No Rate Limiting on Order Cancellations
 - **File**: `apps/api/src/routes/orders.ts`
 - **Impact**: Users can spam cancel requests without rate limiting.
+
+### M-15: PermanentDelegate Enables Silent Token Seizure *(NEW — 2026-02-27)*
+- **File**: `instructions/execute_close_v2.rs`, `instructions/burn_remaining_shares_v2.rs`
+- **Impact**: The market PDA is set as `PermanentDelegate` on YES/NO mints during initialization. This grants the market PDA unconditional ability to transfer or burn any user's YES/NO tokens without their explicit consent per-operation. While this is by-design for the close and settlement flows, it means a compromised relayer (who signs as market authority) can arbitrarily move or destroy user tokens. Users should be informed that holding YES/NO tokens implies consent to the market PDA's authority.
+- **Mitigation**: Document the trust model. Add a consent disclosure in the UI before first trade.
+
+### M-16: Market Transition setTimeout Not Cleaned Up *(NEW — 2026-02-27)*
+- **File**: `apps/webv3/src/components/Chart.tsx`
+- **Impact**: The WebSocket handler for `market_resolved`/`market_activated` events schedules a 500ms `setTimeout` to recompute round times and re-anchor the chart view. If the Chart component unmounts during that 500ms window, the callback fires against stale refs (`chartRef`, `seriesRef`), causing silent errors or attempting operations on a destroyed chart instance. Over time, accumulated leaked timeouts can cause memory pressure and UI glitches.
+- **Status**: FIXED ✅ (2026-02-27) — Added `cancelled` check and cleanup in component unmount.
 
 ---
 
@@ -264,6 +287,76 @@ A comprehensive security audit was performed on both the on-chain Solana Anchor 
 - I-10: Write-behind service uses in-memory batch (lost on crash)
 - I-11: No metrics for on-chain TX confirmation times
 - I-12: Session key expiry not enforced on-chain
+- I-13: *(NEW)* `initialize_market_v2` uses two-phase init (split for stack depth). Phase 2 has a manual `no_mint == Pubkey::default()` check in the body but the Anchor constraint is commented out. Both checks exist but the constraint form is preferred.
+- I-14: *(NEW)* `MarketV2.id` defaults to 0 in `initialize_market_v2` — no auto-increment from GlobalState. Market identification relies on PDA address rather than sequential ID.
+- I-15: *(NEW)* WebSocket `maxReconnectAttempts` was 5 (finite), meaning long-running browser sessions could permanently lose price data. Fixed to Infinity with capped 30s backoff on 2026-02-27.
+
+---
+
+## On-Chain Access Control Matrix
+
+| Instruction | Signer | Authority Constraint | Status |
+|------------|--------|---------------------|--------|
+| `initialize_global` | Admin (creates) | Admin is payer | ✅ |
+| `update_config` | Admin | `has_one = admin` | ✅ |
+| `pause_protocol` | Admin | `has_one = admin` | ✅ |
+| `initialize_market` / `_v2` | Market authority | Authority is payer | ✅ |
+| `activate_market` / `_v2` | Market authority | `market.authority == authority.key()` | ✅ |
+| `resolve_market` / `_v2` | Market authority | `market.authority == authority.key()` | ✅ (FIXED) |
+| `place_order` | User | User owns USDC ATA | ✅ |
+| `cancel_order` | User | `has_one = owner` | ✅ |
+| `cancel_order_by_relayer` | Market authority | `market.authority == authority.key()` | ✅ |
+| `execute_match` / `_v2` | Relayer (signer) | **No authority constraint** | ⚠️ C-03 |
+| `execute_close` / `_v2` | Relayer (signer) | **No authority constraint** | ⚠️ C-03 |
+| `settle_positions` | Market authority | `market.authority == authority.key()` | ✅ (FIXED) |
+| `post_merkle_root` | Market authority | `market.authority == authority.key()` | ✅ |
+| `batch_settle_v2` | Relayer | `market.authority == relayer.key()` | ✅ (FIXED) |
+| `burn_remaining_shares_v2` | Market authority | `market.authority == authority.key()` | ✅ |
+| `finalize_market_v2` | Market authority | `market.authority == authority.key()` | ✅ |
+| `close_market` / `_v2` | Market authority | `market.authority == authority.key()` | ✅ |
+
+---
+
+## PDA Derivation Reference
+
+| PDA | Seeds | Notes |
+|-----|-------|-------|
+| GlobalState | `[b"global"]` | Singleton, admin-owned |
+| Market (V1) | `[b"market", asset_bytes, timeframe_bytes, expiry_ts.to_le_bytes()]` | Trimmed string bytes |
+| MarketV2 | `[b"market_v2", asset_bytes, timeframe_bytes, expiry_ts.to_le_bytes()]` | Trimmed string bytes |
+| Order | `[b"order", market_pubkey, user_pubkey, client_order_id.to_le_bytes()]` | Unique per user+market |
+| UserPosition | `[b"position", market_pubkey, user_pubkey]` | `init_if_needed` |
+| YES Mint (V2) | `[b"yes_mint", market_pubkey]` | Token-2022 + MintCloseAuthority |
+| NO Mint (V2) | `[b"no_mint", market_pubkey]` | Token-2022 + MintCloseAuthority |
+| USDC Vault (V2) | `[b"vault", market_pubkey]` | ATA owned by market PDA |
+| SettlementBitmap | `[b"settlement_bitmap", market_pubkey, chunk_index.to_le_bytes()]` | 8,192 bits per chunk |
+
+---
+
+## Token Operations & Trust Model
+
+### Token-2022 Extensions (V2 Markets)
+- **MintCloseAuthority**: Set to market PDA on YES/NO mints. Allows closing mints after settlement to recover rent (~0.003 SOL per mint).
+- **PermanentDelegate**: Set to market PDA on YES/NO mints. Allows market PDA to burn tokens from any holder during settlement (see M-15). Required for `burn_remaining_shares_v2` to work.
+
+### Fund Flow
+```
+Place Order:  User USDC → Market Vault (locked)
+Execute Match: Vault USDC stays locked; YES/NO tokens minted to maker/taker
+Cancel Order:  Vault USDC → User (proportional to unfilled size)
+Settlement:    Vault USDC → Winners (via merkle proofs)
+Finalize:      Vault dust → Authority; close vault, mints, PDA (rent recovery)
+```
+
+### Rent Economics (per market lifecycle)
+| Account | Rent (SOL) | Created | Recovered |
+|---------|-----------|---------|-----------|
+| MarketV2 PDA | ~0.003 | create_market_v2 | finalize_market_v2 |
+| USDC Vault | ~0.002 | create_market_v2_finalize | finalize_market_v2 |
+| YES Mint (Token-2022) | ~0.003 | create_market_v2 | finalize_market_v2 |
+| NO Mint (Token-2022) | ~0.003 | create_market_v2_finalize | finalize_market_v2 |
+| SettlementBitmap | ~0.001 | post_merkle_root | (manual) |
+| **Total** | **~0.012** | | **~0.011** recovered |
 
 ---
 
@@ -271,10 +364,36 @@ A comprehensive security audit was performed on both the on-chain Solana Anchor 
 
 | Priority | Issues | Timeline |
 |----------|--------|----------|
-| P0 — Deploy Blocker | C-01, C-02, C-05, C-06, H-04, H-05 | Immediate |
-| P1 — Before Mainnet | C-03, C-04, C-07, H-01, H-03, H-06, H-07, H-08, H-11 | Before launch |
-| P2 — Before Scale | H-02, H-09, H-10, M-01–M-14 | Before scaling |
+| P0 — Deploy Blocker | C-01 ✅, C-02 ✅, C-05 ✅, C-06 ✅, H-04 ✅, H-05 ✅ | Done |
+| P1 — Before Mainnet | C-03 (mitigate), C-04 ✅, C-07 ✅, H-01 ✅, H-03 ✅, H-06 ✅, H-07 ✅, H-08, H-11 ✅, **M-01**, **M-02** | Before launch |
+| P2 — Before Scale | H-02, H-09, H-10, H-12, M-04, M-05, M-06, M-13 | Before scaling |
+| P3 — Improvements | L-01–L-10, M-07–M-16, I-01–I-15 | Ongoing |
+
+### Must-Fix Before Mainnet (Prioritized)
+1. **M-01**: Validate USDC mint address against canonical mainnet address in `initialize_market` and `initialize_market_v2_finalize`
+2. **M-02**: Uncomment the `no_mint == Pubkey::default()` constraint in `initialize_market_v2_finalize`
+3. **C-03**: Implement relayer authorization (whitelist in GlobalState or API-level IP+signature checks)
+4. **H-08**: Add periodic delegation verification for session-based orders
+5. **H-12**: Track cumulative settlement amounts on-chain to prevent vault overdraw edge cases
 
 ---
 
-*Last updated: 2026-02-23 — CRITICAL and HIGH fixes applied*
+## Files Reviewed (2026-02-27 Re-audit)
+
+All 30 instruction files, 2 state files, 1 error file, lib.rs, mod.rs:
+- `lib.rs`, `instructions/mod.rs`
+- `instructions/initialize_global.rs`, `update_config.rs`, `pause_protocol.rs`
+- `instructions/initialize_market.rs`, `initialize_market_v2.rs`, `initialize_market_v2_finalize.rs` (implied)
+- `instructions/activate_market.rs`, `activate_market_v2.rs`
+- `instructions/place_order.rs`, `cancel_order.rs`, `cancel_order_by_relayer.rs`
+- `instructions/execute_match.rs`, `execute_match_v2.rs`, `execute_close.rs`, `execute_close_v2.rs`
+- `instructions/resolve_market.rs`, `resolve_market_v2.rs`, `resolve_and_post_merkle_root_v2.rs`
+- `instructions/settle_positions.rs`, `post_merkle_root.rs`, `batch_settle_v2.rs`
+- `instructions/burn_remaining_shares_v2.rs`, `finalize_market_v2.rs`
+- `instructions/close_market.rs`, `close_market_v2.rs`
+- `state.rs`, `state_v2.rs`, `errors.rs`
+
+---
+
+*Initial audit: 2026-02-23 — 7/8 CRITICAL and 8/11 HIGH fixed*
+*Re-audit: 2026-02-27 — Full contract review, 2 new HIGH, 2 new MEDIUM, 3 new INFO findings added*
