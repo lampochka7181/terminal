@@ -139,12 +139,8 @@ pub const MIN_TAKER_FEE: u64 = 20_000;  // $0.02
 pub struct GlobalState {
     /// Admin authority (can pause, update fees)
     pub admin: Pubkey,
-    /// Pending admin for two-step transfer (L-03)
-    pub pending_admin: Pubkey,
     /// Fee recipient treasury
     pub fee_recipient: Pubkey,
-    /// Canonical USDC mint address — all markets must use this mint (M-01)
-    pub usdc_mint: Pubkey,
     /// Maker fee in basis points (0 = 0.00%) - currently unused
     pub maker_fee_bps: u16,
     /// Taker fee in basis points (10 = 0.10%) - used as max fee cap for validation
@@ -168,9 +164,7 @@ impl GlobalState {
 
     pub const SIZE: usize = 8 +     // discriminator
         32 +                        // admin
-        32 +                        // pending_admin
         32 +                        // fee_recipient
-        32 +                        // usdc_mint
         2 +                         // maker_fee_bps
         2 +                         // taker_fee_bps
         1 +                         // paused

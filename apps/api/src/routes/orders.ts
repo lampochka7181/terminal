@@ -212,13 +212,13 @@ export async function orderRoutes(app: FastifyInstance) {
     }
 
     // Reject orders too close to market expiry — they'll likely fail on-chain with MarketNotOpen
-    const EXPIRY_BUFFER_MS = 30_000; // 30 seconds
+    const EXPIRY_BUFFER_MS = 3_000; // 3 seconds
     if (market.expiryAt) {
       const expiryMs = new Date(market.expiryAt).getTime();
       const remainingMs = expiryMs - Date.now();
       if (remainingMs < EXPIRY_BUFFER_MS) {
         return reply.code(409).send({
-          error: { code: 'MARKET_EXPIRING', message: `Market closes in ${Math.round(remainingMs / 1000)}s — orders cannot be placed within 30 seconds of expiry` },
+          error: { code: 'MARKET_EXPIRING', message: `Market closes in ${Math.round(remainingMs / 1000)}s — orders cannot be placed within ${EXPIRY_BUFFER_MS / 1000} seconds of expiry` },
         });
       }
     }

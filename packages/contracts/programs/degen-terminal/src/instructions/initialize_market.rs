@@ -37,10 +37,7 @@ pub struct InitializeMarket<'info> {
     )]
     pub vault: Account<'info, TokenAccount>,
     
-    /// USDC mint — validated against GlobalState.usdc_mint
-    #[account(
-        constraint = usdc_mint.key() == global_state.usdc_mint @ DegenError::InvalidMarketParams
-    )]
+    /// USDC mint
     pub usdc_mint: Account<'info, Mint>,
     
     #[account(mut)]

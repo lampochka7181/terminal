@@ -58,80 +58,7 @@ pub fn update_config(
     Ok(())
 }
 
-// L-03: Two-step admin transfer — propose step
-#[derive(Accounts)]
-pub struct ProposeAdminTransfer<'info> {
-    #[account(
-        mut,
-        seeds = [GlobalState::SEED],
-        bump = global_state.bump,
-        has_one = admin @ DegenError::Unauthorized
-    )]
-    pub global_state: Account<'info, GlobalState>,
-
-    pub admin: Signer<'info>,
-
-    /// CHECK: New admin address (will need to accept)
-    pub new_admin: AccountInfo<'info>,
-}
-
-pub fn propose_admin_transfer(ctx: Context<ProposeAdminTransfer>) -> Result<()> {
-    let global_state = &mut ctx.accounts.global_state;
-    global_state.pending_admin = ctx.accounts.new_admin.key();
-
-    msg!(
-        "Admin transfer proposed: {} -> {} (pending acceptance)",
-        global_state.admin, ctx.accounts.new_admin.key()
-    );
-
-    emit!(ConfigUpdated {
-        admin: ctx.accounts.admin.key(),
-        field: "pending_admin".to_string(),
-        old_value: Pubkey::default().to_string(),
-        new_value: ctx.accounts.new_admin.key().to_string(),
-    });
-
-    Ok(())
-}
-
-// L-03: Two-step admin transfer — accept step
-#[derive(Accounts)]
-pub struct AcceptAdminTransfer<'info> {
-    #[account(
-        mut,
-        seeds = [GlobalState::SEED],
-        bump = global_state.bump,
-        constraint = global_state.pending_admin == new_admin.key() @ DegenError::Unauthorized
-    )]
-    pub global_state: Account<'info, GlobalState>,
-
-    pub new_admin: Signer<'info>,
-}
-
-pub fn accept_admin_transfer(ctx: Context<AcceptAdminTransfer>) -> Result<()> {
-    let global_state = &mut ctx.accounts.global_state;
-    let old_admin = global_state.admin;
-
-    global_state.admin = ctx.accounts.new_admin.key();
-    global_state.pending_admin = Pubkey::default();
-
-    msg!(
-        "Admin transfer accepted: {} -> {}",
-        old_admin, ctx.accounts.new_admin.key()
-    );
-
-    emit!(ConfigUpdated {
-        admin: ctx.accounts.new_admin.key(),
-        field: "admin".to_string(),
-        old_value: old_admin.to_string(),
-        new_value: ctx.accounts.new_admin.key().to_string(),
-    });
-
-    Ok(())
-}
-
-// Keep legacy single-step transfer for emergency use but require pending_admin == default
-// to prevent accidental use when two-step is intended
+/// Transfer admin authority to a new address (direct transfer)
 #[derive(Accounts)]
 pub struct TransferAdmin<'info> {
     #[account(
@@ -153,12 +80,18 @@ pub fn transfer_admin(ctx: Context<TransferAdmin>) -> Result<()> {
     let old_admin = global_state.admin;
 
     global_state.admin = ctx.accounts.new_admin.key();
-    global_state.pending_admin = Pubkey::default();
 
     msg!(
-        "Admin transferred (direct): {} -> {}",
+        "Admin transferred: {} -> {}",
         old_admin, ctx.accounts.new_admin.key()
     );
+
+    emit!(ConfigUpdated {
+        admin: ctx.accounts.new_admin.key(),
+        field: "admin".to_string(),
+        old_value: old_admin.to_string(),
+        new_value: ctx.accounts.new_admin.key().to_string(),
+    });
 
     Ok(())
 }

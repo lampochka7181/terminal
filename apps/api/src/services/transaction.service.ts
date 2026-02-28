@@ -688,6 +688,17 @@ class TransactionService {
     if (message.includes('insufficient lamports')) {
       return 'INSUFFICIENT_LAMPORTS';
     }
+    // Anchor framework errors (3000-3012) — account deserialization, constraint violations, etc.
+    // Error format in preflight: {"InstructionError":[N,{"Custom":3003}]}
+    if (message.includes('accountdidnotdeserialize') || message.includes('"custom":3003') || message.includes('0xbbb')) {
+      return 'ACCOUNT_DESERIALIZATION';
+    }
+    if (message.includes('accountdidnotserialize') || message.includes('"custom":3004') || message.includes('0xbbc')) {
+      return 'ACCOUNT_SERIALIZATION';
+    }
+    if (message.includes('constraintviolation') || message.includes('a raw constraint was violated') || message.includes('"custom":2000')) {
+      return 'CONSTRAINT_VIOLATION';
+    }
 
     return null; // Retryable error
   }

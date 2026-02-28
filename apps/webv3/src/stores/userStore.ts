@@ -5,7 +5,7 @@
 
 import { create } from 'zustand';
 import { api, type UserBalance, type Position, type Order, type Settlement, type UserTransaction, ApiError } from '@/lib/api';
-import { getWebSocket, type UserFillUpdate, type UserSettlementUpdate, type UserLiquidationUpdate } from '@/lib/websocket';
+import { getWebSocket, type UserFillUpdate, type UserSettlementUpdate, type UserLiquidationUpdate, type UserTradeFailedUpdate } from '@/lib/websocket';
 
 // Debounce helper for fetchAll to prevent request floods
 let fetchAllDebounceTimer: NodeJS.Timeout | null = null;
@@ -473,6 +473,16 @@ export function subscribeToUserUpdates(): () => void {
     } else if (message.event === 'settlement') {
       const settlementMessage = message as UserSettlementUpdate;
       store.handleSettlement(settlementMessage.data);
+    } else if (message.event === 'trade_failed') {
+      // On-chain match failed — position was reversed in DB, re-fetch everything
+      const failedMessage = message as UserTradeFailedUpdate;
+      console.warn('[UserStore] Trade failed on-chain, removing phantom position:', failedMessage.data);
+      // Immediately remove the phantom position for this market
+      if (failedMessage.data.marketAddress) {
+        store.removePosition(failedMessage.data.marketAddress);
+      }
+      // Re-fetch positions, transactions, and balance to sync with DB
+      store.fetchAllImmediate();
     } else if (message.event === 'liquidation') {
       // Position was liquidated - refresh positions to get updated state
       const liquidationMessage = message as UserLiquidationUpdate;

@@ -17,6 +17,7 @@ import {
   broadcastMarketResolved,
   broadcastUserFill,
   broadcastUserSettlement,
+  broadcastTradeFailure,
 } from '../../lib/broadcasts.js';
 import type { WsEventsJobData } from '../queues.js';
 
@@ -68,6 +69,14 @@ async function processJob(job: Job<WsEventsJobData>): Promise<void> {
 
       case 'user_settlement':
         broadcastUserSettlement(data.userId, data.settlement);
+        break;
+
+      case 'trade_failed':
+        broadcastTradeFailure(data.userId, {
+          tradeId: data.tradeId,
+          marketAddress: data.marketAddress,
+          errorCode: data.errorCode,
+        });
         break;
 
       default:

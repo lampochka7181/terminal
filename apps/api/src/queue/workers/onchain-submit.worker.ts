@@ -235,7 +235,8 @@ async function processJob(job: Job<OnchainSubmitJobData>): Promise<void> {
     // Check if this is a permanent error that should not be retried
     const permanentCodes = ['INSUFFICIENT_FUNDS', 'INSUFFICIENT_SHARES', 'FEE_TOO_LOW',
       'POSITION_LIMIT', 'MARKET_CLOSED', 'INVALID_SIGNATURE', 'SELF_TRADE', 'ACCOUNT_NOT_FOUND',
-      'INSUFFICIENT_LAMPORTS', 'MAX_RETRIES'];
+      'INSUFFICIENT_LAMPORTS', 'MAX_RETRIES', 'ACCOUNT_DESERIALIZATION', 'ACCOUNT_SERIALIZATION',
+      'CONSTRAINT_VIOLATION'];
 
     if (result.errorCode && permanentCodes.includes(result.errorCode)) {
       logger.warn(`[QUEUE:onchain] Permanent failure for ${idempotencyKey}: ${result.errorCode}`);

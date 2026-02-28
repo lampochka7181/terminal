@@ -23,7 +23,8 @@ export type WsServerMessage =
   | WsPriceUpdate
   | WsMarketResolved
   | WsSettlement
-  | WsFillUpdate;
+  | WsFillUpdate
+  | WsTradeFailedUpdate;
 
 export interface WsOrderbookUpdate {
   channel: 'orderbook';
@@ -92,6 +93,16 @@ export interface WsFillUpdate {
     remainingSize: number;
     status: string;
     timestamp: number;
+  };
+}
+
+export interface WsTradeFailedUpdate {
+  channel: 'user';
+  event: 'trade_failed';
+  data: {
+    tradeId: string;
+    marketAddress: string;
+    errorCode: string;
   };
 }
 

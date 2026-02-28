@@ -55,7 +55,7 @@ export default function RightSidebar() {
     if (!market) return;
 
     const prices = outcome === 'yes' ? yesPrices : noPrices;
-    const price = orderType === 'market' ? prices.bestAsk || 0.50 : prices.bestAsk || 0.50;
+    const price = orderType === 'limit' ? parseFloat(limitPrice) : (prices.bestAsk || 0.50);
     const isLeveraged = leverage > 1;
     const marginAmount = isLeveraged ? amount / leverage : undefined;
     const size = amount / price;
@@ -80,7 +80,7 @@ export default function RightSidebar() {
     } else if (result?.error) {
       showPrompt('Order Failed', result.error, 'error');
     }
-  }, [market, orderType, amount, leverage, yesPrices, noPrices, placeOrder, showPrompt, delegation]);
+  }, [market, orderType, amount, leverage, limitPrice, yesPrices, noPrices, placeOrder, showPrompt, delegation]);
 
   const handlePlaceOrder = useCallback(async (outcome: 'yes' | 'no', side: 'bid') => {
     if (!wallet.connected) {

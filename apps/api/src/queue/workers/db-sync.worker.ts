@@ -16,6 +16,7 @@ import { logger } from '../../lib/logger.js';
 import { db, trades, positions } from '../../db/index.js';
 import { eq, and, or, sql } from 'drizzle-orm';
 import type { DbSyncJobData } from '../queues.js';
+import { wsEventsQueue } from '../queues.js';
 
 function redisOpts() {
   const url = new URL(config.redisUrl);
@@ -39,7 +40,8 @@ async function reversePositionForFailedTrade(
   tradeId?: string,
   makerOrderId?: string,
   takerOrderId?: string
-): Promise<void> {
+): Promise<{ affectedUserIds: string[]; marketAddress?: string }> {
+  const result: { affectedUserIds: string[]; marketAddress?: string } = { affectedUserIds: [] };
   try {
     // Find the trade record(s) to get details for reversal
     let tradeRecords: any[] = [];
@@ -57,7 +59,7 @@ async function reversePositionForFailedTrade(
 
     if (tradeRecords.length === 0) {
       logger.debug(`[QUEUE:db-sync] No trade found for position reversal (tradeId=${tradeId})`);
-      return;
+      return result;
     }
 
     for (const trade of tradeRecords) {
@@ -87,6 +89,7 @@ async function reversePositionForFailedTrade(
           takerIsBuying ? size * takerPrice : size * takerPrice, // cost/proceeds
           takerIsBuying
         );
+        result.affectedUserIds.push(trade.takerUserId);
       }
 
       // Reverse for maker
@@ -100,6 +103,12 @@ async function reversePositionForFailedTrade(
           makerIsBuying ? size * makerPrice : size * makerPrice,
           makerIsBuying
         );
+        result.affectedUserIds.push(trade.makerUserId);
+      }
+
+      // Track market for WS notification
+      if (trade.marketId) {
+        result.marketAddress = trade.marketId;
       }
 
       logger.info(`[QUEUE:db-sync] Reversed position for failed trade ${trade.id} (${size} shares)`);
@@ -108,6 +117,7 @@ async function reversePositionForFailedTrade(
     // Non-fatal: position may be slightly off until reconciliation
     logger.error(`[QUEUE:db-sync] Position reversal failed: ${err.message}`);
   }
+  return result;
 }
 
 /**
@@ -187,8 +197,9 @@ async function processJob(job: Job<DbSyncJobData>): Promise<void> {
   logger.debug(`[QUEUE:db-sync] Syncing trade status: sig=${txSignature?.slice(0, 16)}... status=${status}`);
 
   // If marking as FAILED, reverse the optimistic position update FIRST
+  let reversal: { affectedUserIds: string[]; marketAddress?: string } = { affectedUserIds: [] };
   if (status === 'FAILED') {
-    await reversePositionForFailedTrade(tradeId, makerOrderId, takerOrderId);
+    reversal = await reversePositionForFailedTrade(tradeId, makerOrderId, takerOrderId);
   }
 
   const updateData: Record<string, any> = {
@@ -229,6 +240,26 @@ async function processJob(job: Job<DbSyncJobData>): Promise<void> {
 
     if (status === 'FAILED') {
       logger.warn(`[QUEUE:db-sync] Trade marked FAILED (${errorCode || 'UNKNOWN'}): tradeId=${tradeId}, maker=${makerOrderId}, taker=${takerOrderId}`);
+
+      // Push WebSocket notification to affected users so frontend removes phantom positions
+      for (const userId of reversal.affectedUserIds) {
+        try {
+          await wsEventsQueue.add('ws-events', {
+            channel: 'user',
+            eventType: 'trade_failed',
+            data: {
+              userId,
+              tradeId: tradeId || '',
+              marketAddress: reversal.marketAddress || '',
+              errorCode: errorCode || 'UNKNOWN',
+            },
+          }, {
+            jobId: `ws-trade-failed-${tradeId || takerOrderId}-${userId}`,
+          });
+        } catch (wsErr: any) {
+          logger.debug(`[QUEUE:db-sync] Failed to enqueue trade_failed WS event: ${wsErr.message}`);
+        }
+      }
     }
   } catch (err: any) {
     logger.error(`[QUEUE:db-sync] Failed to sync trade: ${err.message}`);

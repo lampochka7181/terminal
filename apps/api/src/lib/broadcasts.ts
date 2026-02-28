@@ -374,6 +374,17 @@ export function broadcastUserLiquidation(
   broadcastToUser(userId, 'liquidation', liquidation);
 }
 
+export function broadcastTradeFailure(
+  userId: string,
+  failure: {
+    tradeId: string;
+    marketAddress: string;
+    errorCode: string;
+  },
+): void {
+  broadcastToUser(userId, 'trade_failed', failure);
+}
+
 export function broadcastMarketActivated(
   marketAddress: string,
   data: {

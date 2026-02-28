@@ -134,6 +134,16 @@ export interface UserLiquidationUpdate {
   };
 }
 
+export interface UserTradeFailedUpdate {
+  channel: 'user';
+  event: 'trade_failed';
+  data: {
+    tradeId: string;
+    marketAddress: string;
+    errorCode: string;
+  };
+}
+
 export interface GlobalTradeUpdate {
   channel: 'trades:global';
   type: 'global_trade';
@@ -163,6 +173,7 @@ type WSUpdate =
   | UserFillUpdate
   | UserSettlementUpdate
   | UserLiquidationUpdate
+  | UserTradeFailedUpdate
   | GlobalTradeUpdate;
 
 type MessageHandler = (message: WSUpdate) => void;
