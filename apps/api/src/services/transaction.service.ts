@@ -682,8 +682,11 @@ class TransactionService {
     if (message.includes('self trade')) {
       return 'SELF_TRADE';
     }
-    if (message.includes('account not found') || message.includes('0x1')) {
+    if (message.includes('account not found')) {
       return 'ACCOUNT_NOT_FOUND';
+    }
+    if (message.includes('insufficient lamports')) {
+      return 'INSUFFICIENT_LAMPORTS';
     }
 
     return null; // Retryable error

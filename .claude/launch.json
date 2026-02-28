@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "webv3",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": ["--", "bash", "-ic", "cd /mnt/c/Users/alexd/degen_terminal && pnpm --filter webv3 dev"],
+      "port": 5177
+    },
+    {
+      "name": "api",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": ["--", "bash", "-ic", "cd /mnt/c/Users/alexd/degen_terminal && pnpm --filter @degen/api dev"],
+      "port": 4000,
+      "autoPort": false
+    }
+  ],
+  "autoVerify": false
+}

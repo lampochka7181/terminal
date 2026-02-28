@@ -28,7 +28,7 @@ export interface UseDelegationReturn {
   delegatedAmount: number;
   
   // Actions
-  checkApproval: () => Promise<void>;
+  checkApproval: () => Promise<boolean>;
   approve: (amount?: number) => Promise<boolean>;
   revoke: () => Promise<boolean>;
 }
@@ -57,12 +57,12 @@ export function useDelegation(): UseDelegationReturn {
     fetchConfig();
   }, []);
 
-  // Check if user has approved the relayer
-  const checkApproval = useCallback(async () => {
+  // Check if user has approved the relayer. Returns the fresh approval status.
+  const checkApproval = useCallback(async (): Promise<boolean> => {
     if (!publicKey || !relayerAddress) {
       setIsApproved(false);
       setDelegatedAmount(0);
-      return;
+      return false;
     }
 
     setIsLoading(true);
@@ -78,16 +78,19 @@ export function useDelegation(): UseDelegationReturn {
         if (tokenAccount.delegate?.toBase58() === relayerAddress) {
           const amount = Number(tokenAccount.delegatedAmount);
           setDelegatedAmount(amount);
-          setIsApproved(amount > 0);
+          const approved = amount > 0;
+          setIsApproved(approved);
+          return approved;
         } else {
           setIsApproved(false);
           setDelegatedAmount(0);
+          return false;
         }
       } catch (err) {
         if (err instanceof TokenAccountNotFoundError) {
-          // User doesn't have USDC account yet
           setIsApproved(false);
           setDelegatedAmount(0);
+          return false;
         } else {
           throw err;
         }
@@ -95,6 +98,7 @@ export function useDelegation(): UseDelegationReturn {
     } catch (err) {
       console.error('Failed to check delegation:', err);
       setError('Failed to check delegation status');
+      return false;
     } finally {
       setIsLoading(false);
     }

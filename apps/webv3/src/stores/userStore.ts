@@ -21,6 +21,11 @@ const MIN_FETCH_INTERVAL = 2000; // At least 2 seconds between fetchAll batches
 // Delayed refetch tracking - cancel previous if new event comes in
 let delayedRefetchTimer: NodeJS.Timeout | null = null;
 
+// Track orderIds that were already handled by the API response (useOrder.ts upsertPosition).
+// handleFill should skip these to prevent double-counting shares.
+const recentlyHandledOrderIds = new Set<string>();
+const HANDLED_ORDER_TTL = 10_000; // 10s — plenty of time for WS fills to arrive
+
 // Pending order info shown during "Placing..." phase before order hits DB
 export interface PendingOrderInfo {
   marketAddress: string;
@@ -76,6 +81,7 @@ interface UserState {
   setPendingOrder: (order: PendingOrderInfo | null) => void;
   upsertPosition: (position: Position) => void; // Immediately update/add a position
   removePosition: (marketAddress: string) => void; // Remove a closed position
+  markOrderHandled: (orderId: string) => void; // Prevent handleFill from double-counting
   clearUserData: () => void;
 }
 
@@ -283,7 +289,79 @@ export const useUserStore = create<UserState>((set, get) => ({
     }
     delayedRefetchTimer = null;
 
-    // Single throttled refetch - no delayed refetch to avoid double refresh UX
+    // Skip optimistic update if this fill's order was already handled by the API response
+    // (useOrder.ts already called upsertPosition with correct position data).
+    // Without this, we'd double-count shares: once from API response, once from WS fill.
+    if (fill.orderId && recentlyHandledOrderIds.has(fill.orderId)) {
+      console.log(`[UserStore] Skipping handleFill for already-handled order ${fill.orderId.slice(0,8)}`);
+      // Still do a background refetch to ensure consistency
+      get().fetchAllImmediate();
+      return;
+    }
+
+    // Optimistically update position immediately from fill data
+    // This gives instant UI feedback instead of waiting for DB round-trip
+    const isBuy = fill.side === 'bid';
+    const positions = get().positions;
+    const existing = positions.find(p => p.marketAddress === fill.marketAddress);
+    const isYes = fill.outcome === 'yes';
+    const fillShares = fill.filledSize;
+    const fillPrice = fill.price;
+
+    if (existing) {
+      const updated = { ...existing };
+      if (isBuy) {
+        // Add shares and update weighted avg entry
+        if (isYes) {
+          const curShares = updated.yesShares || 0;
+          const curAvg = updated.avgEntryYes ?? updated.avgEntryPrice ?? 0;
+          updated.avgEntryYes = curShares > 0
+            ? (curShares * curAvg + fillShares * fillPrice) / (curShares + fillShares)
+            : fillPrice;
+          updated.yesShares = curShares + fillShares;
+          updated.avgEntryPrice = updated.avgEntryYes;
+        } else {
+          const curShares = updated.noShares || 0;
+          const curAvg = updated.avgEntryNo ?? updated.avgEntryPrice ?? 0;
+          updated.avgEntryNo = curShares > 0
+            ? (curShares * curAvg + fillShares * fillPrice) / (curShares + fillShares)
+            : fillPrice;
+          updated.noShares = curShares + fillShares;
+          updated.avgEntryPrice = updated.avgEntryNo;
+        }
+        updated.totalCost = (updated.totalCost ?? 0) + fillShares * fillPrice;
+      } else {
+        // Sell: subtract shares
+        if (isYes) {
+          updated.yesShares = Math.max(0, (updated.yesShares || 0) - fillShares);
+        } else {
+          updated.noShares = Math.max(0, (updated.noShares || 0) - fillShares);
+        }
+      }
+      updated.status = 'open';
+      get().upsertPosition(updated);
+    } else if (isBuy) {
+      // New position — create it optimistically
+      const newPosition: Position = {
+        marketAddress: fill.marketAddress,
+        market: '',
+        asset: '',
+        expiryAt: 0,
+        yesShares: isYes ? fillShares : 0,
+        noShares: isYes ? 0 : fillShares,
+        avgEntryPrice: fillPrice,
+        avgEntryYes: isYes ? fillPrice : undefined,
+        avgEntryNo: isYes ? undefined : fillPrice,
+        currentPrice: 0,
+        unrealizedPnL: 0,
+        totalCost: fillShares * fillPrice,
+        status: 'open',
+        createdAt: Date.now(),
+      };
+      get().upsertPosition(newPosition);
+    }
+
+    // Background refetch to sync with DB (fills in market name, prices, etc.)
     get().fetchAllImmediate();
   },
 
@@ -327,10 +405,23 @@ export const useUserStore = create<UserState>((set, get) => ({
       );
       
       if (existingIndex >= 0) {
-        // Update existing position
-        console.log(`[⏱️ STORE] Updating existing position at index ${existingIndex}`);
+        const existing = state.positions[existingIndex];
+        // Merge: preserve shares and entry prices from the other outcome
+        const merged = { ...position };
+        if (position.yesShares > 0 && existing.noShares > 0 && position.noShares === 0) {
+          merged.noShares = existing.noShares;
+          merged.avgEntryNo = existing.avgEntryNo ?? existing.avgEntryPrice;
+          merged.avgEntryYes = position.avgEntryYes ?? position.avgEntryPrice;
+          merged.totalCost = (position.totalCost ?? 0) + (existing.totalCost ?? existing.noShares * existing.avgEntryPrice);
+        } else if (position.noShares > 0 && existing.yesShares > 0 && position.yesShares === 0) {
+          merged.yesShares = existing.yesShares;
+          merged.avgEntryYes = existing.avgEntryYes ?? existing.avgEntryPrice;
+          merged.avgEntryNo = position.avgEntryNo ?? position.avgEntryPrice;
+          merged.totalCost = (position.totalCost ?? 0) + (existing.totalCost ?? existing.yesShares * existing.avgEntryPrice);
+        }
+        console.log(`[⏱️ STORE] Merging position at index ${existingIndex} (yes=${merged.yesShares}, no=${merged.noShares})`);
         const newPositions = [...state.positions];
-        newPositions[existingIndex] = position;
+        newPositions[existingIndex] = merged;
         return { positions: newPositions };
       } else {
         // Add new position
@@ -344,6 +435,11 @@ export const useUserStore = create<UserState>((set, get) => ({
     set((state) => ({
       positions: state.positions.filter((p) => p.marketAddress !== marketAddress),
     }));
+  },
+
+  markOrderHandled: (orderId) => {
+    recentlyHandledOrderIds.add(orderId);
+    setTimeout(() => recentlyHandledOrderIds.delete(orderId), HANDLED_ORDER_TTL);
   },
 
   clearUserData: () => {

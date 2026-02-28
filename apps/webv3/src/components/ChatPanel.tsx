@@ -139,41 +139,41 @@ export default function ChatPanel() {
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, overflow: 'hidden' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: 300, minHeight: 300, flexShrink: 0, overflow: 'hidden' }}>
       <div ref={scrollRef} style={{
-        flex: 1, minHeight: 0, overflowY: 'auto', padding: '16px 28px',
-        display: 'flex', flexDirection: 'column', gap: 16,
+        flex: 1, minHeight: 0, overflowY: 'auto', padding: '12px 21px',
+        display: 'flex', flexDirection: 'column', gap: 12,
       }}>
         {messages.map((msg) => {
           if (msg.isOwn) {
             return (
               <div key={msg.id} style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                <div style={{ padding: '10px 20px', borderRadius: 12, background: 'rgba(0,30,255,0.66)', maxWidth: '80%' }}>
-                  <span style={{ fontSize: 24, color: '#eee' }}>{msg.text}</span>
+                <div style={{ padding: '8px 15px', borderRadius: 9, background: 'rgba(0,30,255,0.66)', maxWidth: '80%' }}>
+                  <span style={{ fontSize: 18, color: '#eee' }}>{msg.text}</span>
                 </div>
               </div>
             );
           }
 
           return (
-            <div key={msg.id} style={{ display: 'flex', gap: 16, alignItems: 'flex-end' }}>
+            <div key={msg.id} style={{ display: 'flex', gap: 12, alignItems: 'flex-end' }}>
               <div style={{
-                width: 50, height: 50, borderRadius: '50%', background: '#333',
+                width: 38, height: 38, borderRadius: '50%', background: '#333',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
-                fontSize: 28, flexShrink: 0,
+                fontSize: 21, flexShrink: 0,
               }}>
                 {msg.avatar}
               </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxWidth: '80%' }}>
-                <span style={{ fontSize: 16, fontWeight: 700, color: dim }}>{msg.user}</span>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxWidth: '80%' }}>
+                <span style={{ fontSize: 12, fontWeight: 700, color: dim }}>{msg.user}</span>
                 {msg.isAction ? (
-                  <div style={{ padding: '10px 20px', borderRadius: 12, background: '#232323' }}>
-                    <span style={{ fontSize: 24, fontWeight: 700, color: '#eee' }}>{msg.actionBold}</span>
-                    <span style={{ fontSize: 24, color: '#eee' }}> {msg.actionText}</span>
+                  <div style={{ padding: '8px 15px', borderRadius: 9, background: '#232323' }}>
+                    <span style={{ fontSize: 18, fontWeight: 700, color: '#eee' }}>{msg.actionBold}</span>
+                    <span style={{ fontSize: 18, color: '#eee' }}> {msg.actionText}</span>
                   </div>
                 ) : (
-                  <div style={{ padding: '10px 20px', borderRadius: 12, background: '#232323' }}>
-                    <span style={{ fontSize: 24, color: '#eee' }}>{msg.text}</span>
+                  <div style={{ padding: '8px 15px', borderRadius: 9, background: '#232323' }}>
+                    <span style={{ fontSize: 18, color: '#eee' }}>{msg.text}</span>
                   </div>
                 )}
               </div>
@@ -182,7 +182,7 @@ export default function ChatPanel() {
         })}
       </div>
 
-      <div style={{ display: 'flex', gap: 16, padding: '16px 28px', flexShrink: 0 }}>
+      <div style={{ display: 'flex', gap: 12, padding: '12px 21px', flexShrink: 0 }}>
         <input
           type="text"
           placeholder={isAuthenticated ? 'Leave a message' : 'Connect wallet to chat'}
@@ -191,10 +191,10 @@ export default function ChatPanel() {
           onKeyDown={(e) => { if (e.key === 'Enter') handleSend(); }}
           disabled={!isAuthenticated}
           style={{
-            flex: 1, height: 70, borderRadius: 12,
+            flex: 1, height: 53, borderRadius: 9,
             border: '1px solid rgba(255,255,255,0.11)',
-            background: '#232323', color: '#eee', fontSize: 24,
-            padding: '0 24px', outline: 'none',
+            background: '#232323', color: '#eee', fontSize: 18,
+            padding: '0 18px', outline: 'none',
             fontFamily: "'IBM Plex Mono', monospace",
             opacity: isAuthenticated ? 1 : 0.5,
           }}
@@ -203,13 +203,13 @@ export default function ChatPanel() {
           onClick={handleSend}
           disabled={!isAuthenticated || !input.trim()}
           style={{
-            width: 70, height: 70, borderRadius: 12,
+            width: 53, height: 53, borderRadius: 9,
             background: '#001eff', border: 'none',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             cursor: isAuthenticated ? 'pointer' : 'not-allowed', flexShrink: 0,
             opacity: isAuthenticated && input.trim() ? 1 : 0.5,
           }}>
-          <Send size={28} color="#eee" />
+          <Send size={21} color="#eee" />
         </button>
       </div>
     </div>

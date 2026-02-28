@@ -5,7 +5,9 @@ import { priceFeedService } from '../services/price-feed.service.js';
 import { logger, marketLogger, logEvents } from '../lib/logger.js';
 import { broadcastMarketResolved } from '../lib/broadcasts.js';
 import { anchorClient, getMarketPda } from '../lib/anchor-client.js';
+import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
 import { prepareSettlementData, settleMarketWithData, type SettlementPrepData } from './position-settler.js';
+import { triggerMerkleSettlement, preSeedSettlingState, getPreSeededMerkleData, markRootPosted } from './merkle-settler.js';
 import { config } from '../config.js';
 
 /**
@@ -225,8 +227,9 @@ async function resolveMarket(
     }
   };
   
-  // Start on-chain resolve (don't await yet)
-  if (anchorClient.isReady()) {
+  // Start on-chain resolve (don't await yet) — V1 only.
+  // V2 uses the combined resolveAndPostMerkleRoot instruction below.
+  if (anchorClient.isReady() && !config.useV2) {
     logger.info(`Resolving market on-chain: ${market.pubkey} (outcome=${outcome}, price=${finalPrice})`);
     onChainResolvePending = attemptResolve();
   }
@@ -234,17 +237,85 @@ async function resolveMarket(
   // Start settlement prep IN PARALLEL with on-chain resolve
   settlementPrepPending = prepareSettlementData(marketId);
   
+  // V2 fast path: combined resolve + postMerkleRoot in ONE TX (~2s saved)
+  if (config.useV2) {
+    // Pre-build merkle tree from settlement data fetched in parallel with resolve TX.
+    // This runs BEFORE the resolve TX confirms, so the tree is ready the instant it does.
+    const settlementPrepData = await settlementPrepPending;
+    if (settlementPrepData && settlementPrepData.positions.length > 0) {
+      preSeedSettlingState(marketId, outcome, settlementPrepData.positions, settlementPrepData.walletMap);
+    }
+
+    // Try combined resolve+postMerkleRoot in a single TX (saves ~2s)
+    const merkleData = getPreSeededMerkleData(marketId);
+    let usedCombinedTx = false;
+
+    if (anchorClient.isReady() && merkleData) {
+      try {
+        const sig = await anchorClient.resolveAndPostMerkleRootV2({
+          marketPubkey: market.pubkey,
+          outcome,
+          finalPrice,
+          merkleRoot: merkleData.merkleRoot,
+          totalAmount: merkleData.totalAmount,
+          totalSettlements: merkleData.totalSettlements,
+        });
+        logger.info(`✅ MarketV2 resolved+merkleRoot in single TX: ${sig}`);
+        markRootPosted(marketId);
+        usedCombinedTx = true;
+      } catch (err: any) {
+        const errorMsg = err.message || '';
+        // Handle clock skew — fall back to separate resolve + postMerkleRoot
+        if (errorMsg.includes('MarketNotExpired') || errorMsg.includes('0x1777')) {
+          logger.warn(`Combined TX failed (clock skew), falling back to separate resolve: ${errorMsg}`);
+        } else if (errorMsg.includes('MarketAlreadyResolved') || errorMsg.includes('0x1778')) {
+          logger.debug(`Market ${marketId} already resolved on-chain, continuing`);
+        } else if (errorMsg.includes('AccountNotInitialized') || errorMsg.includes('0xbc4')) {
+          logger.warn(`Market ${marketId} (${market.pubkey}) does not exist on-chain. Marking as archived.`);
+          await marketService.markArchived(marketId);
+          return;
+        } else {
+          logger.warn(`Combined TX failed, falling back to separate resolve: ${errorMsg}`);
+        }
+      }
+    }
+
+    // Fallback: separate resolve TX if combined didn't work (no merkle data, or combined failed)
+    if (!usedCombinedTx && anchorClient.isReady()) {
+      logger.info(`Resolving market on-chain (fallback): ${market.pubkey} (outcome=${outcome}, price=${finalPrice})`);
+      await attemptResolve();
+    }
+
+    // Update DB + broadcast (skip syncMarketStatusFromChain — TX just confirmed)
+    await marketService.resolve(marketId, outcome, finalPrice.toString());
+    broadcastMarketResolved(marketPubkey, outcome, finalPrice, strike);
+    logEvents.marketResolved({
+      marketId, asset: market.asset, timeframe: market.timeframe,
+      outcome, strikePrice: strike, finalPrice,
+    });
+
+    // Trigger batch settlement. If combined TX was used, processMarketSettlement
+    // skips postMerkleRoot (rootPosted flag) and goes straight to batch creation.
+    // If fallback was used, it does the normal postMerkleRoot first.
+    const resolvedMarket = { ...market, status: 'RESOLVED' as const, outcome, finalPrice: finalPrice.toString() };
+    triggerMerkleSettlement(marketId, resolvedMarket as any).catch(err => {
+      logger.warn(`[MarketResolver] Direct merkle trigger failed for ${marketId}, polling will pick up: ${(err as Error).message}`);
+    });
+    return;
+  }
+
+  // V1 path: full sync + position settler
   // Wait for on-chain resolve to complete (settlement prep continues in parallel)
   if (onChainResolvePending) {
     await onChainResolvePending;
   }
-  
+
   // Update market with outcome in database
   await marketService.resolve(marketId, outcome, finalPrice.toString());
-  
+
   // Broadcast resolution event
   broadcastMarketResolved(marketPubkey, outcome, finalPrice, strike);
-  
+
   // Log market resolution
   logEvents.marketResolved({
     marketId,
@@ -254,17 +325,17 @@ async function resolveMarket(
     strikePrice: strike,
     finalPrice,
   });
-  
+
   // Wait for settlement prep to complete (likely already done)
   const settlementPrepData = await settlementPrepPending;
-  
+
   // Get updated market with outcome for settlement
   const resolvedMarket = await marketService.getById(marketId);
   if (!resolvedMarket) {
     logger.error(`Market ${marketId} not found after resolution`);
     return;
   }
-  
+
   // Execute settlement immediately with pipelined data
   try {
     await settleMarketWithData(resolvedMarket, settlementPrepData);

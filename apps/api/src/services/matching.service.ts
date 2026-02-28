@@ -128,6 +128,9 @@ export interface DollarMatchResult {
   totalContracts: number;
   avgPrice: number;
   unfilledDollars: number;
+  totalTakerFees: number;
+  upfrontFee: number;
+  dollarAmount: number;
 }
 
 /**
@@ -514,9 +517,14 @@ export class MatchingService {
    */
   async matchMarketOrderByDollar(order: DollarMarketOrder): Promise<DollarMatchResult> {
     const fills: Fill[] = [];
+    
+    // Match with full budget first; after matching we know the fill count,
+    // so we can calculate exact per-fill fees and scale fills down to fit
+    // within dollarAmount (collateral + fees = dollarAmount).
     let remainingDollars = order.dollarAmount;
     let totalContracts = 0;
     let totalSpent = 0;
+    let totalTakerFees = 0;
     
     const perfEnabled = this.matchingPerfEnabled();
     const perf = {
@@ -626,7 +634,7 @@ export class MatchingService {
 
           const fillSize = remainingDollars / price;
           const fillCost = fillSize * price;
-          const { makerFee, takerFee } = calculateFillFees(fillCost);
+          const { makerFee } = calculateFillFees(fillCost);
 
           const fill: Fill = {
             makerOrderId: `mm_synth_${Date.now()}`,
@@ -637,7 +645,7 @@ export class MatchingService {
             size: fillSize,
             outcome: order.outcome,
             makerFee,
-            takerFee,
+            takerFee: 0, // Placeholder — distributed proportionally after matching
             makerSide: matchSide, // maker provides the opposing side
             takerSide: order.side,
             makerClientOrderId: Date.now(),
@@ -699,8 +707,8 @@ export class MatchingService {
       const fillPrice = userEffectivePrice;  // User sees their effective price
       const fillCost = fillSize * fillPrice;
       
-      // Calculate fees based on user's cost (tiered fee structure)
-      const { makerFee, takerFee } = calculateFillFees(fillCost);
+      // Maker fee per fill (always 0 currently); taker fee distributed after loop
+      const { makerFee } = calculateFillFees(fillCost);
       
       // Placeholder for taker order ID - will be replaced after order is created
       const takerOrderId = 'pending';
@@ -716,7 +724,7 @@ export class MatchingService {
         size: fillSize,
         outcome: order.outcome,  // User's original outcome (YES or NO)
         makerFee,
-        takerFee,
+        takerFee: 0, // Placeholder — distributed proportionally after matching
         makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side, // Flip for NO
         takerSide: order.side,
         makerClientOrderId: bestOrder.clientOrderId || Date.now(),
@@ -753,12 +761,52 @@ export class MatchingService {
       );
     }
     
+    // TWO-PASS FEE ADJUSTMENT:
+    // Pass 1 (above) matched with full dollarAmount to discover fill count & prices.
+    // Pass 2 (below) calculates actual per-fill fees, then scales fills down so
+    // collateral + fees = dollarAmount exactly. This prevents overcharging when
+    // user has exactly dollarAmount in their wallet.
+    let upfrontFee = 0;
+    if (fills.length > 0 && totalSpent > 0) {
+      // Calculate real per-fill fees
+      for (const fill of fills) {
+        const fillCost = fill.price * fill.size;
+        fill.takerFee = calculateFillFees(fillCost).takerFee;
+      }
+      const grossFees = fills.reduce((sum, f) => sum + f.takerFee, 0);
+      
+      // Scale fills down so totalSpent_scaled + grossFees_scaled = dollarAmount
+      // Since flat fees don't change with fill size (below tier1Max), we just need:
+      //   targetCollateral = dollarAmount - totalFees
+      //   scaleFactor = targetCollateral / totalSpent
+      const targetCollateral = order.dollarAmount - grossFees;
+      
+      if (targetCollateral > 0 && targetCollateral < totalSpent) {
+        const scale = targetCollateral / totalSpent;
+        totalContracts = 0;
+        totalSpent = 0;
+        
+        for (const fill of fills) {
+          fill.size = fill.size * scale;
+          const newCost = fill.price * fill.size;
+          totalContracts += fill.size;
+          totalSpent += newCost;
+          // Recalculate fee on scaled cost (may change for percentage tiers)
+          fill.takerFee = calculateFillFees(newCost).takerFee;
+        }
+      }
+      
+      totalTakerFees = fills.reduce((sum, f) => sum + f.takerFee, 0);
+      upfrontFee = totalTakerFees;
+    }
+    
     const avgPrice = totalContracts > 0 ? totalSpent / totalContracts : 0;
     
     logger.info(
       `Walk-the-book complete: ${fills.length} fills, ` +
       `${totalContracts.toFixed(6)} contracts @ avg ${avgPrice.toFixed(4)}, ` +
-      `spent $${totalSpent.toFixed(2)}, unfilled $${remainingDollars.toFixed(4)}`
+      `collateral $${totalSpent.toFixed(4)}, fees $${totalTakerFees.toFixed(4)}, ` +
+      `total $${(totalSpent + totalTakerFees).toFixed(4)} of $${order.dollarAmount}`
     );
 
     if (perfEnabled) {
@@ -784,6 +832,9 @@ export class MatchingService {
       totalContracts,
       avgPrice,
       unfilledDollars: remainingDollars,
+      totalTakerFees,
+      upfrontFee,
+      dollarAmount: order.dollarAmount,
     };
   }
 
@@ -868,17 +919,25 @@ export class MatchingService {
       }
       
       // Update taker position for each outcome
+      // Use dollarAmount as cost for buy orders so fee is baked into PnL
+      const useDollarAmountAsCost = takerIsBuy && outcomeShares.size === 1;
       for (const [outcome, shares] of outcomeShares) {
-        const outcomeFills = result.fills.filter(f => f.outcome === outcome);
-        const outcomeNotional = outcomeFills.reduce((sum, f) => sum + f.price * f.size, 0);
-        const outcomeFee = outcomeFills.reduce((sum, f) => sum + f.takerFee, 0);
+        let cost: number;
+        if (useDollarAmountAsCost) {
+          cost = result.dollarAmount;
+        } else {
+          const outcomeFills = result.fills.filter(f => f.outcome === outcome);
+          const outcomeNotional = outcomeFills.reduce((sum, f) => sum + f.price * f.size, 0);
+          const outcomeFee = outcomeFills.reduce((sum, f) => sum + f.takerFee, 0);
+          cost = takerIsBuy ? outcomeNotional + outcomeFee : outcomeNotional - outcomeFee;
+        }
         
         await positionService.updateAfterTrade(
           order.userId,
           order.marketId,
           outcome,
           shares,
-          takerIsBuy ? outcomeNotional + outcomeFee : outcomeNotional - outcomeFee,
+          cost,
           takerIsBuy
         );
       }
@@ -900,7 +959,10 @@ export class MatchingService {
       pubkey: market.pubkey,
       asset: market.asset,
       timeframe: market.timeframe,
-    }, !!(order.leverage && order.leverage > 1)).catch(err => logger.error(`Background DB processing failed: ${err.message}`));
+    }, !!(order.leverage && order.leverage > 1), {
+      dollarAmount: result.dollarAmount,
+      upfrontFee: result.upfrontFee,
+    }).catch(err => logger.error(`Background DB processing failed: ${err.message}`));
     
     return { ...result, orderId };
   }
@@ -1979,6 +2041,7 @@ export class MatchingService {
     order: DollarMarketOrder,
     market: { id: string; pubkey: string; asset?: string; timeframe?: string },
     skipTakerPosition: boolean = false,
+    feeInfo?: { dollarAmount: number; upfrontFee: number },
   ): Promise<void> {
     logger.info(`[DEBUG] processFillsInBackground: fills=${fills.length}, market=${order.marketId.slice(0,8)}, perfTestMode=${config.perfTestMode}`);
     if (fills.length === 0) return;
@@ -2056,7 +2119,7 @@ export class MatchingService {
           .catch(err => logger.error(`Market price update failed: ${err.message}`));
 
         // ALSO create positions in perf mode (required for settlement testing)
-        const positionUpdates = this.aggregateFillsForPositions(fills, order);
+        const positionUpdates = this.aggregateFillsForPositions(fills, order, feeInfo);
         for (const update of positionUpdates) {
           positionService.updateAfterTrade(
             update.userId,
@@ -2084,7 +2147,7 @@ export class MatchingService {
       const insertedTrades = await db.insert(trades).values(tradeRecords).returning();
       
       // 2. AGGREGATE POSITION UPDATES (parallel — not sequential)
-      const positionUpdates = this.aggregateFillsForPositions(fills, order);
+      const positionUpdates = this.aggregateFillsForPositions(fills, order, feeInfo);
       
       const positionPromises = positionUpdates
         .filter(update => !(skipTakerPosition && update.userId === order.userId))
@@ -2226,7 +2289,8 @@ export class MatchingService {
    */
   private aggregateFillsForPositions(
     fills: Fill[],
-    order: DollarMarketOrder
+    order: DollarMarketOrder,
+    opts?: { dollarAmount?: number; upfrontFee?: number }
   ): Array<{
     userId: string;
     outcome: 'YES' | 'NO';
@@ -2252,6 +2316,15 @@ export class MatchingService {
       current.shares += fill.size;
       current.cost += takerIsBuy ? notional + fill.takerFee : notional - fill.takerFee;
       takerOutcomes.set(fill.outcome, current);
+    }
+    
+    // When upfrontFee is provided (dollar market orders), use dollarAmount as the
+    // taker's total cost so the DB position reflects the user's full selected amount.
+    // This ensures PnL shows the fee as an initial loss.
+    if (opts?.dollarAmount && opts?.upfrontFee && takerIsBuy && takerOutcomes.size === 1) {
+      const [outcome, data] = [...takerOutcomes.entries()][0];
+      data.cost = opts.dollarAmount;
+      takerOutcomes.set(outcome, data);
     }
     
     for (const [outcome, data] of takerOutcomes) {

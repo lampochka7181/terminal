@@ -67,30 +67,30 @@ export default function App() {
               {/* Asset info bar — identical layout in both modes */}
               <div style={{
                 display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                padding: '12px 28px', background: '#1e1e1e', flexShrink: 0,
+                padding: '9px 21px', background: '#1e1e1e', flexShrink: 0,
               }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 15 }}>
                   <button style={{
-                    display: 'flex', alignItems: 'center', gap: 12, padding: '10px 20px', borderRadius: 10,
+                    display: 'flex', alignItems: 'center', gap: 9, padding: '8px 15px', borderRadius: 8,
                     background: '#232323', border: 'none', cursor: 'pointer',
                   }}>
-                    <div style={{ width: 44, height: 44, borderRadius: '50%', background: '#f7931a', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <span style={{ fontSize: 22, fontWeight: 700, color: '#fff' }}>₿</span>
+                    <div style={{ width: 33, height: 33, borderRadius: '50%', background: '#f7931a', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <span style={{ fontSize: 16, fontWeight: 700, color: '#fff' }}>₿</span>
                     </div>
-                    <span style={{ fontSize: 28, color: '#eee', fontWeight: 400 }}>BTC/USD</span>
-                    <span style={{ fontSize: 20, color: 'rgba(238,238,238,0.66)' }}>Bitcoin</span>
-                    <ChevronDown size={22} color="rgba(238,238,238,0.33)" />
+                    <span style={{ fontSize: 21, color: '#eee', fontWeight: 400 }}>BTC/USD</span>
+                    <span style={{ fontSize: 15, color: 'rgba(238,238,238,0.66)' }}>Bitcoin</span>
+                    <ChevronDown size={16} color="rgba(238,238,238,0.33)" />
                   </button>
 
                   <span style={{
-                    padding: '8px 20px', borderRadius: 10, fontSize: 26, fontWeight: 700,
+                    padding: '6px 15px', borderRadius: 8, fontSize: 20, fontWeight: 700,
                     letterSpacing: '0.02em', background: '#001eff', color: '#eee',
                   }}>
                     0TDE
                   </span>
 
                   <span style={{
-                    fontSize: 44, fontWeight: 500, color: '#eee',
+                    fontSize: 33, fontWeight: 500, color: '#eee',
                     fontVariantNumeric: 'tabular-nums', letterSpacing: '-0.01em',
                   }}>
                     ${priceDisplay}
@@ -98,16 +98,16 @@ export default function App() {
 
                   {isActivating ? (
                     <span style={{
-                      padding: '6px 16px',
-                      borderRadius: 10, fontSize: 22, fontWeight: 600,
+                      padding: '4px 12px',
+                      borderRadius: 8, fontSize: 16, fontWeight: 600,
                       background: '#424242', color: '#f7931a',
                     }}>
                       Activating...
                     </span>
                   ) : (
                     <span style={{
-                      padding: '6px 16px',
-                      borderRadius: 10, fontSize: 22, fontWeight: 700,
+                      padding: '4px 12px',
+                      borderRadius: 8, fontSize: 16, fontWeight: 700,
                       background: isAbove ? '#95ff94' : '#f55252',
                       color: isAbove ? '#1e1e1e' : '#fff',
                     }}>
@@ -118,19 +118,19 @@ export default function App() {
 
                 {/* Pro/Lite toggle */}
                 <div
-                  style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer' }}
+                  style={{ display: 'flex', alignItems: 'center', gap: 9, cursor: 'pointer' }}
                   onClick={() => setViewMode(isPro ? 'lite' : 'pro')}
                 >
-                  <span style={{ fontSize: 24, color: '#fff', fontWeight: 700 }}>
+                  <span style={{ fontSize: 18, color: '#fff', fontWeight: 700 }}>
                     {isPro ? 'Pro' : 'Lite'}
                   </span>
                   <div style={{
-                    width: 80, height: 44, borderRadius: 88,
+                    width: 60, height: 33, borderRadius: 66,
                     background: isPro ? '#474747' : '#191919',
-                    display: 'flex', alignItems: 'center', padding: '0 4px',
+                    display: 'flex', alignItems: 'center', padding: '0 3px',
                   }}>
                     <div style={{
-                      width: 36, height: 36, borderRadius: '50%', background: '#eee',
+                      width: 27, height: 27, borderRadius: '50%', background: '#eee',
                       marginLeft: isPro ? 'auto' : 0,
                       transition: 'margin-left 0.2s',
                     }} />

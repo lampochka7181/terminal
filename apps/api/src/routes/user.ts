@@ -140,9 +140,9 @@ export async function userRoutes(app: FastifyInstance) {
     return positions.map((p) => {
       const yesShares = truncate6(parseFloat(p.yesShares || '0'));
       const noShares = truncate6(parseFloat(p.noShares || '0'));
-      const avgEntry = yesShares > 0 
-        ? parseFloat(p.avgEntryYes || '0')
-        : parseFloat(p.avgEntryNo || '0');
+      const avgEntryYes = parseFloat(p.avgEntryYes || '0');
+      const avgEntryNo = parseFloat(p.avgEntryNo || '0');
+      const avgEntry = yesShares > 0 ? avgEntryYes : avgEntryNo;
       const currentPrice = p.market?.yesPrice 
         ? parseFloat(p.market.yesPrice) 
         : 0.5;
@@ -163,6 +163,8 @@ export async function userRoutes(app: FastifyInstance) {
         yesShares,
         noShares,
         avgEntryPrice: avgEntry,
+        avgEntryYes,
+        avgEntryNo,
         currentPrice,
         unrealizedPnL: parseFloat(unrealizedPnL.toFixed(2)),
         totalCost: parseFloat(p.totalCost || '0'),
@@ -352,21 +354,7 @@ export async function userRoutes(app: FastifyInstance) {
 
     const { limit, offset } = query.data;
     
-    // 1. Get user's positions to look up avg entry prices for P&L calculation
-    const userPositions = await positionService.getUserPositions(userId);
-    
-    // Create position lookup map by marketId+outcome
-    const positionMap = new Map<string, { avgEntry: number }>();
-    for (const p of userPositions) {
-      if (parseFloat(p.avgEntryYes || '0') > 0 || parseFloat(p.yesShares || '0') > 0) {
-        positionMap.set(`${p.marketId}-YES`, { avgEntry: parseFloat(p.avgEntryYes || '0') });
-      }
-      if (parseFloat(p.avgEntryNo || '0') > 0 || parseFloat(p.noShares || '0') > 0) {
-        positionMap.set(`${p.marketId}-NO`, { avgEntry: parseFloat(p.avgEntryNo || '0') });
-      }
-    }
-    
-    // 2. Get trades where user is maker OR taker, including order IDs
+    // 1. Get trades where user is maker OR taker, including order IDs
     const userTrades = await db
       .select({
         id: trades.id,
@@ -386,6 +374,7 @@ export async function userRoutes(app: FastifyInstance) {
         makerFee: trades.makerFee,
         size: trades.size,
         txSignature: trades.txSignature,
+        txStatus: trades.txStatus,
         executedAt: trades.executedAt,
         // Market info
         marketPubkey: markets.pubkey,
@@ -442,7 +431,65 @@ export async function userRoutes(app: FastifyInstance) {
       }
     }
     
-    // 3. Aggregate trades by order ID
+    // 3. Compute correct avgEntry at time of each sell from trade history.
+    // Using the current position avgEntry is WRONG — it gets overwritten when
+    // user sells all shares and re-buys at a different price.
+    // Instead, replay trades chronologically to track avgEntry through time.
+    // NOTE: Skip FAILED trades — they never settled on-chain.
+    const sellAvgEntryMap = new Map<string, number>(); // orderId -> avgEntry at time of sell
+    {
+      // Group non-failed trades by market+outcome for this user
+      const tradesByPosition = new Map<string, typeof userTrades>();
+      for (const t of userTrades) {
+        // Skip failed trades — they never settled on-chain
+        if (t.txStatus === 'FAILED') continue;
+        const isTaker = t.takerUserId === userId;
+        const userOutcome = isTaker ? t.takerOutcome : t.makerOutcome;
+        const key = `${t.marketId}-${userOutcome}`;
+        if (!tradesByPosition.has(key)) tradesByPosition.set(key, []);
+        tradesByPosition.get(key)!.push(t);
+      }
+
+      for (const [, groupTrades] of tradesByPosition) {
+        // Sort chronologically (ASC) — userTrades came in DESC order
+        const sorted = [...groupTrades].sort((a, b) =>
+          (a.executedAt?.getTime() || 0) - (b.executedAt?.getTime() || 0)
+        );
+
+        let shares = 0;
+        let avgEntry = 0;
+
+        for (const t of sorted) {
+          const isTaker = t.takerUserId === userId;
+          const takerSide = t.takerSide;
+          const size = parseFloat(t.size || '0');
+          const userPrice = isTaker
+            ? parseFloat(t.takerPrice || '0')
+            : parseFloat(t.makerPrice || '0');
+
+          // Is this user buying or selling?
+          const isBuying = isTaker ? takerSide === 'BID' : takerSide === 'ASK';
+
+          if (isBuying) {
+            // Update weighted average entry price
+            avgEntry = shares > 0
+              ? (shares * avgEntry + size * userPrice) / (shares + size)
+              : userPrice;
+            shares += size;
+          } else {
+            // Selling — record the avgEntry at this point for PnL calc
+            const orderId = isTaker ? t.takerOrderId : t.makerOrderId;
+            if (orderId && !sellAvgEntryMap.has(orderId)) {
+              sellAvgEntryMap.set(orderId, avgEntry);
+            }
+            shares = Math.max(0, shares - size);
+            // avgEntry stays the same for remaining shares
+          }
+        }
+      }
+    }
+
+    // 4. Aggregate trades by order ID
     // Group by the user's order (takerOrderId if user is taker, makerOrderId if maker)
     interface OrderAggregation {
       orderId: string;
@@ -458,6 +505,7 @@ export async function userRoutes(app: FastifyInstance) {
       totalNotional: number;
       totalFee: number;
       txSignature: string; // Last tx signature for this order
+      txStatus: string; // 'PENDING' | 'CONFIRMED' | 'FAILED'
       timestamp: number; // First execution timestamp
       fills: number; // Number of fills
       avgEntryPrice?: number; // For closing trades, the avg entry to calculate P&L
@@ -486,14 +534,10 @@ export async function userRoutes(app: FastifyInstance) {
       
       const side = isTaker ? (takerSide === 'BID' ? 'buy' : 'sell') : (takerSide === 'BID' ? 'sell' : 'buy');
       
-      // For closing trades (sells), look up avg entry price for P&L calculation
+      // For closing trades (sells), use the avgEntry computed from trade history replay
       let avgEntryPrice: number | undefined;
-      if (!isOpening && t.marketId) {
-        const posKey = `${t.marketId}-${userOutcome}`;
-        const position = positionMap.get(posKey);
-        if (position) {
-          avgEntryPrice = position.avgEntry;
-        }
+      if (!isOpening && orderId) {
+        avgEntryPrice = sellAvgEntryMap.get(orderId);
       }
       
       // Get leverage for this order
@@ -517,14 +561,20 @@ export async function userRoutes(app: FastifyInstance) {
         if (t.txSignature) {
           existing.txSignature = t.txSignature;
         }
+        // If ANY fill is FAILED, mark the whole order as FAILED
+        if (t.txStatus === 'FAILED') {
+          existing.txStatus = 'FAILED';
+        } else if (existing.txStatus !== 'FAILED' && t.txStatus === 'CONFIRMED') {
+          existing.txStatus = 'CONFIRMED';
+        }
       } else {
         // Create new order aggregation
         orderMap.set(orderId, {
           orderId,
           marketId: t.marketId || '',
           marketAddress: t.marketPubkey || '',
-          market: t.marketAsset && t.marketTimeframe 
-            ? `${t.marketAsset}-${t.marketTimeframe}` 
+          market: t.marketAsset && t.marketTimeframe
+            ? `${t.marketAsset}-${t.marketTimeframe}`
             : '',
           asset: t.marketAsset || '',
           expiryAt: t.marketExpiryAt?.getTime() || 0,
@@ -535,6 +585,7 @@ export async function userRoutes(app: FastifyInstance) {
           totalNotional: userNotional,
           totalFee: userFee,
           txSignature: t.txSignature || '',
+          txStatus: t.txStatus || 'PENDING',
           timestamp: t.executedAt?.getTime() || 0,
           fills: 1,
           avgEntryPrice,
@@ -549,17 +600,17 @@ export async function userRoutes(app: FastifyInstance) {
       .map((o) => {
         const avgExecPrice = o.totalSize > 0 ? o.totalNotional / o.totalSize : 0;
         
-        // Calculate P&L for closing trades (sells)
+        // Calculate P&L for closing trades (sells) — skip FAILED trades
         // P&L = proceeds - cost basis
         // proceeds = totalNotional (what we received from selling)
         // cost basis = size × avgEntryPrice (what we paid to buy)
         let pnl: number | undefined;
-        if (o.transactionType === 'close' && o.avgEntryPrice && o.avgEntryPrice > 0) {
+        if (o.txStatus !== 'FAILED' && o.transactionType === 'close' && o.avgEntryPrice && o.avgEntryPrice > 0) {
           const proceeds = o.totalNotional;
           const costBasis = o.totalSize * o.avgEntryPrice;
           pnl = proceeds - costBasis - o.totalFee; // Include fees in P&L
         }
-        
+
         return {
           id: o.orderId,
           type: 'trade' as const,
@@ -577,6 +628,7 @@ export async function userRoutes(app: FastifyInstance) {
           pnl, // P&L for closing trades
           leverage: o.leverage, // Leverage if > 1
           txSignature: o.txSignature,
+          txStatus: o.txStatus,
           timestamp: o.timestamp,
           fills: o.fills,
         };

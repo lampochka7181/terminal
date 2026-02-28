@@ -12,7 +12,7 @@ interface ChartToolbarStore {
 }
 
 export const useChartToolbarStore = create<ChartToolbarStore>((set) => ({
-  tickSize: 6,
+  tickSize: 5,
   setTickSize: (size) => set({ tickSize: size }),
   drawingMode: false,
   setDrawingMode: (on) => set({ drawingMode: on }),
@@ -21,9 +21,9 @@ export const useChartToolbarStore = create<ChartToolbarStore>((set) => ({
 }));
 
 const TICK_OPTIONS = [
-  { label: 'S', value: 3 },
-  { label: 'M', value: 6 },
-  { label: 'L', value: 12 },
+  { label: 'S', value: 2 },
+  { label: 'M', value: 5 },
+  { label: 'L', value: 9 },
 ];
 
 export default function ChartToolbar() {
@@ -34,10 +34,10 @@ export default function ChartToolbar() {
 
   return (
     <div style={{
-      position: 'absolute', top: 8, left: 8, zIndex: 10,
+      position: 'absolute', top: 6, left: 6, zIndex: 10,
       display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2,
-      padding: '6px 4px',
-      borderRadius: 12,
+      padding: '5px 3px',
+      borderRadius: 9,
       pointerEvents: 'auto',
     }}>
       {/* Tick size */}
@@ -46,34 +46,34 @@ export default function ChartToolbar() {
           title="Tick Size"
           onClick={() => setTickOpen(o => !o)}
           style={{
-            width: 48, height: 48, display: 'flex', alignItems: 'center', justifyContent: 'center',
+            width: 36, height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center',
             flexDirection: 'column',
-            borderRadius: 10, border: 'none', cursor: 'pointer',
+            borderRadius: 8, border: 'none', cursor: 'pointer',
             background: tickOpen ? 'rgba(66,66,66,0.8)' : 'transparent',
             color: '#eee',
             transition: 'background 0.15s',
-            fontSize: 13, fontWeight: 600, lineHeight: 1.2, letterSpacing: '0.02em',
+            fontSize: 10, fontWeight: 600, lineHeight: 1.2, letterSpacing: '0.02em',
           }}
         >
-          <span style={{ fontSize: 11, opacity: 0.5 }}>TICK</span>
+          <span style={{ fontSize: 8, opacity: 0.5 }}>TICK</span>
           <span>{activeTick.label} ▸</span>
         </button>
         {tickOpen && (
           <div style={{
-            position: 'absolute', left: 56, top: 0,
+            position: 'absolute', left: 42, top: 0,
             display: 'flex', flexDirection: 'column', gap: 2,
-            background: '#2a2a2a', borderRadius: 10, padding: 4,
+            background: '#2a2a2a', borderRadius: 8, padding: 3,
             border: '1px solid rgba(255,255,255,0.11)',
-            boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+            boxShadow: '0 3px 12px rgba(0,0,0,0.5)',
           }}>
             {TICK_OPTIONS.map((opt) => (
               <button
                 key={opt.value}
                 onClick={() => { setTickSize(opt.value); setTickOpen(false); }}
                 style={{
-                  width: 44, height: 36, borderRadius: 8, border: 'none', cursor: 'pointer',
+                  width: 33, height: 27, borderRadius: 6, border: 'none', cursor: 'pointer',
                   background: opt.value === tickSize ? '#001eff' : 'transparent',
-                  color: '#eee', fontSize: 14, fontWeight: 600,
+                  color: '#eee', fontSize: 11, fontWeight: 600,
                 }}
               >
                 {opt.label}
@@ -88,14 +88,14 @@ export default function ChartToolbar() {
         title="Draw Line"
         onClick={() => setDrawingMode(!drawingMode)}
         style={{
-          width: 48, height: 48, display: 'flex', alignItems: 'center', justifyContent: 'center',
-          borderRadius: 10, border: 'none', cursor: 'pointer',
+          width: 36, height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          borderRadius: 8, border: 'none', cursor: 'pointer',
           background: drawingMode ? 'rgba(66,66,66,0.8)' : 'transparent',
           color: drawingMode ? '#eee' : 'rgba(238,238,238,0.33)',
           transition: 'color 0.15s, background 0.15s',
         }}
       >
-        <Minus size={28} strokeWidth={1.5} />
+        <Minus size={21} strokeWidth={1.5} />
       </button>
 
       {/* Clear all drawings */}
@@ -103,14 +103,14 @@ export default function ChartToolbar() {
         title="Clear Drawings"
         onClick={triggerClear}
         style={{
-          width: 48, height: 48, display: 'flex', alignItems: 'center', justifyContent: 'center',
-          borderRadius: 10, border: 'none', cursor: 'pointer',
+          width: 36, height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          borderRadius: 8, border: 'none', cursor: 'pointer',
           background: 'transparent',
           color: 'rgba(238,238,238,0.33)',
           transition: 'color 0.15s, background 0.15s',
         }}
       >
-        <Trash2 size={22} strokeWidth={1.5} />
+        <Trash2 size={17} strokeWidth={1.5} />
       </button>
     </div>
   );

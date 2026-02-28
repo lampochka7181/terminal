@@ -1,6 +1,8 @@
+import { PublicKey } from '@solana/web3.js';
 import { marketService } from '../services/market.service.js';
 import { priceFeedService } from '../services/price-feed.service.js';
-import { anchorClient } from '../lib/anchor-client.js';
+import { anchorClient, fetchMarketV2OnChainState } from '../lib/anchor-client.js';
+import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
 import { logger, logEvents } from '../lib/logger.js';
 import { broadcastMarketActivated } from '../lib/broadcasts.js';
 import { config } from '../config.js';
@@ -62,18 +64,41 @@ async function activateMarketEntry(market: Awaited<ReturnType<typeof marketServi
     return;
   }
   
-  // 2. Activate on-chain (set strike price and change status to OPEN)
-  if (anchorClient.isReady()) {
+  // 2. Pre-flight: check on-chain status before attempting activation
+  let alreadyActive = false;
+  if (anchorClient.isReady() && config.useV2) {
+    try {
+      const chainState = await fetchMarketV2OnChainState(
+        anchorClient.getConnection(),
+        new PublicKey(pubkey),
+      );
+      if (!chainState) {
+        logger.warn(`[MarketActivator] ${pubkey.slice(0, 8)} on-chain account gone, skipping`);
+        await marketService.markArchived(id);
+        return;
+      }
+      if (chainState.status !== 'OPEN' || chainState.statusRaw !== 0) {
+        // statusRaw 0 = Pending, 1 = Open; anything other than Pending means already activated
+        alreadyActive = chainState.statusRaw !== 0;
+        if (alreadyActive) {
+          logger.info(`[MarketActivator] ${pubkey.slice(0, 8)} already ${chainState.status} on-chain (raw=${chainState.statusRaw}), updating DB only`);
+        }
+      }
+    } catch (err: any) {
+      logger.debug(`[MarketActivator] Pre-flight check failed for ${pubkey.slice(0, 8)}: ${err.message}`);
+    }
+  }
+
+  // 3. Activate on-chain (only if not already active)
+  if (!alreadyActive && anchorClient.isReady()) {
     try {
       if (config.useV2) {
-        // V2: Tokenized shares market
         await anchorClient.activateMarketV2({
           marketPubkey: pubkey,
           strikePrice: currentPrice,
         });
         logger.info(`✅ Activated on-chain MarketV2 ${asset}-${timeframe} with strike $${currentPrice.toLocaleString()}`);
       } else {
-        // V1: Position PDAs market
         await anchorClient.activateMarket({
           marketPubkey: pubkey,
           strikePrice: currentPrice,
@@ -85,21 +110,24 @@ async function activateMarketEntry(market: Awaited<ReturnType<typeof marketServi
       const errorLogs = err.logs ? err.logs.join(' ') : '';
       const fullError = errorMsg + ' ' + errorLogs;
       
-      // If market is already activated (not PENDING on-chain), that's fine - just update DB
-      // Error code 0x1774 (6004) = MarketNotPending
-      if (fullError.includes('MarketNotPending') || fullError.includes('0x1774') || fullError.includes('6004')) {
+      if (fullError.includes('MarketNotPending') || fullError.includes('0x1776') || fullError.includes('6006')) {
         logger.debug(`Market ${pubkey.slice(0, 8)} already activated on-chain, updating DB only`);
       } else {
         logger.error(`❌ Failed to activate market ${pubkey} on-chain: ${errorMsg}`);
-        return; // Don't activate in DB if on-chain failed unexpectedly
+        return;
       }
     }
-  } else {
-    // Anchor client not ready - still activate in DB for testing
+  } else if (!anchorClient.isReady()) {
     logger.warn(`Anchor client not ready, activating market ${pubkey} in DB only`);
   }
   
-  // 3. Update DB: status -> OPEN, strikePrice -> real price
+  // 4. Sync chain status and update DB
+  if (anchorClient.isReady() && config.useV2) {
+    const chainState = await syncMarketStatusFromChain(id, pubkey, 'OPEN');
+    if (chainState && chainState.status !== 'OPEN') {
+      logger.warn(`[MarketActivator] On-chain status after activation is ${chainState.status}, expected OPEN`);
+    }
+  }
   await marketService.activateMarket(id, currentPrice.toString());
   
   // 4. Broadcast activation to all connected clients for instant UI update

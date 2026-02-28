@@ -314,9 +314,16 @@ export function broadcastMarketResolved(
   finalPrice: number,
   strikePrice: number,
 ): void {
+  const data = { marketId, outcome, finalPrice, strikePrice, timestamp: Date.now() };
   broadcast(`market:${marketId}`, {
     type: 'market_resolved',
-    data: { marketId, outcome, finalPrice, strikePrice, timestamp: Date.now() },
+    data,
+  });
+
+  broadcastGlobal({
+    type: 'market_resolved',
+    channel: 'market',
+    data,
   });
 }
 

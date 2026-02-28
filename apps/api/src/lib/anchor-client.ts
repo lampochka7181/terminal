@@ -265,6 +265,48 @@ export function getSettlementBitmapPda(marketV2Pubkey: PublicKey, chunkIndex: nu
   return pda;
 }
 
+// On-chain MarketStatusV2 enum values (must match state_v2.rs)
+const CHAIN_STATUS_MAP: Record<number, string> = {
+  0: 'OPEN',       // Pending on-chain (DB uses OPEN + strikePrice='0')
+  1: 'OPEN',       // Open
+  2: 'CLOSED',     // Closed
+  3: 'RESOLVED',   // Resolved
+  4: 'RESOLVED',   // Settling on-chain; maps to RESOLVED in DB (transient state)
+  5: 'SETTLED',    // Fully settled
+};
+
+// Byte offset of `status` field inside a MarketV2 account (after 8-byte discriminator)
+// 8(disc) + 8(id) + 32(authority) + 10(asset) + 10(timeframe) + 8(strike) + 8(final) + 8(created) + 8(expiry) + 8(resolved) + 8(settled) = 116
+const MARKET_V2_STATUS_OFFSET = 116;
+// open_interest offset: status(1) + outcome(1) + volume(8) + trades(4) + yes_mint(32) + no_mint(32) = +78 from status
+const MARKET_V2_OPEN_INTEREST_OFFSET = MARKET_V2_STATUS_OFFSET + 1 + 1 + 8 + 4 + 32 + 32; // 194
+
+export interface MarketV2ChainState {
+  status: string;       // Mapped DB status string
+  statusRaw: number;    // Raw on-chain enum value
+  openInterest: bigint; // Raw open_interest (USDC lamports)
+}
+
+/**
+ * Read the on-chain status and open_interest of a MarketV2 account.
+ * Returns null if the account does not exist (already finalized/closed).
+ */
+export async function fetchMarketV2OnChainState(
+  connection: Connection,
+  marketPubkey: PublicKey,
+): Promise<MarketV2ChainState | null> {
+  const info = await connection.getAccountInfo(marketPubkey);
+  if (!info || !info.data || info.data.length < MARKET_V2_OPEN_INTEREST_OFFSET + 8) {
+    return null;
+  }
+
+  const statusRaw = info.data[MARKET_V2_STATUS_OFFSET];
+  const status = CHAIN_STATUS_MAP[statusRaw] ?? 'OPEN';
+  const openInterest = info.data.readBigUInt64LE(MARKET_V2_OPEN_INTEREST_OFFSET);
+
+  return { status, statusRaw, openInterest };
+}
+
 /**
  * Solana client for interacting with the Degen Terminal program
  * Uses raw instruction building for maximum compatibility
@@ -812,7 +854,8 @@ export class AnchorClient {
   async submitTransaction(
     instructions: TransactionInstruction[],
     additionalSigners: Keypair[] = [],
-    contextLabel: string = 'Transaction'
+    contextLabel: string = 'Transaction',
+    opts?: { priorityMicroLamports?: number; computeUnits?: number }
   ): Promise<string> {
     if (!this.relayerKeypair) {
       throw new Error('Relayer keypair not set');
@@ -820,10 +863,12 @@ export class AnchorClient {
 
     const transaction = new Transaction();
 
-    // Add compute budget with higher priority fee for faster inclusion
+    // Add compute budget with priority fee (override-able for settlement ops)
+    const computeUnits = opts?.computeUnits ?? 400000;
+    const priorityFee = opts?.priorityMicroLamports ?? 10000;
     transaction.add(
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 400000 }),
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 10000 })  // 10x priority for faster slot inclusion
+      ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
     );
 
     // Add instructions
@@ -2374,7 +2419,11 @@ export class AnchorClient {
     }
 
     const instruction = await this.buildResolveMarketV2Instruction(params);
-    const signature = await this.submitTransaction([instruction], [], `Resolve MarketV2 ${params.marketPubkey.slice(0, 8)} (${params.outcome})`);
+    const signature = await this.submitTransaction(
+      [instruction], [],
+      `Resolve MarketV2 ${params.marketPubkey.slice(0, 8)} (${params.outcome})`,
+      { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
+    );
 
     logger.info(`MarketV2 resolved on-chain: ${signature} (outcome=${params.outcome}, price=${params.finalPrice})`);
 
@@ -2633,6 +2682,7 @@ export class AnchorClient {
     const signature = await this.submitTransaction(
       [instruction], [],
       `PostMerkleRoot ${params.marketPubkey.slice(0, 8)} (${params.totalSettlements} settlements)`,
+      { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
     );
     logger.info(`PostMerkleRoot executed: ${signature}`);
     return signature;
@@ -2740,6 +2790,7 @@ export class AnchorClient {
     const signature = await this.submitTransaction(
       allIxs, [],
       `BatchSettleV2 ${entries.length} entries (Market ${params.marketPubkey.slice(0, 8)})`,
+      { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
     );
     logger.info(`BatchSettleV2 executed: ${signature} (${entries.length} settlements)`);
     return signature;
@@ -2790,6 +2841,7 @@ export class AnchorClient {
     const signature = await this.submitTransaction(
       [instruction], [],
       `BurnRemainingSharesV2 ${params.userShareAtas.length} ATAs (Market ${params.marketPubkey.slice(0, 8)})`,
+      { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
     );
     logger.info(`BurnRemainingSharesV2 executed: ${signature} (${params.userShareAtas.length} ATAs burned)`);
     return signature;
@@ -2842,8 +2894,63 @@ export class AnchorClient {
     const signature = await this.submitTransaction(
       [instruction], [],
       `FinalizeMarketV2 ${params.marketPubkey.slice(0, 8)}`,
+      { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
     );
     logger.info(`FinalizeMarketV2 executed: ${signature}`);
+    return signature;
+  }
+
+  /**
+   * Atomically resolve a V2 market AND post the merkle root in one TX.
+   * Saves ~2s by eliminating one full TX round-trip between resolve and postMerkleRoot.
+   * Market transitions directly from Open/Closed → Settling.
+   */
+  async resolveAndPostMerkleRootV2(params: {
+    marketPubkey: string;
+    outcome: 'YES' | 'NO';
+    finalPrice: number;
+    merkleRoot: Uint8Array;    // 32 bytes
+    totalAmount: bigint;       // USDC native units (6 decimals)
+    totalSettlements: number;
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const bitmapPda = getSettlementBitmapPda(market, 0);
+
+    const discriminator = computeDiscriminator('resolve_and_post_merkle_root_v2');
+
+    // Args: outcome (u8) + final_price (u64) + merkle_root [u8;32] + total_amount (u64) + total_settlements (u64)
+    // Total: 1 + 8 + 32 + 8 + 8 = 57 bytes
+    const argsBuffer = Buffer.alloc(57);
+    argsBuffer.writeUInt8(params.outcome === 'YES' ? 0 : 1, 0);
+    const finalPriceU64 = BigInt(Math.floor(params.finalPrice * 100_000_000));
+    argsBuffer.writeBigUInt64LE(finalPriceU64, 1);
+    Buffer.from(params.merkleRoot).copy(argsBuffer, 9, 0, 32);
+    argsBuffer.writeBigUInt64LE(params.totalAmount, 41);
+    argsBuffer.writeBigUInt64LE(BigInt(params.totalSettlements), 49);
+
+    const data = Buffer.concat([discriminator, argsBuffer]);
+
+    const instruction = new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: market, isSigner: false, isWritable: true },
+        { pubkey: bitmapPda, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair!.publicKey, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data,
+    });
+
+    const signature = await this.submitTransaction(
+      [instruction], [],
+      `ResolveAndPostMerkleRoot ${params.marketPubkey.slice(0, 8)} (${params.outcome}, ${params.totalSettlements} settlements)`,
+      { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
+    );
+    logger.info(`ResolveAndPostMerkleRootV2 executed: ${signature} (outcome=${params.outcome}, settlements=${params.totalSettlements})`);
     return signature;
   }
 }

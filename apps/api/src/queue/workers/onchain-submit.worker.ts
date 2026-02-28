@@ -19,6 +19,7 @@ import { db } from '../../db/index.js';
 import { sql } from 'drizzle-orm';
 import { dbSyncQueue } from '../queues.js';
 import type { OnchainSubmitJobData, DbSyncJobData } from '../queues.js';
+import { triggerMerkleSettlement } from '../../jobs/merkle-settler.js';
 
 // In-memory cache for market status checks (avoid DB query per on-chain job)
 const marketStatusCache = new Map<string, { status: string; fetchedAt: number }>();
@@ -50,6 +51,27 @@ function redisOpts() {
     username: url.username || undefined,
     maxRetriesPerRequest: null as null,
   };
+}
+
+/**
+ * After a batch-settle completes, check if all batches for the market are done.
+ * If so, immediately trigger merkle finalization (eliminates ~9s polling gap).
+ */
+async function checkAndTriggerSettlementCompletion(marketId: string): Promise<void> {
+  try {
+    const pending = await db.execute(sql`
+      SELECT COUNT(*)::int AS cnt FROM settlement_jobs
+      WHERE market_id = ${marketId}::uuid AND status NOT IN ('COMPLETED')
+    `);
+    if (((pending.rows?.[0] as any)?.cnt || 0) === 0) {
+      logger.info(`[QUEUE:onchain] All batches complete for ${marketId}, triggering finalization`);
+      triggerMerkleSettlement(marketId).catch(err => {
+        logger.warn(`[QUEUE:onchain] Merkle trigger failed for ${marketId}: ${(err as Error).message}`);
+      });
+    }
+  } catch (err: any) {
+    logger.debug(`[QUEUE:onchain] Completion check failed (non-fatal): ${err.message}`);
+  }
 }
 
 /**
@@ -87,6 +109,9 @@ async function executeBatchSettle(payload: Record<string, any>): Promise<{ succe
       WHERE market_id = ${marketId}::uuid AND batch_index = ${batchIndex}
     `);
 
+    // Check if all batches done → trigger finalization immediately
+    await checkAndTriggerSettlementCompletion(marketId);
+
     return { success: true, signature: sig };
   } catch (err: any) {
     const msg = err.message || '';
@@ -98,6 +123,8 @@ async function executeBatchSettle(payload: Record<string, any>): Promise<{ succe
         SET status = 'COMPLETED', completed_at = NOW()
         WHERE market_id = ${marketId}::uuid AND batch_index = ${batchIndex}
       `);
+      // Check if all batches done → trigger finalization immediately
+      await checkAndTriggerSettlementCompletion(marketId);
       return { success: true, signature: 'already_claimed' };
     }
 
@@ -207,7 +234,8 @@ async function processJob(job: Job<OnchainSubmitJobData>): Promise<void> {
   } else {
     // Check if this is a permanent error that should not be retried
     const permanentCodes = ['INSUFFICIENT_FUNDS', 'INSUFFICIENT_SHARES', 'FEE_TOO_LOW',
-      'POSITION_LIMIT', 'MARKET_CLOSED', 'INVALID_SIGNATURE', 'SELF_TRADE', 'ACCOUNT_NOT_FOUND'];
+      'POSITION_LIMIT', 'MARKET_CLOSED', 'INVALID_SIGNATURE', 'SELF_TRADE', 'ACCOUNT_NOT_FOUND',
+      'INSUFFICIENT_LAMPORTS', 'MAX_RETRIES'];
 
     if (result.errorCode && permanentCodes.includes(result.errorCode)) {
       logger.warn(`[QUEUE:onchain] Permanent failure for ${idempotencyKey}: ${result.errorCode}`);
@@ -265,8 +293,37 @@ export function startOnchainSubmitWorker(): Worker {
     },
   });
 
-  worker.on('failed', (job, err) => {
-    logger.warn(`[QUEUE:onchain] Job ${job?.id} failed: ${err.message}`);
+  worker.on('failed', async (job, err) => {
+    if (!job) {
+      logger.warn(`[QUEUE:onchain] Job (unknown) failed: ${err.message}`);
+      return;
+    }
+
+    const maxAttempts = job.opts?.attempts ?? 5;
+    const isFinalFailure = job.attemptsMade >= maxAttempts;
+    const { type, idempotencyKey, payload } = job.data;
+
+    logger.warn(`[QUEUE:onchain] Job ${job.id} failed (attempt ${job.attemptsMade}/${maxAttempts}): ${err.message}`);
+
+    // On final BullMQ failure, mark trade as FAILED in DB (safety net)
+    if (isFinalFailure && (type === 'match' || type === 'close')) {
+      logger.error(`[QUEUE:onchain] FINAL FAILURE for ${type} job ${idempotencyKey} — marking trade as FAILED`);
+      try {
+        const syncData: DbSyncJobData = {
+          tradeId: payload.tradeId,
+          makerOrderId: payload.makerOrderId,
+          takerOrderId: payload.takerOrderId,
+          txSignature: '',
+          status: 'FAILED',
+          errorCode: 'MAX_RETRIES_EXHAUSTED',
+        };
+        await dbSyncQueue.add('db-sync', syncData, {
+          jobId: `dbsync-exhausted-${idempotencyKey}`,
+        });
+      } catch (syncErr: any) {
+        logger.error(`[QUEUE:onchain] Failed to enqueue db-sync for failed job: ${syncErr.message}`);
+      }
+    }
   });
 
   worker.on('error', (err) => {

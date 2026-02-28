@@ -24,15 +24,15 @@ export default function Orderbook() {
 
   if (!hasData) {
     return (
-      <div style={{ fontSize: 20, height: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', color: 'rgba(238,238,238,0.33)' }}>
+      <div style={{ fontSize: 15, height: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', color: 'rgba(238,238,238,0.33)' }}>
         Waiting for orders...
       </div>
     );
   }
 
   return (
-    <div style={{ fontSize: 20, height: '100%', display: 'flex', flexDirection: 'column' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 18, color: 'rgba(238,238,238,0.33)', marginBottom: 4, padding: '0 4px' }}>
+    <div style={{ fontSize: 15, height: '100%', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14, color: 'rgba(238,238,238,0.33)', marginBottom: 3, padding: '0 3px' }}>
         <span style={{ color: 'rgba(149,255,148,0.5)' }}>YES</span>
         <span>AMOUNT</span>
         <span>TOTAL</span>
@@ -41,7 +41,7 @@ export default function Orderbook() {
       {yesAsksReversed.map((ask: any, i: number) => {
         const total = ask.total ?? ask.size;
         return (
-          <div key={`yes-${i}`} style={{ position: 'relative', display: 'flex', justifyContent: 'space-between', padding: '3px 4px', lineHeight: '32px' }}>
+          <div key={`yes-${i}`} style={{ position: 'relative', display: 'flex', justifyContent: 'space-between', padding: '2px 3px', lineHeight: '24px' }}>
             <div style={{ position: 'absolute', top: 0, right: 0, bottom: 0, width: `${(total / maxTotal) * 100}%`, background: 'rgba(149,255,148,0.10)', borderRadius: 2 }} />
             <span style={{ color: '#95ff94', position: 'relative', zIndex: 1, fontVariantNumeric: 'tabular-nums', fontWeight: 500 }}>{ask.price.toFixed(2)}</span>
             <span style={{ color: '#eee', position: 'relative', zIndex: 1, fontVariantNumeric: 'tabular-nums', fontWeight: 500 }}>${Math.round(ask.size * ask.price).toLocaleString()}</span>
@@ -50,14 +50,14 @@ export default function Orderbook() {
         );
       })}
 
-      <div style={{ display: 'flex', justifyContent: 'center', padding: '4px 4px', margin: '2px 0', fontSize: 18, color: 'rgba(238,238,238,0.33)' }}>
+      <div style={{ display: 'flex', justifyContent: 'center', padding: '3px 3px', margin: '2px 0', fontSize: 14, color: 'rgba(238,238,238,0.33)' }}>
         SPREAD: {spread.toFixed(2)}
       </div>
 
       {noAsks.map((ask: any, i: number) => {
         const total = ask.total ?? ask.size;
         return (
-          <div key={`no-${i}`} style={{ position: 'relative', display: 'flex', justifyContent: 'space-between', padding: '3px 4px', lineHeight: '32px' }}>
+          <div key={`no-${i}`} style={{ position: 'relative', display: 'flex', justifyContent: 'space-between', padding: '2px 3px', lineHeight: '24px' }}>
             <div style={{ position: 'absolute', top: 0, right: 0, bottom: 0, width: `${(total / maxTotal) * 100}%`, background: 'rgba(255,92,95,0.10)', borderRadius: 2 }} />
             <span style={{ color: '#ff5c5f', position: 'relative', zIndex: 1, fontVariantNumeric: 'tabular-nums', fontWeight: 500 }}>{ask.price.toFixed(2)}</span>
             <span style={{ color: '#eee', position: 'relative', zIndex: 1, fontVariantNumeric: 'tabular-nums', fontWeight: 500 }}>${Math.round(ask.size * ask.price).toLocaleString()}</span>

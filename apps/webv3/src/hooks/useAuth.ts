@@ -32,18 +32,13 @@ export function useAuth() {
 
     await authSignIn(wallet.publicKey.toBase58(), wallet.signMessage);
     
-    // Check if sign-in actually succeeded before continuing
-    // (authSignIn may return early without error if wallet signing fails)
     const { isAuthenticated: nowAuthenticated, token: newToken } = useAuthStore.getState();
     if (!nowAuthenticated || !newToken) {
       console.debug('[useAuth] Sign-in did not complete, skipping user data fetch');
       return;
     }
     
-    // Start token refresh
     startTokenRefresh();
-    
-    // Fetch user data after sign in
     await fetchAllUser();
   }, [wallet.publicKey, wallet.signMessage, authSignIn, fetchAllUser]);
 

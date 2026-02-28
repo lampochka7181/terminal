@@ -18,6 +18,9 @@ import { relations } from 'drizzle-orm';
 // Enums
 // Note: PENDING exists in DB enum but we don't use it - we use strikePrice = '0' to indicate pending
 // This avoids Supabase connection pooler enum caching issues
+// Note: On-chain has a SETTLING state between RESOLVED and SETTLED, but we don't use it
+// in the DB — Supabase connection pooler caches enum values and won't see new ones.
+// Settling state is transient and can be read from chain directly when needed.
 export const marketStatusEnum = pgEnum('market_status', ['OPEN', 'CLOSED', 'RESOLVED', 'SETTLED', 'SETTLEMENT_FAILED']);
 export const orderSideEnum = pgEnum('order_side', ['BID', 'ASK']);
 export const orderOutcomeEnum = pgEnum('order_outcome', ['YES', 'NO']);

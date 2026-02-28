@@ -21,6 +21,7 @@ pub mod resolve_market_v2;
 
 // V2 merkle settlement instructions
 pub mod post_merkle_root;
+pub mod resolve_and_post_merkle_root_v2;
 pub mod batch_settle_v2;
 pub mod burn_remaining_shares_v2;
 pub mod finalize_market_v2;
@@ -49,6 +50,7 @@ pub use resolve_market_v2::*;
 
 // V2 merkle settlement exports
 pub use post_merkle_root::*;
+pub use resolve_and_post_merkle_root_v2::*;
 pub use batch_settle_v2::*;
 pub use burn_remaining_shares_v2::*;
 pub use finalize_market_v2::*;

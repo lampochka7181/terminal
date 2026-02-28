@@ -5,6 +5,7 @@ import { db, markets, positions, settlements, users } from '../db/index.js';
 import { positionService } from '../services/position.service.js';
 import { marketService } from '../services/market.service.js';
 import { anchorClient, getYesMintPda, getNoMintPda } from '../lib/anchor-client.js';
+import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
 import { buildMerkleTree, createSettlementLeaf, verifyMerkleProof, type SettlementLeaf, type MerkleTree } from '../lib/merkle-tree.js';
 import { broadcastUserSettlement } from '../lib/broadcasts.js';
 import { onchainSubmitQueue } from '../queue/queues.js';
@@ -44,6 +45,7 @@ interface SettlingState {
   batchesCreated: boolean;
   totalBatches: number;
   batchSignatures: string[];
+  rootPosted?: boolean; // Set by combined resolve+postMerkleRoot to skip redundant postMerkleRoot call
 }
 const settlingState = new Map<string, SettlingState>();
 
@@ -61,7 +63,13 @@ export async function merkleSettlerJob(): Promise<void> {
     if (processingMarkets.has(market.id)) continue;
 
     const hasTrades = parseFloat(market.totalVolume || '0') > 0;
-    if (!hasTrades) continue;
+    if (!hasTrades) {
+      // Zero-trade markets: skip merkle settlement, mark as SETTLED so market-closer
+      // picks them up and closes on-chain accounts to recover rent (~0.009 SOL each)
+      logger.info(`[MerkleSettler] Marking zero-trade market ${market.asset}-${market.timeframe} (${market.pubkey.slice(0, 8)}) as SETTLED for cleanup`);
+      await marketService.markSettled(market.id);
+      continue;
+    }
 
     processingMarkets.add(market.id);
     try {
@@ -71,6 +79,108 @@ export async function merkleSettlerJob(): Promise<void> {
     } finally {
       processingMarkets.delete(market.id);
     }
+  }
+}
+
+/**
+ * Pre-seed the settling state from already-fetched settlement data.
+ * Called from market-resolver DURING the resolve TX (parallel prep) so the
+ * merkle tree is ready the instant the resolve TX confirms — saves ~300ms
+ * of DB queries that buildSettlementState would otherwise do.
+ */
+export function preSeedSettlingState(
+  marketId: string,
+  outcome: 'YES' | 'NO',
+  positions: Array<{ id: string; userId: string | null; yesShares: string | null; noShares: string | null }>,
+  walletMap: Map<string, string | null>,
+): boolean {
+  if (settlingState.has(marketId)) return false;
+
+  const leaves: SettlingState['leaves'] = [];
+  for (const position of positions) {
+    const yesShares = parseFloat(position.yesShares || '0');
+    const noShares = parseFloat(position.noShares || '0');
+    const winningShares = outcome === 'YES' ? yesShares : noShares;
+    if (winningShares <= 0) continue;
+
+    const wallet = position.userId ? walletMap.get(position.userId) : null;
+    if (!wallet) continue;
+
+    const amount = BigInt(Math.round(winningShares * 1_000_000));
+    leaves.push({ recipient: new PublicKey(wallet), amount, positionId: position.id, userId: position.userId });
+  }
+
+  if (leaves.length === 0) return false;
+
+  const treeLeaves: SettlementLeaf[] = leaves.map(l => ({ recipient: l.recipient, amount: l.amount }));
+  const tree = buildMerkleTree(treeLeaves);
+  const totalAmount = leaves.reduce((sum, l) => sum + l.amount, 0n);
+
+  settlingState.set(marketId, { leaves, tree, totalAmount, batchesCreated: false, totalBatches: 0, batchSignatures: [] });
+  logger.info(`[MerkleSettler] Pre-seeded merkle tree: ${leaves.length} leaves, totalAmount=${totalAmount}, root=${Buffer.from(tree.root).toString('hex').slice(0, 16)}...`);
+  return true;
+}
+
+/**
+ * Get the pre-seeded merkle tree info for the combined resolve+postMerkleRoot instruction.
+ * Returns null if no state is pre-seeded for this market.
+ */
+export function getPreSeededMerkleData(marketId: string): {
+  merkleRoot: Uint8Array;
+  totalAmount: bigint;
+  totalSettlements: number;
+} | null {
+  const state = settlingState.get(marketId);
+  if (!state) return null;
+  return {
+    merkleRoot: state.tree.root,
+    totalAmount: state.totalAmount,
+    totalSettlements: state.leaves.length,
+  };
+}
+
+/**
+ * Mark that the merkle root was already posted on-chain (via combined instruction).
+ * processMarketSettlement will skip the separate postMerkleRoot call.
+ */
+export function markRootPosted(marketId: string): void {
+  const state = settlingState.get(marketId);
+  if (state) {
+    state.rootPosted = true;
+  }
+}
+
+/**
+ * Direct trigger for merkle settlement — called from market-resolver and
+ * onchain-submit worker to eliminate polling gaps.
+ * Safe to call multiple times: idempotent pipeline + processingMarkets guard.
+ *
+ * @param marketId    Market UUID
+ * @param marketObj   Optional pre-fetched market row (avoids a DB round-trip when caller already has it)
+ */
+export async function triggerMerkleSettlement(
+  marketId: string,
+  marketObj?: typeof markets.$inferSelect,
+): Promise<void> {
+  if (!config.useV2 || !anchorClient.isReady()) return;
+  if (processingMarkets.has(marketId)) return;
+
+  const market = marketObj ?? (await db.select().from(markets).where(eq(markets.id, marketId)).limit(1))[0];
+  if (!market || market.status !== 'RESOLVED') return;
+  if (parseFloat(market.totalVolume || '0') <= 0) {
+    // Zero-trade market: mark as SETTLED for cleanup
+    logger.info(`[MerkleSettler] Marking zero-trade market ${market.asset}-${market.timeframe} (${market.pubkey.slice(0, 8)}) as SETTLED for cleanup`);
+    await marketService.markSettled(market.id);
+    return;
+  }
+
+  processingMarkets.add(marketId);
+  try {
+    await processMarketSettlement(market);
+  } catch (err: any) {
+    logger.error(`[MerkleSettler] Triggered settlement failed for ${marketId}: ${err.message}`);
+  } finally {
+    processingMarkets.delete(marketId);
   }
 }
 
@@ -103,8 +213,11 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
     settlingState.set(marketId, state);
   }
 
-  // Step 2: Post merkle root on-chain
-  try {
+  // Step 2: Post merkle root on-chain (skip if combined resolve+post already did it)
+  if (state.rootPosted) {
+    logger.info(`[MerkleSettler] Merkle root already posted via combined instruction for ${market.asset}-${market.timeframe}, skipping to batch creation`);
+    marketFailureCount.delete(marketId);
+  } else try {
     const sig = await anchorClient.postMerkleRoot({
       marketPubkey,
       merkleRoot: state.tree.root,
@@ -112,7 +225,9 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
       totalSettlements: state.leaves.length,
     });
     logger.info(`[MerkleSettler] Merkle root posted for ${market.asset}-${market.timeframe}: ${sig}`);
-    marketFailureCount.delete(marketId); // Reset on success
+    marketFailureCount.delete(marketId);
+    // Skip syncMarketStatusFromChain — the TX just confirmed so we know the
+    // on-chain state is SETTLING. DB stays RESOLVED until finalize. (~300ms saved)
   } catch (err: any) {
     const msg = err.message || '';
     if (msg.includes('MerkleRootAlreadySet') || msg.includes('already in use') || msg.includes('MarketNotSettling')) {
@@ -341,7 +456,8 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
     }
   }
 
-  // Step 7: Sync DB
+  // Step 7: Verify on-chain state, then sync DB
+  await syncMarketStatusFromChain(marketId, marketPubkey, 'RESOLVED');
   await syncSettlementToDb(market, state, outcome);
 
   // Cleanup

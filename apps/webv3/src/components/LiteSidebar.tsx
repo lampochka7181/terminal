@@ -9,7 +9,9 @@ import { useOrder } from '@/hooks/useOrder';
 import { useSessionKey } from '@/hooks/useSessionKey';
 import { useDelegation } from '@/hooks/useDelegation';
 import { useSelectedMarket, useMarketStore } from '@/stores/marketStore';
+import { usePriceStore } from '@/stores/priceStore';
 import { useOrderbook, useBestPrices } from '@/hooks/useOrderbook';
+import { useWalletModal } from '@solana/wallet-adapter-react-ui';
 
 const bdr = '1px solid rgba(255,255,255,0.11)';
 const dim = 'rgba(238,238,238,0.33)';
@@ -32,20 +34,20 @@ function InfoDot({ text }: { text?: string }) {
       <div
         onClick={() => text && setOpen(o => !o)}
         style={{
-          width: 24, height: 24, borderRadius: '50%', border: `1px solid ${dim}`,
+          width: 18, height: 18, borderRadius: '50%', border: `1px solid ${dim}`,
           display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
           cursor: text ? 'pointer' : 'default',
         }}
       >
-        <span style={{ fontSize: 14, color: dim, fontWeight: 500 }}>i</span>
+        <span style={{ fontSize: 11, color: dim, fontWeight: 500 }}>i</span>
       </div>
       {open && text && (
         <div style={{
-          position: 'absolute', top: 32, left: '50%', transform: 'translateX(-50%)',
-          width: 280, padding: '12px 16px', borderRadius: 10,
+          position: 'absolute', top: 24, left: '50%', transform: 'translateX(-50%)',
+          width: 210, padding: '9px 12px', borderRadius: 8,
           background: '#333', border: '1px solid rgba(255,255,255,0.15)',
-          fontSize: 18, lineHeight: '24px', color: '#ddd', zIndex: 50,
-          boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+          fontSize: 14, lineHeight: '18px', color: '#ddd', zIndex: 50,
+          boxShadow: '0 6px 18px rgba(0,0,0,0.5)',
         }}>
           {text}
         </div>
@@ -55,7 +57,7 @@ function InfoDot({ text }: { text?: string }) {
 }
 
 export default function LiteSidebar() {
-  const { isAuthenticated, wallet } = useAuth();
+  const { isAuthenticated, wallet, signIn } = useAuth();
   const { balance, positions } = useUser();
   const sessionKey = useSessionKey();
   const { placeOrder, isPlacing } = useOrder(sessionKey.sessionSigner);
@@ -65,11 +67,13 @@ export default function LiteSidebar() {
   const yesPrices = useBestPrices('YES');
   const noPrices = useBestPrices('NO');
 
+  const { setVisible: setWalletModalVisible } = useWalletModal();
   const [amount, setAmount] = useState(25);
   const [timeframe, setTimeframe] = useState('5m');
   const [chatOpen, setChatOpen] = useState(false);
   const [delegationModalOpen, setDelegationModalOpen] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
+  const [closingPosition, setClosingPosition] = useState<string | null>(null);
   const [promptMsg, setPromptMsg] = useState({ title: '', message: '', type: 'info' as 'info' | 'error' | 'success' | 'warning' });
   const amountPresets = [25, 50, 100, 250];
 
@@ -79,9 +83,18 @@ export default function LiteSidebar() {
   }, []);
 
   const handlePlaceOrder = useCallback(async (outcome: 'yes' | 'no') => {
-    if (!wallet.connected) { showPrompt('Connect Wallet', 'Please connect your wallet.', 'warning'); return; }
-    if (!isAuthenticated) { showPrompt('Sign In', 'Please sign in first.', 'warning'); return; }
-    if (!delegation.isApproved) { showPrompt('Delegation Required', 'Please delegate USDC.', 'warning'); setDelegationModalOpen(true); return; }
+    if (!wallet.connected) { setWalletModalVisible(true); return; }
+    if (!isAuthenticated) {
+      try { await signIn(); } catch { return; }
+    }
+    const approved = await delegation.checkApproval();
+    if (!approved) { showPrompt('Delegation Required', 'Please delegate USDC.', 'warning'); setDelegationModalOpen(true); return; }
+    const delegatedUsd = delegation.delegatedAmount / 1_000_000;
+    if (amount > delegatedUsd) {
+      showPrompt('Insufficient Delegation', `You have $${delegatedUsd.toFixed(2)} delegated but need $${amount}. Please increase your delegation.`, 'warning');
+      setDelegationModalOpen(true);
+      return;
+    }
     if (!market) { showPrompt('No Market', 'No active market.', 'error'); return; }
 
     const prices = outcome === 'yes' ? yesPrices : noPrices;
@@ -97,12 +110,34 @@ export default function LiteSidebar() {
     });
 
     if (result && result.status !== 'error') {
-      // Refresh delegation amount so the displayed balance updates immediately
       setTimeout(() => delegation.checkApproval(), 500);
     } else if (result?.error) {
       showPrompt('Order Failed', result.error, 'error');
     }
-  }, [wallet.connected, isAuthenticated, delegation.isApproved, market, amount, yesPrices, noPrices, placeOrder, showPrompt, delegation]);
+  }, [wallet.connected, isAuthenticated, market, amount, yesPrices, noPrices, placeOrder, showPrompt, delegation, signIn, setWalletModalVisible]);
+
+  const handleClosePosition = useCallback(async (entry: { pos: { marketAddress: string }; isYes: boolean; shares: number }) => {
+    const outcome = entry.isYes ? 'yes' : 'no';
+    const key = `${entry.pos.marketAddress}-${outcome}`;
+    setClosingPosition(key);
+    try {
+      const result = await placeOrder({
+        marketAddress: entry.pos.marketAddress,
+        side: 'ask',
+        outcome: outcome as 'yes' | 'no',
+        orderType: 'market',
+        price: entry.isYes ? 0.01 : 0.99,
+        size: entry.shares,
+      });
+      if (result?.error) {
+        showPrompt('Close Failed', result.error, 'error');
+      } else if (result && result.filledSize === 0) {
+        showPrompt('No Liquidity', 'No liquidity available to close your position. It will settle automatically at market expiry.', 'warning');
+      }
+    } finally {
+      setClosingPosition(null);
+    }
+  }, [placeOrder, showPrompt]);
 
   const balanceDisplay = balance ? `$${balance.available.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}` : '$0';
   const delegatedDisplay = delegation.delegatedAmount > 0 ? `$${(delegation.delegatedAmount / 1_000_000).toLocaleString()}` : '$0';
@@ -119,6 +154,37 @@ export default function LiteSidebar() {
   const noPayout = noPrices.bestAsk > 0 ? `+$${Math.round(amount * (1 / noPrices.bestAsk - 1))}` : '--';
 
   const { selectedAsset } = useMarketStore();
+  const assetPrice = usePriceStore(s => s.prices[selectedAsset as keyof typeof s.prices]);
+
+  // Listen for sell events from TradeBubbles overlay
+  const handleBubbleSell = useCallback(async (outcome: 'yes' | 'no', mktAddr: string) => {
+    const pos = positions.find(p =>
+      (p.marketAddress === mktAddr || p.market === mktAddr) && p.status === 'open'
+    );
+    if (!pos) return;
+    const shares = outcome === 'yes' ? pos.yesShares : pos.noShares;
+    if (shares <= 0) return;
+    const result = await placeOrder({
+      marketAddress: pos.marketAddress,
+      side: 'ask',
+      outcome,
+      orderType: 'market',
+      price: outcome === 'yes' ? 0.01 : 0.99,
+      size: shares,
+    });
+    if (result && result.filledSize === 0) {
+      showPrompt('No Liquidity', 'No liquidity available to close your position. It will settle automatically at market expiry.', 'warning');
+    }
+  }, [positions, placeOrder, showPrompt]);
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { outcome, marketAddress: mktAddr } = (e as CustomEvent).detail;
+      handleBubbleSell(outcome, mktAddr);
+    };
+    window.addEventListener('trade-bubble-sell', handler);
+    return () => window.removeEventListener('trade-bubble-sell', handler);
+  }, [handleBubbleSell]);
 
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -135,74 +201,104 @@ export default function LiteSidebar() {
     }
     return true;
   });
-  const firstPosition = openPositions[0];
 
-  const liteBestAsk = firstPosition
-    ? (firstPosition.yesShares > 0 ? yesPrices.bestAsk : noPrices.bestAsk)
+  // Split positions with both YES and NO shares into separate display entries
+  type DisplayEntry = { pos: typeof openPositions[0]; isYes: boolean; shares: number; costBasis: number; entryPrice: number };
+  const displayEntries: DisplayEntry[] = [];
+  for (const pos of openPositions) {
+    const hasYes = pos.yesShares > 0;
+    const hasNo = pos.noShares > 0;
+    if (hasYes && hasNo) {
+      const yesEntry = pos.avgEntryYes ?? pos.avgEntryPrice;
+      const noEntry = pos.avgEntryNo ?? pos.avgEntryPrice;
+      const yesNotional = pos.yesShares * yesEntry;
+      const noNotional = pos.noShares * noEntry;
+      const totalNotional = yesNotional + noNotional;
+      const yesCost = pos.totalCost ? pos.totalCost * (yesNotional / totalNotional) : yesNotional;
+      const noCost = pos.totalCost ? pos.totalCost - yesCost : noNotional;
+      displayEntries.push({ pos, isYes: true, shares: pos.yesShares, costBasis: yesCost, entryPrice: yesEntry });
+      displayEntries.push({ pos, isYes: false, shares: pos.noShares, costBasis: noCost, entryPrice: noEntry });
+    } else if (hasYes) {
+      const yesEntry = pos.avgEntryYes ?? pos.avgEntryPrice;
+      displayEntries.push({ pos, isYes: true, shares: pos.yesShares, costBasis: pos.totalCost ?? pos.yesShares * yesEntry, entryPrice: yesEntry });
+    } else if (hasNo) {
+      const noEntry = pos.avgEntryNo ?? pos.avgEntryPrice;
+      displayEntries.push({ pos, isYes: false, shares: pos.noShares, costBasis: pos.totalCost ?? pos.noShares * noEntry, entryPrice: noEntry });
+    }
+  }
+  const firstEntry = displayEntries[0];
+
+  const liteBestAsk = firstEntry
+    ? (firstEntry.isYes ? yesPrices.bestAsk : noPrices.bestAsk)
     : 0;
   const liteHasLiquidity = liteBestAsk > 0 && liteBestAsk < 1;
-  const liveMark = firstPosition
+  let liveMark = firstEntry
     ? (liteHasLiquidity ? liteBestAsk : 0)
     : 0;
-  const liveShares = firstPosition
-    ? (firstPosition.yesShares > 0 ? firstPosition.yesShares : firstPosition.noShares)
-    : 0;
-  const liteCostBasis = firstPosition
-    ? (firstPosition.totalCost ?? (liveShares * firstPosition.avgEntryPrice))
-    : 0;
-  const livePnL = firstPosition
-    ? (liteHasLiquidity ? (liveMark - firstPosition.avgEntryPrice) * liveShares : -liteCostBasis)
+  let liteFallback = false;
+  if (firstEntry && !liteHasLiquidity && strikePrice > 0 && assetPrice) {
+    if (assetPrice > strikePrice) {
+      liveMark = firstEntry.isYes ? 0.999 : 0.001;
+      liteFallback = true;
+    } else if (assetPrice < strikePrice) {
+      liveMark = firstEntry.isYes ? 0.001 : 0.999;
+      liteFallback = true;
+    }
+  }
+  const liveShares = firstEntry?.shares ?? 0;
+  const liteCostBasis = firstEntry?.costBasis ?? 0;
+  const livePnL = firstEntry
+    ? ((liteHasLiquidity || liteFallback) ? (liveMark * liveShares) - liteCostBasis : -liteCostBasis)
     : 0;
 
   return (
     <>
       <div style={{
-        width: 720, minWidth: 720, background: '#1e1e1e', borderRadius: 22,
+        width: 540, minWidth: 540, background: '#1e1e1e', borderRadius: 17,
         display: 'flex', flexDirection: 'column', overflow: 'hidden', height: '100%',
       }}>
         {/* Balance */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 28px', flexShrink: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span style={{ fontSize: 20, color: dim, fontWeight: 500 }}>BAL</span>
-            <span style={{ fontSize: 26, fontWeight: 500, color: '#eee' }}>{balanceDisplay}</span>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 21px', flexShrink: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 15, color: dim, fontWeight: 500 }}>BAL</span>
+            <span style={{ fontSize: 20, fontWeight: 500, color: '#eee' }}>{balanceDisplay}</span>
           </div>
           <button
             onClick={() => setDelegationModalOpen(true)}
             style={{
-              display: 'flex', alignItems: 'center', gap: 6, padding: '4px 14px',
-              borderRadius: 8, background: 'rgba(81,176,72,0.12)', border: 'none',
-              color: '#95ff94', fontSize: 22, fontWeight: 500, cursor: 'pointer',
+              display: 'flex', alignItems: 'center', gap: 5, padding: '3px 11px',
+              borderRadius: 6, background: 'rgba(81,176,72,0.12)', border: 'none',
+              color: '#95ff94', fontSize: 17, fontWeight: 500, cursor: 'pointer',
             }}>
-            <Zap size={18} />
+            <Zap size={14} />
             <span>{delegatedDisplay}</span>
-            <ChevronDown size={16} />
+            <ChevronDown size={12} />
           </button>
         </div>
 
         <div style={{ height: 1, background: 'rgba(255,255,255,0.11)', flexShrink: 0 }} />
 
-        <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}>
-            <div style={{ padding: '14px 36px 4px' }}>
-              <h2 style={{ fontSize: 48, fontWeight: 500, color: '#fff', margin: 0, lineHeight: '54px' }}>Up or Down?</h2>
-              <p style={{ fontSize: 20, color: 'rgba(238,238,238,0.44)', lineHeight: '26px', margin: '4px 0 0' }}>
+        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}>
+            <div style={{ padding: '11px 27px 3px' }}>
+              <h2 style={{ fontSize: 36, fontWeight: 500, color: '#fff', margin: 0, lineHeight: '41px' }}>Up or Down?</h2>
+              <p style={{ fontSize: 15, color: 'rgba(238,238,238,0.44)', lineHeight: '20px', margin: '3px 0 0' }}>
                 Predict outcomes within timeframes.<br />0TDE Binary Options.
               </p>
             </div>
 
-            <div style={{ padding: '8px 36px 8px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                <span style={{ fontSize: 22, color: '#eee', fontWeight: 500 }}>1. SELECT ROUND TIMEFRAME</span>
+            <div style={{ padding: '6px 27px 6px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+                <span style={{ fontSize: 17, color: '#eee', fontWeight: 500 }}>1. SELECT ROUND TIMEFRAME</span>
                 <InfoDot text="Choose how long your prediction window lasts. Currently only 5-minute rounds are active." />
               </div>
-              <div style={{ display: 'flex', borderRadius: 12, background: 'rgba(238,238,238,0.05)', padding: 6, overflow: 'hidden' }}>
+              <div style={{ display: 'flex', borderRadius: 9, background: 'rgba(238,238,238,0.05)', padding: 5, overflow: 'hidden' }}>
                 {['1m', '5m', '15m', '1h'].map((tf) => {
                   const isActive = tf === '5m';
                   const isDisabled = !isActive;
                   return (
                     <button key={tf} disabled={isDisabled} onClick={() => !isDisabled && setTimeframe(tf)} style={{
-                      flex: 1, padding: '12px 0', borderRadius: 12, border: 'none',
-                      fontSize: 26, fontWeight: 600,
+                      flex: 1, padding: '9px 0', borderRadius: 9, border: 'none',
+                      fontSize: 20, fontWeight: 600,
                       cursor: isDisabled ? 'not-allowed' : 'pointer',
                       background: isActive ? '#001eff' : 'transparent',
                       color: isActive ? '#fff' : dim,
@@ -213,29 +309,29 @@ export default function LiteSidebar() {
               </div>
             </div>
 
-            <div style={{ padding: '6px 36px 8px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                <span style={{ fontSize: 22, color: '#eee', fontWeight: 500 }}>2. SELECT AMOUNT</span>
-                <InfoDot text="Set how much USDC to wager on this round. Minimum $5." />
+            <div style={{ padding: '5px 27px 6px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+                <span style={{ fontSize: 17, color: '#eee', fontWeight: 500 }}>2. SELECT AMOUNT</span>
+                <InfoDot text="Set how much USDC to wager on this round. Minimum $1." />
               </div>
-              <div style={{ display: 'flex', gap: 10, marginBottom: 10 }}>
+              <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
                 {amountPresets.map((p) => (
                   <button key={p} onClick={() => setAmount(p)} style={{
-                    flex: 1, padding: '10px 0', borderRadius: 12, fontSize: 26, fontWeight: 600, cursor: 'pointer',
+                    flex: 1, padding: '8px 0', borderRadius: 9, fontSize: 20, fontWeight: 600, cursor: 'pointer',
                     border: 'none', background: amount === p ? '#424242' : '#232323', color: amount === p ? '#eee' : dim,
                   }}>${p}</button>
                 ))}
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <button onClick={() => setAmount(Math.max(5, amount - 5))} style={{
-                  width: 60, height: 60, borderRadius: 12, border: bdr, background: '#232323', color: dim,
-                  cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 34, fontWeight: 600,
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <button onClick={() => setAmount(Math.max(1, amount - 5))} style={{
+                  width: 45, height: 45, borderRadius: 9, border: bdr, background: '#232323', color: dim,
+                  cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 26, fontWeight: 600,
                 }}>-</button>
                 <div style={{
-                  flex: 1, height: 60, borderRadius: 12, border: bdr, background: '#232323',
+                  flex: 1, height: 45, borderRadius: 9, border: bdr, background: '#232323',
                   display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative',
                 }}>
-                  <span style={{ fontSize: 28, fontWeight: 600, color: '#eee', position: 'absolute', left: 16, pointerEvents: 'none' }}>$</span>
+                  <span style={{ fontSize: 21, fontWeight: 600, color: '#eee', position: 'absolute', left: 12, pointerEvents: 'none' }}>$</span>
                   <input
                     type="text"
                     inputMode="numeric"
@@ -247,32 +343,32 @@ export default function LiteSidebar() {
                     onBlur={() => { if (amount < 1) setAmount(5); }}
                     style={{
                       width: '100%', height: '100%', border: 'none', background: 'transparent',
-                      textAlign: 'center', fontSize: 28, fontWeight: 600, color: '#eee',
-                      outline: 'none', fontFamily: 'inherit', padding: '0 24px',
+                      textAlign: 'center', fontSize: 21, fontWeight: 600, color: '#eee',
+                      outline: 'none', fontFamily: 'inherit', padding: '0 18px',
                     }}
                   />
                 </div>
                 <button onClick={() => setAmount(amount + 5)} style={{
-                  width: 60, height: 60, borderRadius: 12, border: bdr, background: '#232323', color: dim,
-                  cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 34, fontWeight: 600,
+                  width: 45, height: 45, borderRadius: 9, border: bdr, background: '#232323', color: dim,
+                  cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 26, fontWeight: 600,
                 }}>+</button>
               </div>
             </div>
 
-            <div style={{ padding: '6px 36px 8px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                <span style={{ fontSize: 22, color: '#eee', fontWeight: 500 }}>3. PLACE ORDER</span>
+            <div style={{ padding: '5px 27px 6px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 5 }}>
+                <span style={{ fontSize: 17, color: '#eee', fontWeight: 500 }}>3. PLACE ORDER</span>
                 <InfoDot text="Predict whether BTC will close above or below the strike price before the round ends." />
               </div>
               {isActivating ? (
                 <p style={{
-                  fontSize: 20, color: '#f7931a', lineHeight: '26px',
-                  margin: '0 0 8px', fontWeight: 500,
+                  fontSize: 15, color: '#f7931a', lineHeight: '20px',
+                  margin: '0 0 6px', fontWeight: 500,
                 }}>
                   Activating next market...
                 </p>
               ) : (
-                <p style={{ fontSize: 20, color: 'rgba(238,238,238,0.55)', lineHeight: '26px', margin: '0 0 8px' }}>
+                <p style={{ fontSize: 15, color: 'rgba(238,238,238,0.55)', lineHeight: '20px', margin: '0 0 6px' }}>
                   Will BTC close above or below{' '}
                   <span style={{ color: '#4d7fff', fontWeight: 600 }}>${strikePrice.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
                   {' '}in <span style={{ color: '#f7931a', fontWeight: 600 }}>{timeDisplay}</span> minutes?
@@ -282,119 +378,125 @@ export default function LiteSidebar() {
                 onClick={() => handlePlaceOrder('yes')}
                 disabled={isPlacing || isActivating}
                 style={{
-                  width: '100%', padding: '16px 28px', borderRadius: 12, border: bdr,
+                  width: '100%', padding: '12px 21px', borderRadius: 9, border: bdr,
                   background: 'rgba(238,238,238,0.05)',
                   cursor: isPlacing || isActivating ? 'not-allowed' : 'pointer',
-                  display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8,
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6,
                   opacity: isPlacing || isActivating ? 0.4 : 1,
                 }}>
-                <span style={{ fontSize: 28, fontWeight: 600, color: '#95ff94' }}>Above</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-                  <span style={{ fontSize: 22, color: dim }}>{yesMultiplier}x</span>
-                  <span style={{ fontSize: 28, fontWeight: 700, color: '#eee' }}>{yesPayout}</span>
+                <span style={{ fontSize: 21, fontWeight: 600, color: '#95ff94' }}>Above</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <span style={{ fontSize: 17, color: dim }}>{yesMultiplier}x</span>
+                  <span style={{ fontSize: 21, fontWeight: 700, color: '#eee' }}>{yesPayout}</span>
                 </div>
               </button>
               <button
                 onClick={() => handlePlaceOrder('no')}
                 disabled={isPlacing || isActivating}
                 style={{
-                  width: '100%', padding: '16px 28px', borderRadius: 12, border: bdr,
+                  width: '100%', padding: '12px 21px', borderRadius: 9, border: bdr,
                   background: 'rgba(238,238,238,0.05)',
                   cursor: isPlacing || isActivating ? 'not-allowed' : 'pointer',
                   display: 'flex', alignItems: 'center', justifyContent: 'space-between',
                   opacity: isPlacing || isActivating ? 0.4 : 1,
                 }}>
-                <span style={{ fontSize: 28, fontWeight: 600, color: '#f55252' }}>Below</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-                  <span style={{ fontSize: 22, color: dim }}>{noMultiplier}x</span>
-                  <span style={{ fontSize: 28, fontWeight: 700, color: '#eee' }}>{noPayout}</span>
+                <span style={{ fontSize: 21, fontWeight: 600, color: '#f55252' }}>Below</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <span style={{ fontSize: 17, color: dim }}>{noMultiplier}x</span>
+                  <span style={{ fontSize: 21, fontWeight: 700, color: '#eee' }}>{noPayout}</span>
                 </div>
               </button>
             </div>
-          </div>
 
-          {/* Bottom group */}
-          <div style={{ display: 'flex', flexDirection: 'column', flexShrink: 0, ...(chatOpen ? { flex: 1, minHeight: 0 } : {}) }}>
-            <div style={{ height: 1, background: 'rgba(255,255,255,0.11)', flexShrink: 0 }} />
-
-            {!chatOpen && (
-              <>
-                <div style={{ padding: '12px 36px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-                    <span style={{ fontSize: 22, color: '#eee', fontWeight: 500 }}>POSITIONS</span>
-                    <InfoDot text="Your active positions for the current round. PnL updates live." />
-                  </div>
-                  {firstPosition ? (
-                    <div style={{ padding: '16px 24px', borderRadius: 12, border: bdr, background: 'rgba(238,238,238,0.05)' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-                          <span style={{ fontSize: 24, fontWeight: 600, color: firstPosition.yesShares > 0 ? '#95ff94' : '#f55252' }}>
-                            {firstPosition.yesShares > 0 ? 'Above' : 'Below'}
-                          </span>
-                          <span style={{ fontSize: 20, color: dim }}>{firstPosition.asset}</span>
-                        </div>
-                        <span style={{ fontSize: 24, fontWeight: 500, color: '#eee' }}>
-                          ${(firstPosition.totalCost ?? ((firstPosition.yesShares + firstPosition.noShares) * firstPosition.avgEntryPrice)).toFixed(2)}
-                        </span>
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-                        <span style={{ fontSize: 20, color: '#eee' }}>
-                          Entry: ${firstPosition.avgEntryPrice.toFixed(4)}
-                          {liveMark > 0 && (
-                            <span style={{ color: dim }}>{' → '}<span style={{ color: liveMark >= firstPosition.avgEntryPrice ? '#95ff94' : '#f55252' }}>${liveMark.toFixed(4)}</span></span>
-                          )}
-                        </span>
-                        <span style={{
-                          fontSize: 24, fontWeight: 700,
-                          color: livePnL >= 0 ? '#95ff94' : '#f55252',
-                        }}>
-                          ${livePnL >= 0 ? '+' : ''}{livePnL.toFixed(2)}
-                        </span>
-                      </div>
-                      <button style={{
-                        width: '100%', padding: '14px 0', borderRadius: 12,
-                        background: '#95ff94', border: 'none', color: '#232323',
-                        fontSize: 24, fontWeight: 700, cursor: 'pointer',
-                      }}>
-                        Close Position
-                      </button>
-                    </div>
-                  ) : (
-                    <div style={{ padding: '24px 24px', borderRadius: 12, border: bdr, background: 'rgba(238,238,238,0.05)', textAlign: 'center' }}>
-                      <span style={{ fontSize: 22, color: dim }}>No open positions</span>
-                    </div>
-                  )}
-                </div>
-
-                <div style={{ height: 1, background: 'rgba(255,255,255,0.11)' }} />
-
-                <div style={{ padding: '10px 36px' }}>
-                  <span style={{ fontSize: 22, color: '#eee', fontWeight: 500 }}>LIVE WINS</span>
-                </div>
-
-                <div style={{ height: 1, background: 'rgba(255,255,255,0.11)' }} />
-              </>
-            )}
-
-            <div
-              onClick={() => setChatOpen(!chatOpen)}
-              style={{
-                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                padding: '8px 28px', flexShrink: 0, cursor: 'pointer',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <span style={{ fontSize: 20, color: '#eee', fontWeight: 500 }}>CHATROOM</span>
-                <div style={{ width: 16, height: 16, borderRadius: '50%', background: '#001eff' }} />
+            <div style={{ padding: '9px 27px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                <span style={{ fontSize: 17, color: '#eee', fontWeight: 500 }}>POSITIONS</span>
+                <InfoDot text="Your active positions for the current round. PnL updates live." />
               </div>
-              <ChevronUp size={22} color={dim} style={{
-                transform: chatOpen ? 'rotate(180deg)' : 'rotate(0deg)',
-                transition: 'transform 0.2s',
-              }} />
+              {displayEntries.length > 0 ? displayEntries.map((entry, idx) => {
+                const eBestAsk = entry.isYes ? yesPrices.bestAsk : noPrices.bestAsk;
+                const eHasLiq = eBestAsk > 0 && eBestAsk < 1;
+                let eMark = eHasLiq ? eBestAsk : 0;
+                let eFallback = false;
+                if (!eHasLiq && strikePrice > 0 && assetPrice) {
+                  if (assetPrice > strikePrice) {
+                    eMark = entry.isYes ? 0.999 : 0.001;
+                    eFallback = true;
+                  } else if (assetPrice < strikePrice) {
+                    eMark = entry.isYes ? 0.001 : 0.999;
+                    eFallback = true;
+                  }
+                }
+                const ePnl = (eHasLiq || eFallback) ? (eMark * entry.shares) - entry.costBasis : -entry.costBasis;
+                return (
+                <div key={`${entry.pos.marketAddress}-${entry.isYes ? 'yes' : 'no'}`} style={{ padding: '12px 18px', borderRadius: 9, border: bdr, background: 'rgba(238,238,238,0.05)', marginBottom: idx < displayEntries.length - 1 ? 6 : 0 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 11 }}>
+                      <span style={{ fontSize: 18, fontWeight: 600, color: entry.isYes ? '#95ff94' : '#f55252' }}>
+                        {entry.isYes ? 'Above' : 'Below'}
+                      </span>
+                      <span style={{ fontSize: 15, color: dim }}>{entry.pos.asset}</span>
+                    </div>
+                    <span style={{ fontSize: 18, fontWeight: 500, color: '#eee' }}>
+                      ${entry.costBasis.toFixed(2)}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                    <span style={{ fontSize: 15, color: '#eee' }}>
+                      Entry: ${entry.entryPrice.toFixed(4)}
+                      {eMark > 0 && (
+                        <span style={{ color: dim }}>{' → '}<span style={{ color: eMark >= entry.entryPrice ? '#95ff94' : '#f55252' }}>${eMark.toFixed(4)}</span></span>
+                      )}
+                    </span>
+                    <span style={{
+                      fontSize: 18, fontWeight: 700,
+                      color: ePnl >= 0 ? '#95ff94' : '#f55252',
+                    }}>
+                      ${ePnl >= 0 ? '+' : ''}{ePnl.toFixed(2)}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => handleClosePosition(entry)}
+                    disabled={closingPosition === `${entry.pos.marketAddress}-${entry.isYes ? 'yes' : 'no'}`}
+                    style={{
+                      width: '100%', padding: '11px 0', borderRadius: 9,
+                      background: closingPosition === `${entry.pos.marketAddress}-${entry.isYes ? 'yes' : 'no'}` ? 'rgba(149,255,148,0.4)' : '#95ff94',
+                      border: 'none', color: '#232323',
+                      fontSize: 18, fontWeight: 700,
+                      cursor: closingPosition === `${entry.pos.marketAddress}-${entry.isYes ? 'yes' : 'no'}` ? 'not-allowed' : 'pointer',
+                      opacity: closingPosition === `${entry.pos.marketAddress}-${entry.isYes ? 'yes' : 'no'}` ? 0.6 : 1,
+                    }}>
+                    {closingPosition === `${entry.pos.marketAddress}-${entry.isYes ? 'yes' : 'no'}` ? 'Closing...' : 'Close Position'}
+                  </button>
+                </div>
+                );
+              }) : (
+                <div style={{ padding: '18px 18px', borderRadius: 9, border: bdr, background: 'rgba(238,238,238,0.05)', textAlign: 'center' }}>
+                  <span style={{ fontSize: 17, color: dim }}>No open positions</span>
+                </div>
+              )}
             </div>
-
-            {chatOpen && <ChatPanel />}
           </div>
+
+        <div style={{ flexShrink: 0 }}>
+          <div style={{ height: 1, background: 'rgba(255,255,255,0.11)' }} />
+          <div
+            onClick={() => setChatOpen(!chatOpen)}
+            style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '6px 21px', cursor: 'pointer',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 15, color: '#eee', fontWeight: 500 }}>CHATROOM</span>
+              <div style={{ width: 12, height: 12, borderRadius: '50%', background: '#001eff' }} />
+            </div>
+            <ChevronUp size={17} color={dim} style={{
+              transform: chatOpen ? 'rotate(180deg)' : 'rotate(0deg)',
+              transition: 'transform 0.2s',
+            }} />
+          </div>
+          {chatOpen && <ChatPanel />}
         </div>
       </div>
 

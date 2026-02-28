@@ -332,6 +332,21 @@ pub mod degen_terminal {
         instructions::post_merkle_root(ctx, args)
     }
 
+    /// Atomically resolve a V2 market AND post the merkle root in one TX
+    ///
+    /// Combines resolve_market_v2 + post_merkle_root into a single instruction,
+    /// saving ~2s by eliminating one full TX round-trip. The market transitions
+    /// directly from Open/Closed to SETTLING status.
+    ///
+    /// # Arguments
+    /// * `args` - Combined resolution + merkle root parameters
+    pub fn resolve_and_post_merkle_root_v2(
+        ctx: Context<ResolveAndPostMerkleRootV2>,
+        args: ResolveAndPostMerkleRootArgsV2,
+    ) -> Result<()> {
+        instructions::resolve_and_post_merkle_root_v2(ctx, args)
+    }
+
     /// Batch settle multiple users with merkle proofs
     ///
     /// Settles up to 15 users in one transaction. Each settlement is verified

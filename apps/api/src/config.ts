@@ -133,7 +133,7 @@ export const config = {
   },
   
   // Order Minimums
-  minBuyNotional: parseFloat(process.env.MIN_BUY_NOTIONAL || '5.0'),   // $5.00 minimum buy
+  minBuyNotional: parseFloat(process.env.MIN_BUY_NOTIONAL || '1.0'),   // $1.00 minimum buy
   minSellNotional: parseFloat(process.env.MIN_SELL_NOTIONAL || '0.02'), // $0.02 minimum sell (= flat fee)
   
   // Gas Cost (for reference/monitoring - actual cost ~$0.00135 at current settings)

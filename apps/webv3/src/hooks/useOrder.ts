@@ -86,7 +86,9 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
       return null;
     }
 
-    if (!isAuthenticated || !token) {
+    // Read fresh auth state from store (closure values may be stale after inline signIn)
+    const { isAuthenticated: authed, token: authToken } = useAuthStore.getState();
+    if (!authed || !authToken) {
       setError('Please sign in to place orders');
       return null;
     }
@@ -288,6 +290,12 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
       // Clear pending order
       useUserStore.getState().setPendingOrder(null);
 
+      // Mark this order as handled so handleFill doesn't double-count shares
+      // when the WS fill event arrives for the same order
+      if (response.orderId) {
+        useUserStore.getState().markOrderHandled(response.orderId);
+      }
+
       // IMMEDIATE POSITION UPDATE: Use position data from response for instant UI update
       // This avoids the extra API round-trip that was causing 1-2 second delays
       if (response.position) {
@@ -400,7 +408,7 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
     } finally {
       setIsPlacing(false);
     }
-  }, [connected, publicKey, signTransaction, signMessage, isAuthenticated, token, sessionSigner]);
+  }, [connected, publicKey, signTransaction, signMessage, sessionSigner]);
 
   /**
    * Cancel an existing order

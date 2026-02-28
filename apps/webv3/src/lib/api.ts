@@ -58,6 +58,8 @@ export interface Position {
   yesShares: number;
   noShares: number;
   avgEntryPrice: number;
+  avgEntryYes?: number;
+  avgEntryNo?: number;
   currentPrice: number;
   unrealizedPnL: number;
   totalCost?: number;
@@ -140,6 +142,7 @@ export interface UserTransaction {
   leverage?: number; // For liquidations
   loanRepaid?: number; // For liquidations
   txSignature: string;
+  txStatus?: string; // 'PENDING' | 'CONFIRMED' | 'FAILED'
   timestamp: number;
 }
 

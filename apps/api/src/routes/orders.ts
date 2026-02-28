@@ -680,6 +680,8 @@ export async function orderRoutes(app: FastifyInstance) {
           yesShares,
           noShares,
           avgEntryPrice: data.price,
+          avgEntryYes: outcomeUpper === 'YES' ? data.price : 0,
+          avgEntryNo: outcomeUpper === 'NO' ? data.price : 0,
           currentPrice,
           unrealizedPnL: (currentPrice - data.price) * result.filledSize,
           status: 'open' as const,
@@ -767,11 +769,12 @@ export async function orderRoutes(app: FastifyInstance) {
       }
       
       // Build position data for immediate frontend update
+      // totalCost = dollarAmount (what user selected), fee baked into PnL as initial loss
       let positionData = null;
       if (result.totalContracts > 0) {
         const yesShares = outcomeUpper === 'YES' ? result.totalContracts : 0;
         const noShares = outcomeUpper === 'NO' ? result.totalContracts : 0;
-        const totalCost = result.totalSpent;
+        const totalCost = result.dollarAmount;
         const currentPrice = outcomeUpper === 'YES' 
           ? parseFloat(market.yesPrice || '0.50')
           : parseFloat(market.noPrice || '0.50');
@@ -784,7 +787,10 @@ export async function orderRoutes(app: FastifyInstance) {
           yesShares,
           noShares,
           avgEntryPrice: result.avgPrice,
+          avgEntryYes: outcomeUpper === 'YES' ? result.avgPrice : 0,
+          avgEntryNo: outcomeUpper === 'NO' ? result.avgPrice : 0,
           currentPrice,
+          totalCost,
           unrealizedPnL: (currentPrice - result.avgPrice) * result.totalContracts,
           status: 'open' as const,
           createdAt: Date.now(),

@@ -7,6 +7,7 @@ import { orderExpirerJob } from './order-expirer.js';
 import { marketCloserJob } from './market-closer.js';
 import { liquidationCheckerJob, lendingPoolSyncJob } from './liquidation-checker.js';
 import { merkleSettlerJob } from './merkle-settler.js';
+import { marketReconcilerJob } from './market-reconciler.js';
 import { reconciliationJob } from '../queue/jobs/reconciliation.job.js';
 import { relayerPoolService } from '../services/relayer-pool.service.js';
 import { db, pool } from '../db/index.js'; // To check pool load directly
@@ -73,7 +74,7 @@ const jobs: JobConfig[] = [
     name: 'Position Settler',
     intervalMs: isPerfMode ? 15 * 1000 : 5 * 1000,
     job: positionSettlerJob,
-    enabled: true,
+    enabled: !config.useV2, // V2 uses merkle settler exclusively
     startupDelayMs: isPerfMode ? 60000 : 28000, // Later in perf mode
   },
   {
@@ -92,7 +93,7 @@ const jobs: JobConfig[] = [
   },
   {
     name: 'Merkle Settler V2',
-    intervalMs: isPerfMode ? 30 * 1000 : 10 * 1000,
+    intervalMs: isPerfMode ? 30 * 1000 : 3 * 1000, // 3s safety net (direct triggers handle happy path)
     job: merkleSettlerJob,
     enabled: config.useV2,
     startupDelayMs: isPerfMode ? 90000 : 30000, // Much later in perf mode
@@ -103,6 +104,13 @@ const jobs: JobConfig[] = [
     job: marketCloserJob,
     enabled: !isPerfMode,
     startupDelayMs: 55000,
+  },
+  {
+    name: 'Market Reconciler',
+    intervalMs: 60 * 1000,
+    job: marketReconcilerJob,
+    enabled: !isPerfMode && config.useV2,
+    startupDelayMs: 50000,
   },
   {
     name: 'Trade Reconciliation',

@@ -6,9 +6,10 @@ import { useMarketStore } from '@/stores/marketStore';
 import { api, type Candle } from '@/lib/api';
 import { getWebSocket } from '@/lib/websocket';
 import { useChartToolbarStore } from './ChartToolbar';
+import { chartCoordsRef } from '@/lib/chartCoords';
 
-const PRICE_SCALE_WIDTH = 160;
-const TIME_SCALE_HEIGHT = 52;
+const PRICE_SCALE_WIDTH = 120;
+const TIME_SCALE_HEIGHT = 40;
 const TOOLBAR_CLEARANCE = 0;
 const CANDLE_SEC = 5;
 const VISIBLE_WINDOW = 500; // seconds — matches Lite chart's WINDOW_SEC
@@ -150,13 +151,12 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
     if (cancelled) return;
 
     const chart = createChart(container, {
-      width: container.clientWidth,
-      height: container.clientHeight,
+      autoSize: true,
       layout: {
         background: { type: ColorType.Solid, color: '#1e1e1e' },
         textColor: 'rgba(238,238,238,0.33)',
         fontFamily: "'IBM Plex Mono', monospace",
-        fontSize: 24,
+        fontSize: 18,
       },
       grid: {
         vertLines: { color: 'rgba(238,238,238,0.05)' },
@@ -298,6 +298,12 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
           }
           candles.sort((a, b) => a.time - b.time);
 
+          for (let i = candles.length - 1; i > 0; i--) {
+            if (candles[i].time === candles[i - 1].time) {
+              candles.splice(i, 1);
+            }
+          }
+
           console.log(`[Chart] Loaded ${candles.length} candles, range: ${candles[0]?.close} - ${candles[candles.length - 1]?.close}`);
         }
       } catch (e) {
@@ -317,7 +323,7 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
       const lastClose = candles.length > 0 ? candles[candles.length - 1].close : 0;
       const effectiveStrike = strikePriceRef.current > 0 ? strikePriceRef.current : lastClose;
 
-      if (effectiveStrike > 0) {
+      if (effectiveStrike > 0 && !strikeLine) {
         strikeLine = series.createPriceLine({
           price: effectiveStrike,
           color: '#001eff', lineWidth: 2, lineStyle: 2,
@@ -325,9 +331,11 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
           axisLabelColor: '#001eff', axisLabelTextColor: '#eeeeee',
         });
         strikeLineRef.current = strikeLine;
+      } else if (strikeLine && effectiveStrike > 0) {
+        strikeLine.applyOptions({ price: effectiveStrike });
       }
 
-      if (lastClose > 0) {
+      if (lastClose > 0 && !currentPriceLine) {
         currentPriceLine = series.createPriceLine({
           price: lastClose,
           color: '#ca5858', lineWidth: 2, lineStyle: 2,
@@ -335,6 +343,10 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
           axisLabelVisible: true, title: '',
           axisLabelColor: '#ca5858', axisLabelTextColor: '#eeeeee',
         });
+      } else if (currentPriceLine && lastClose > 0) {
+        currentPriceLine.applyOptions({ price: lastClose });
+      }
+      if (lastClose > 0 && candles.length > 0) {
         lastCandleRef.current = { time: candles[candles.length - 1].time, close: lastClose };
       }
 
@@ -359,6 +371,37 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
       function rafLoop() {
         if (cancelled) return;
         updateOverlays();
+        // Expose coordinate mapper for TradeBubbles
+        const clipW = overlayClipRef.current?.clientWidth ?? 0;
+        const clipH = overlayClipRef.current?.clientHeight ?? 0;
+        chartCoordsRef.current = {
+          timeToX: (timeSec: number) => {
+            const x = chart.timeScale().timeToCoordinate(timeSec as any);
+            if (x !== null) return x;
+            const vr = chart.timeScale().getVisibleRange();
+            if (!vr || clipW <= 0) return null;
+            const from = vr.from as number;
+            const to = vr.to as number;
+            if (to <= from) return null;
+            const frac = (timeSec - from) / (to - from);
+            if (frac < -0.05 || frac > 1.05) return null;
+            return frac * clipW;
+          },
+          priceToY: (price: number) => {
+            const s = seriesRef.current;
+            if (!s) return null;
+            const y = (s as any).priceToCoordinate(price);
+            if (y !== null) return y;
+            const vpr = (s as any).priceScale?.()?.getVisiblePriceRange?.();
+            if (!vpr || clipH <= 0) return null;
+            const pMin = vpr.minValue as number;
+            const pMax = vpr.maxValue as number;
+            if (pMax <= pMin) return null;
+            return clipH * (1 - (price - pMin) / (pMax - pMin));
+          },
+        };
+        // Notify TradeBubbles in same frame — zero lag
+        if (chartCoordsRef.onFrame) chartCoordsRef.onFrame();
         rafRef.current = requestAnimationFrame(rafLoop);
       }
       rafRef.current = requestAnimationFrame(rafLoop);
@@ -480,8 +523,16 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
         updateOverlays();
       }
 
-      // Handle market activation → recalc round times and snap back to default
+      // Handle market resolution/activation → recalc round times and snap back to default
       if (m.channel === 'market' && (m.event === 'resolved' || m.type === 'market_activated' || m.type === 'market_resolved')) {
+        // On market resolved: immediately remove strike line (gap until next market activates)
+        if (m.event === 'resolved' || m.type === 'market_resolved') {
+          if (strikeLine && series) {
+            try { series.removePriceLine(strikeLine); } catch { /* already removed */ }
+            strikeLine = null;
+            strikeLineRef.current = null;
+          }
+        }
         setTimeout(() => {
           computeRoundTimes();
           userInteracted = false;
@@ -502,9 +553,8 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
       }
     });
 
-    // 6) Resize
+    // 6) Resize — chart auto-sizes itself; just sync overlays
     const handleResize = () => {
-      chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
       setTimeout(updateOverlays, 50);
     };
     const resizeObserver = new ResizeObserver(handleResize);
@@ -518,6 +568,7 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
       container.removeEventListener('wheel', markInteracted);
       if (interactTimer) clearTimeout(interactTimer);
       cancelAnimationFrame(rafRef.current);
+      chartCoordsRef.current = null;
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -535,8 +586,12 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
   }, []);
 
   useEffect(() => {
-    if (strikeLineRef.current && strikePrice > 0) {
+    if (strikePrice > 0 && strikeLineRef.current) {
       strikeLineRef.current.applyOptions({ price: strikePrice });
+    } else if (strikePrice === 0 && strikeLineRef.current && seriesRef.current) {
+      // Market expired or no active market — remove strike line
+      try { seriesRef.current.removePriceLine(strikeLineRef.current); } catch { /* already removed */ }
+      strikeLineRef.current = null;
     }
   }, [strikePrice]);
 
