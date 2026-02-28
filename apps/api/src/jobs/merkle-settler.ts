@@ -9,6 +9,7 @@ import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
 import { buildMerkleTree, createSettlementLeaf, verifyMerkleProof, type SettlementLeaf, type MerkleTree } from '../lib/merkle-tree.js';
 import { broadcastUserSettlement } from '../lib/broadcasts.js';
 import { onchainSubmitQueue } from '../queue/queues.js';
+import { tryAdvisoryLock, releaseAdvisoryLock } from '../lib/advisory-lock.js';
 import { logger, logEvents } from '../lib/logger.js';
 import { config } from '../config.js';
 
@@ -36,6 +37,39 @@ const processingMarkets = new Set<string>();
 // Track consecutive failures per market to avoid infinite retry loops
 const marketFailureCount = new Map<string, number>();
 const MAX_SETTLEMENT_FAILURES = 10; // After 10 failed cycles, mark as SETTLEMENT_FAILED
+
+/**
+ * M-05: Convert a decimal string (e.g. "10.500000") to integer microUSDC (bigint)
+ * without floating-point intermediate, avoiding precision loss.
+ *
+ * Examples:
+ *   "10.5"      → 10_500_000n
+ *   "0.001"     → 1_000n
+ *   "100"       → 100_000_000n
+ *   "1.123456"  → 1_123_456n
+ *   "1.1234567" → 1_123_457n (rounded)
+ */
+function decimalToMicroUsdc(value: string): bigint {
+  const trimmed = value.trim();
+  const dotIdx = trimmed.indexOf('.');
+  if (dotIdx === -1) {
+    // No decimal point — whole number
+    return BigInt(trimmed) * 1_000_000n;
+  }
+  const intPart = trimmed.slice(0, dotIdx) || '0';
+  let fracPart = trimmed.slice(dotIdx + 1);
+  if (fracPart.length > 7) {
+    // Take 7 digits for rounding, then truncate to 6
+    const seventh = parseInt(fracPart[6], 10);
+    fracPart = fracPart.slice(0, 6);
+    let micro = BigInt(intPart) * 1_000_000n + BigInt(fracPart);
+    if (seventh >= 5) micro += 1n;
+    return micro;
+  }
+  // Pad to 6 decimals
+  fracPart = fracPart.padEnd(6, '0');
+  return BigInt(intPart) * 1_000_000n + BigInt(fracPart);
+}
 
 // In-memory state for markets being settled
 interface SettlingState {
@@ -71,6 +105,9 @@ export async function merkleSettlerJob(): Promise<void> {
       continue;
     }
 
+    // M-04: Acquire DB advisory lock (multi-instance safe)
+    const lockAcquired = await tryAdvisoryLock('settle', market.id);
+    if (!lockAcquired) continue; // Another instance is settling this market
     processingMarkets.add(market.id);
     try {
       await processMarketSettlement(market);
@@ -78,6 +115,7 @@ export async function merkleSettlerJob(): Promise<void> {
       logger.error(`[MerkleSettler] Failed for market ${market.id} (${market.asset}-${market.timeframe}): ${err.message}`);
     } finally {
       processingMarkets.delete(market.id);
+      await releaseAdvisoryLock('settle', market.id);
     }
   }
 }
@@ -98,15 +136,17 @@ export function preSeedSettlingState(
 
   const leaves: SettlingState['leaves'] = [];
   for (const position of positions) {
-    const yesShares = parseFloat(position.yesShares || '0');
-    const noShares = parseFloat(position.noShares || '0');
-    const winningShares = outcome === 'YES' ? yesShares : noShares;
-    if (winningShares <= 0) continue;
+    const winningSharesStr = outcome === 'YES'
+      ? (position.yesShares || '0')
+      : (position.noShares || '0');
+
+    // M-05: Integer arithmetic for microUSDC conversion
+    const amount = decimalToMicroUsdc(winningSharesStr);
+    if (amount <= 0n) continue;
 
     const wallet = position.userId ? walletMap.get(position.userId) : null;
     if (!wallet) continue;
 
-    const amount = BigInt(Math.round(winningShares * 1_000_000));
     leaves.push({ recipient: new PublicKey(wallet), amount, positionId: position.id, userId: position.userId });
   }
 
@@ -174,6 +214,9 @@ export async function triggerMerkleSettlement(
     return;
   }
 
+  // M-04: Acquire DB advisory lock (multi-instance safe)
+  const lockAcquired = await tryAdvisoryLock('settle', marketId);
+  if (!lockAcquired) return;
   processingMarkets.add(marketId);
   try {
     await processMarketSettlement(market);
@@ -181,6 +224,7 @@ export async function triggerMerkleSettlement(
     logger.error(`[MerkleSettler] Triggered settlement failed for ${marketId}: ${err.message}`);
   } finally {
     processingMarkets.delete(marketId);
+    await releaseAdvisoryLock('settle', marketId);
   }
 }
 
@@ -491,11 +535,13 @@ async function buildSettlementState(
 
   const leaves: SettlingState['leaves'] = [];
   for (const position of openPositions) {
-    const yesShares = parseFloat(position.yesShares || '0');
-    const noShares = parseFloat(position.noShares || '0');
-    const winningShares = outcome === 'YES' ? yesShares : noShares;
+    const winningSharesStr = outcome === 'YES'
+      ? (position.yesShares || '0')
+      : (position.noShares || '0');
 
-    if (winningShares <= 0) continue;
+    // M-05: Use integer arithmetic instead of parseFloat to avoid precision loss
+    const amount = decimalToMicroUsdc(winningSharesStr);
+    if (amount <= 0n) continue;
 
     const wallet = position.userId ? walletMap.get(position.userId) : null;
     if (!wallet) {
@@ -503,7 +549,6 @@ async function buildSettlementState(
       continue;
     }
 
-    const amount = BigInt(Math.round(winningShares * 1_000_000));
     leaves.push({
       recipient: new PublicKey(wallet),
       amount,
@@ -542,10 +587,13 @@ async function syncSettlementToDb(
   const allPositions = await positionService.getPositionsForSettlement(market.id);
 
   for (const position of allPositions) {
-    const yesShares = parseFloat(position.yesShares || '0');
-    const noShares = parseFloat(position.noShares || '0');
-    const winningShares = outcome === 'YES' ? yesShares : noShares;
-    const payout = winningShares * 1.0;
+    // M-05: Use integer microUSDC for payout calculation, then convert to human-readable
+    const winningSharesStr = outcome === 'YES'
+      ? (position.yesShares || '0')
+      : (position.noShares || '0');
+    const payoutMicro = decimalToMicroUsdc(winningSharesStr);
+    const winningShares = Number(payoutMicro) / 1_000_000;
+    const payout = winningShares; // $1.00 per share
     const totalCost = parseFloat(position.totalCost || '0');
     const profit = payout - totalCost;
 

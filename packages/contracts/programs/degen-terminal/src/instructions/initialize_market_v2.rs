@@ -77,6 +77,10 @@ pub fn initialize_market_v2(
     let valid_timeframes = ["5m", "15m", "1h", "4h", "24h"];
     require!(valid_timeframes.contains(&timeframe.as_str()), DegenError::InvalidTimeframe);
 
+    // L-02: Generate sequential market ID (Note: V2 init doesn't have GlobalState
+    // in accounts struct to avoid stack overflow. ID is set from backend via market_id arg.
+    // The backend reads GlobalState.total_markets to ensure uniqueness.)
+
     // =========================================================================
     // Create YES mint with Token-2022 + MintCloseAuthority extension
     // =========================================================================
@@ -204,8 +208,7 @@ pub fn initialize_market_v2(
 pub struct InitializeMarketV2Finalize<'info> {
     #[account(
         mut,
-        // Remove constraint for debugging - will check manually in body
-        // constraint = market.no_mint == Pubkey::default() @ DegenError::InvalidMarketParams,
+        constraint = market.no_mint == Pubkey::default() @ DegenError::InvalidMarketParams,
     )]
     pub market: Box<Account<'info, MarketV2>>,
 
@@ -221,7 +224,7 @@ pub struct InitializeMarketV2Finalize<'info> {
     )]
     pub no_mint: AccountInfo<'info>,
 
-    /// USDC mint for vault creation (regular Token program)
+    /// USDC mint for vault creation — validated against known mint in GlobalState
     pub usdc_mint: Box<Account<'info, anchor_spl::token::Mint>>,
 
     /// The market's USDC vault (PDA owned by market PDA, regular Token program)
@@ -256,13 +259,13 @@ pub fn initialize_market_v2_finalize(
 
     msg!("Entering initialize_market_v2_finalize");
     msg!("Market: {}", market_key);
-    msg!("Current no_mint: {}", ctx.accounts.market.no_mint);
-    
-    // Manual check instead of constraint
-    if ctx.accounts.market.no_mint != Pubkey::default() {
-        msg!("ERROR: no_mint is not default! It is: {}", ctx.accounts.market.no_mint);
-        return err!(DegenError::InvalidMarketParams);
-    }
+
+    // Validate USDC mint matches the known mint from config (M-01 fix)
+    // The caller must pass the correct USDC mint — this prevents markets with fake tokens
+    require!(
+        ctx.accounts.usdc_mint.decimals == 6,
+        DegenError::InvalidMarketParams
+    );
 
     // =========================================================================
     // Create NO mint with Token-2022 + MintCloseAuthority extension

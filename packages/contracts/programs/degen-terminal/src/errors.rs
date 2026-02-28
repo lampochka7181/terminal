@@ -31,7 +31,7 @@ pub enum DegenError {
     #[msg("Market is not pending (cannot activate)")]
     MarketNotPending,
     
-    #[msg("Market is closing soon (within 30 seconds)")]
+    #[msg("Market is closing soon (within trading close buffer)")]
     MarketClosing,
     
     #[msg("Market has already expired")]

@@ -56,9 +56,19 @@ pub mod degen_terminal {
         instructions::update_config(ctx, maker_fee_bps, taker_fee_bps)
     }
 
-    /// Transfer admin authority to a new address
+    /// Transfer admin authority to a new address (legacy direct transfer)
     pub fn transfer_admin(ctx: Context<TransferAdmin>) -> Result<()> {
         instructions::transfer_admin(ctx)
+    }
+
+    /// Propose admin transfer to a new address (L-03: two-step)
+    pub fn propose_admin_transfer(ctx: Context<ProposeAdminTransfer>) -> Result<()> {
+        instructions::propose_admin_transfer(ctx)
+    }
+
+    /// Accept a pending admin transfer (L-03: two-step)
+    pub fn accept_admin_transfer(ctx: Context<AcceptAdminTransfer>) -> Result<()> {
+        instructions::accept_admin_transfer(ctx)
     }
 
     // =========================================================================

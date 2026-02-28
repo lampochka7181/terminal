@@ -65,7 +65,7 @@ pub fn cancel_order_by_relayer(ctx: Context<CancelOrderByRelayer>) -> Result<()>
     let clock = Clock::get()?;
     
     // Only allow forced cancellation once the market is closed to trading.
-    // (Within the last 30s buffer or after expiry.)
+    // (Within the last TRADING_CLOSE_BUFFER (2s) or after expiry.)
     require!(
         clock.unix_timestamp >= market.expiry_at - TRADING_CLOSE_BUFFER,
         DegenError::MarketNotOpen

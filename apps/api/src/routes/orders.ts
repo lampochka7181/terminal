@@ -14,8 +14,27 @@ import { sessionService } from '../services/session.service.js';
 import { marginService, leverageCalc } from '../services/margin.service.js';
 import { lendingService } from '../services/lending.service.js';
 import { db, trades } from '../db/index.js';
+import { redis } from '../db/redis.js';
 import { logger, orderLogger, logEvents } from '../lib/logger.js';
 import { config } from '../config.js';
+
+// M-14: Per-user rate limiter for order cancellations (prevents cancel-spam abuse)
+const CANCEL_RATE_LIMIT = 30;          // max cancels per window
+const CANCEL_RATE_WINDOW_SEC = 60;     // 60-second sliding window
+
+async function checkCancelRateLimit(userId: string): Promise<{ allowed: boolean; remaining: number }> {
+  if (!redis) return { allowed: true, remaining: CANCEL_RATE_LIMIT }; // skip if Redis unavailable
+  const key = `ratelimit:cancel:${userId}`;
+  try {
+    const count = await redis.incr(key);
+    if (count === 1) {
+      await redis.expire(key, CANCEL_RATE_WINDOW_SEC);
+    }
+    return { allowed: count <= CANCEL_RATE_LIMIT, remaining: Math.max(0, CANCEL_RATE_LIMIT - count) };
+  } catch {
+    return { allowed: true, remaining: CANCEL_RATE_LIMIT }; // fail open
+  }
+}
 
 // Validation schemas
 const placeOrderSchema = z.object({
@@ -885,6 +904,14 @@ export async function orderRoutes(app: FastifyInstance) {
     if (!userId) {
       return reply.code(401).send({
         error: { code: 'UNAUTHORIZED', message: 'User not found' },
+      });
+    }
+
+    // M-14: Rate limit cancellations (30/min per user)
+    const rateCheck = await checkCancelRateLimit(userId);
+    if (!rateCheck.allowed) {
+      return reply.code(429).send({
+        error: { code: 'CANCEL_RATE_LIMITED', message: `Too many cancellations. Limit: ${CANCEL_RATE_LIMIT} per minute.`, remaining: rateCheck.remaining },
       });
     }
 

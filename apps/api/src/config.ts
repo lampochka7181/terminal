@@ -201,4 +201,34 @@ export const config = {
   perfTestMode: process.env.PERF_TEST_MODE === 'true',
 };
 
+// ============================================================================
+// STARTUP VALIDATIONS (Security Audit Remediations)
+// ============================================================================
+
+// M-08: Fail on default JWT secret in production
+const isProduction = process.env.NODE_ENV === 'production';
+if (isProduction && config.jwtSecret === 'dev-secret-change-in-production') {
+  console.error('\n❌ FATAL: JWT_SECRET is using the default development value in production!');
+  console.error('   Set a strong, unique JWT_SECRET in your environment variables.\n');
+  process.exit(1);
+}
+
+// M-09: PERF_TEST_MODE must not be enabled in production
+if (isProduction && config.perfTestMode) {
+  console.error('\n❌ FATAL: PERF_TEST_MODE is enabled in production!');
+  console.error('   This bypasses auth and rate limits. Disable PERF_TEST_MODE in production.\n');
+  process.exit(1);
+}
+if (config.perfTestMode) {
+  console.warn('\n⚠️  PERF_TEST_MODE is enabled — auth bypass, elevated rate limits, and debug endpoints are active.');
+  console.warn('   Do NOT use this in production.\n');
+}
+
+// L-06: Validate Solana cluster string
+const VALID_SOLANA_CLUSTERS = ['devnet', 'testnet', 'mainnet-beta'];
+if (!VALID_SOLANA_CLUSTERS.includes(config.solanaNetwork)) {
+  console.error(`\n❌ FATAL: Invalid SOLANA_NETWORK="${config.solanaNetwork}".`);
+  console.error(`   Must be one of: ${VALID_SOLANA_CLUSTERS.join(', ')}\n`);
+  process.exit(1);
+}
 

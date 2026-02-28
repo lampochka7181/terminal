@@ -18,7 +18,10 @@ pub struct InitializeGlobal<'info> {
     
     /// CHECK: Fee recipient account - can be any account
     pub fee_recipient: AccountInfo<'info>,
-    
+
+    /// CHECK: USDC mint address — stored in GlobalState for market validation (M-01)
+    pub usdc_mint: AccountInfo<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -30,11 +33,13 @@ pub fn initialize_global(
     // Validate fee configuration (max 5% = 500 bps)
     require!(maker_fee_bps <= 500, DegenError::InvalidFeeConfig);
     require!(taker_fee_bps <= 500, DegenError::InvalidFeeConfig);
-    
+
     let global_state = &mut ctx.accounts.global_state;
-    
+
     global_state.admin = ctx.accounts.admin.key();
+    global_state.pending_admin = Pubkey::default();
     global_state.fee_recipient = ctx.accounts.fee_recipient.key();
+    global_state.usdc_mint = ctx.accounts.usdc_mint.key();
     global_state.maker_fee_bps = maker_fee_bps;
     global_state.taker_fee_bps = taker_fee_bps;
     global_state.paused = false;
@@ -43,9 +48,9 @@ pub fn initialize_global(
     global_state.total_markets = 0;
     global_state.total_volume = 0;
     global_state.bump = ctx.bumps.global_state;
-    
-    msg!("Global state initialized: admin={}, maker_fee={}bps, taker_fee={}bps", 
-        global_state.admin, maker_fee_bps, taker_fee_bps);
-    
+
+    msg!("Global state initialized: admin={}, usdc_mint={}, maker_fee={}bps, taker_fee={}bps",
+        global_state.admin, global_state.usdc_mint, maker_fee_bps, taker_fee_bps);
+
     Ok(())
 }

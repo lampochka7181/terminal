@@ -8,11 +8,12 @@ import { anchorClient, getMarketPda } from '../lib/anchor-client.js';
 import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
 import { prepareSettlementData, settleMarketWithData, type SettlementPrepData } from './position-settler.js';
 import { triggerMerkleSettlement, preSeedSettlingState, getPreSeededMerkleData, markRootPosted } from './merkle-settler.js';
+import { tryAdvisoryLock, releaseAdvisoryLock } from '../lib/advisory-lock.js';
 import { config } from '../config.js';
 
 /**
  * Market Resolver Job
- * 
+ *
  * Resolves expired markets by:
  * 1. Checking if price is above or below strike
  * 2. Setting the outcome (YES/NO)
@@ -20,8 +21,13 @@ import { config } from '../config.js';
  * 4. Cancelling any remaining open orders
  */
 
-// Track markets being processed to prevent duplicate concurrent processing
+// M-04: Database-backed concurrency guard via pg_try_advisory_lock
+// Replaced in-memory Set with PostgreSQL advisory locks for multi-instance safety.
+// Local Set kept as fast-path to avoid unnecessary DB round-trips within the same process.
 const processingMarkets = new Set<string>();
+
+// L-09: Track consecutive AccountNotInitialized failures before archiving
+const accountNotFoundCount = new Map<string, number>();
 
 async function runWithConcurrency<T>(
   items: T[],
@@ -62,6 +68,9 @@ export async function marketResolverJob(): Promise<void> {
   // Process CLOSED markets with bounded concurrency to avoid DB pool spikes
   const closedToProcess = closedMarkets.filter(market => !processingMarkets.has(market.id));
   await runWithConcurrency(closedToProcess, 2, async (market) => {
+    // M-04: Acquire DB advisory lock (multi-instance safe)
+    const lockAcquired = await tryAdvisoryLock('resolve', market.id);
+    if (!lockAcquired) return; // Another instance is processing this market
     processingMarkets.add(market.id);
     try {
       await resolveMarket(market.id, market.pubkey, market.asset, market.strikePrice, now);
@@ -69,12 +78,16 @@ export async function marketResolverJob(): Promise<void> {
       logger.error(`Failed to resolve market ${market.id} (${market.asset}-${market.timeframe}): ${err.message}`);
     } finally {
       processingMarkets.delete(market.id);
+      await releaseAdvisoryLock('resolve', market.id);
     }
   });
-  
+
   // Process expired markets with bounded concurrency to avoid DB pool spikes
   const expiredToProcess = expiredMarkets.filter(market => !processingMarkets.has(market.id));
   await runWithConcurrency(expiredToProcess, 2, async (market) => {
+    // M-04: Acquire DB advisory lock (multi-instance safe)
+    const lockAcquired = await tryAdvisoryLock('resolve', market.id);
+    if (!lockAcquired) return;
     processingMarkets.add(market.id);
     try {
       // Close + resolve + settle in one atomic flow
@@ -84,12 +97,13 @@ export async function marketResolverJob(): Promise<void> {
       } catch (closeErr: any) {
         logger.error(`Non-fatal: Failed to close market ${market.id} before resolution: ${closeErr.message}`);
       }
-      
+
       await resolveMarket(market.id, market.pubkey, market.asset, market.strikePrice, now);
     } catch (err: any) {
       logger.error(`Failed to resolve market ${market.id} (${market.asset}-${market.timeframe}): ${err.message}`);
     } finally {
       processingMarkets.delete(market.id);
+      await releaseAdvisoryLock('resolve', market.id);
     }
   });
 }
@@ -218,8 +232,17 @@ async function resolveMarket(
       if (errorMsg.includes('MarketAlreadyResolved') || errorMsg.includes('0x1778')) {
         logger.debug(`Market ${marketId} already resolved on-chain, continuing`);
       } else if (errorMsg.includes('AccountNotInitialized') || errorMsg.includes('0xbc4')) {
-        logger.warn(`Market ${marketId} (${market.pubkey}) does not exist on-chain. Marking as archived.`);
-        await marketService.markArchived(marketId);
+        // L-09: Don't auto-archive on a single RPC failure — could be transient.
+        // Track consecutive failures and only archive after 3 consecutive confirmations.
+        const count = (accountNotFoundCount.get(marketId) || 0) + 1;
+        accountNotFoundCount.set(marketId, count);
+        if (count >= 3) {
+          logger.warn(`Market ${marketId} (${market.pubkey}) confirmed not on-chain after ${count} checks. Marking as archived.`);
+          await marketService.markArchived(marketId);
+          accountNotFoundCount.delete(marketId);
+        } else {
+          logger.warn(`Market ${marketId} (${market.pubkey}) not found on-chain (attempt ${count}/3), will retry before archiving.`);
+        }
       } else {
         logger.error(`❌ Failed to resolve market on-chain: ${errorMsg}`);
       }
@@ -271,8 +294,16 @@ async function resolveMarket(
         } else if (errorMsg.includes('MarketAlreadyResolved') || errorMsg.includes('0x1778')) {
           logger.debug(`Market ${marketId} already resolved on-chain, continuing`);
         } else if (errorMsg.includes('AccountNotInitialized') || errorMsg.includes('0xbc4')) {
-          logger.warn(`Market ${marketId} (${market.pubkey}) does not exist on-chain. Marking as archived.`);
-          await marketService.markArchived(marketId);
+          // L-09: Don't auto-archive on transient RPC — require 3 consecutive confirmations
+          const count = (accountNotFoundCount.get(marketId) || 0) + 1;
+          accountNotFoundCount.set(marketId, count);
+          if (count >= 3) {
+            logger.warn(`Market ${marketId} (${market.pubkey}) confirmed not on-chain after ${count} checks. Marking as archived.`);
+            await marketService.markArchived(marketId);
+            accountNotFoundCount.delete(marketId);
+          } else {
+            logger.warn(`Market ${marketId} (${market.pubkey}) not found on-chain (attempt ${count}/3), will retry.`);
+          }
           return;
         } else {
           logger.warn(`Combined TX failed, falling back to separate resolve: ${errorMsg}`);
