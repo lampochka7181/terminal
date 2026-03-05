@@ -1,5 +1,6 @@
 import { logger } from './logger.js';
 import { wsMetrics, startTimer } from '../metrics/index.js';
+import { mmBotV2 } from '../bot/mm-bot-v2.js';
 
 /**
  * Broadcast Manager (v2 — reverse-indexed, batched, with delta support)
@@ -204,22 +205,41 @@ function broadcastToUser(userId: string, event: string, data: any): void {
   // Use user index first
   const socks = userSockets.get(userId);
   if (socks && socks.size > 0) {
+    let sent = 0;
     for (const ws of socks) {
       if (ws.readyState === WS_OPEN) {
-        try { ws.send(message); } catch (err) {
+        try { ws.send(message); sent++; } catch (err) {
           logger.error(`Failed to send to user ${userId}:`, err);
         }
       }
     }
-    return;
+    if (sent > 0) return;
+    const isMM = userId === mmBotV2.getStatus().userId;
+    const label = isMM ? `MM bot ${userId.slice(0, 8)}` : `user ${userId.slice(0, 8)}`;
+    if (isMM) {
+      logger.debug(`[Broadcast] ${label} has ${socks.size} socket(s) but none are OPEN for '${event}' event`);
+    } else {
+      logger.warn(`[Broadcast] ${label} has ${socks.size} socket(s) but none are OPEN for '${event}' event`);
+    }
   }
 
   // Fallback scan (transition period)
+  let fallbackSent = 0;
   for (const [ws, client] of clients) {
     if (ws.readyState === WS_OPEN && client.userId === userId) {
-      try { ws.send(message); } catch (err) {
+      try { ws.send(message); fallbackSent++; } catch (err) {
         logger.error(`Failed to send to user ${userId}:`, err);
       }
+    }
+  }
+
+  if (fallbackSent === 0) {
+    const isMM = userId === mmBotV2.getStatus().userId;
+    const label = isMM ? `MM bot ${userId.slice(0, 8)}` : `user ${userId.slice(0, 8)}`;
+    if (isMM) {
+      logger.debug(`[Broadcast] No connected sockets for ${label} — '${event}' event dropped`);
+    } else {
+      logger.warn(`[Broadcast] No connected sockets for ${label} — '${event}' event dropped`);
     }
   }
 }

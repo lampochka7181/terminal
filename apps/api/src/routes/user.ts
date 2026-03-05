@@ -8,7 +8,7 @@ import { userService } from '../services/user.service.js';
 import { marketService } from '../services/market.service.js';
 import { marginService } from '../services/margin.service.js';
 import { anchorClient } from '../lib/anchor-client.js';
-import { db, trades, settlements, markets, liquidations, marginAccounts, orders } from '../db/index.js';
+import { db, trades, settlements, markets, positions, liquidations, marginAccounts, orders } from '../db/index.js';
 import { logger } from '../lib/logger.js';
 
 // Validation schemas
@@ -314,6 +314,7 @@ export async function userRoutes(app: FastifyInstance) {
           filledSize: parseFloat(o.filledSize || '0'),
           remainingSize: parseFloat(o.remainingSize || '0'),
           status: o.status?.toLowerCase(),
+          dollarAmount: o.dollarAmount ? parseFloat(o.dollarAmount) : undefined,
           createdAt: o.createdAt?.getTime(),
           updatedAt: o.updatedAt?.getTime(),
           // Leverage fields (available before margin account exists)
@@ -375,6 +376,7 @@ export async function userRoutes(app: FastifyInstance) {
         size: trades.size,
         txSignature: trades.txSignature,
         txStatus: trades.txStatus,
+        errorCode: trades.errorCode,
         executedAt: trades.executedAt,
         // Market info
         marketPubkey: markets.pubkey,
@@ -510,6 +512,7 @@ export async function userRoutes(app: FastifyInstance) {
       fills: number; // Number of fills
       avgEntryPrice?: number; // For closing trades, the avg entry to calculate P&L
       leverage?: number; // Leverage used for this order (if > 1)
+      errorCode?: string; // Error code for failed trades
     }
     
     const orderMap = new Map<string, OrderAggregation>();
@@ -564,6 +567,7 @@ export async function userRoutes(app: FastifyInstance) {
         // If ANY fill is FAILED, mark the whole order as FAILED
         if (t.txStatus === 'FAILED') {
           existing.txStatus = 'FAILED';
+          if (t.errorCode) existing.errorCode = t.errorCode;
         } else if (existing.txStatus !== 'FAILED' && t.txStatus === 'CONFIRMED') {
           existing.txStatus = 'CONFIRMED';
         }
@@ -586,6 +590,7 @@ export async function userRoutes(app: FastifyInstance) {
           totalFee: userFee,
           txSignature: t.txSignature || '',
           txStatus: t.txStatus || 'PENDING',
+          errorCode: t.errorCode || undefined,
           timestamp: t.executedAt?.getTime() || 0,
           fills: 1,
           avgEntryPrice,
@@ -629,12 +634,13 @@ export async function userRoutes(app: FastifyInstance) {
           leverage: o.leverage, // Leverage if > 1
           txSignature: o.txSignature,
           txStatus: o.txStatus,
+          errorCode: o.errorCode,
           timestamp: o.timestamp,
           fills: o.fills,
         };
       });
     
-    // 3. Get settlements for this user (with leverage from margin accounts)
+    // 3. Get settlements for this user (with leverage from margin accounts + position shares)
     const userSettlements = await db
       .select({
         id: settlements.id,
@@ -651,32 +657,40 @@ export async function userRoutes(app: FastifyInstance) {
         marketAsset: markets.asset,
         marketTimeframe: markets.timeframe,
         marketExpiryAt: markets.expiryAt,
+        // Position shares (for accurate size on losses)
+        posYesShares: positions.yesShares,
+        posNoShares: positions.noShares,
         // Margin account info (if leveraged)
         marginLeverage: marginAccounts.leverage,
       })
       .from(settlements)
       .leftJoin(markets, eq(settlements.marketId, markets.id))
+      .leftJoin(positions, eq(settlements.positionId, positions.id))
       .leftJoin(marginAccounts, eq(settlements.positionId, marginAccounts.positionId))
       .where(eq(settlements.userId, userId))
       .orderBy(desc(settlements.createdAt));
-    
-    // Transform settlements into unified format (filter out 0-share settlements)
+
+    // Transform settlements into unified format (include both wins and losses)
     const settlementTransactions = userSettlements
-      .filter((s) => parseFloat(s.winningShares || '0') > 0)
       .map((s) => {
         const payout = parseFloat(s.payoutAmount || '0');
         const profit = parseFloat(s.profit || '0');
-        const shares = parseFloat(s.winningShares || '0');
+        const winShares = parseFloat(s.winningShares || '0');
         const isWin = payout > 0;
         const leverage = s.marginLeverage ? parseFloat(s.marginLeverage) : undefined;
-        
+        // For losses, use actual position shares (yes+no) instead of cost
+        const posYes = parseFloat(s.posYesShares || '0');
+        const posNo = parseFloat(s.posNoShares || '0');
+        const totalShares = posYes + posNo;
+        const shares = winShares > 0 ? winShares : totalShares;
+
         return {
           id: s.id,
           type: 'settlement' as const,
           transactionType: 'close' as const,
           marketAddress: s.marketPubkey || '',
-          market: s.marketAsset && s.marketTimeframe 
-            ? `${s.marketAsset}-${s.marketTimeframe}` 
+          market: s.marketAsset && s.marketTimeframe
+            ? `${s.marketAsset}-${s.marketTimeframe}`
             : '',
           asset: s.marketAsset || '',
           expiryAt: s.marketExpiryAt?.getTime() || 0,

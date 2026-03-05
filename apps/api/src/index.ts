@@ -42,6 +42,11 @@ import { mmBotV2 } from './bot/mm-bot-v2.js';
 // Anchor Client (for config endpoint)
 import { anchorClient } from './lib/anchor-client.js';
 
+// Relayer Pool (Phase 6)
+import { relayerPoolService } from './services/relayer-pool.service.js';
+import { Keypair } from '@solana/web3.js';
+import bs58 from 'bs58';
+
 // Circuit Breaker for self-healing
 import { circuitBreaker, circuitBreakerMiddleware } from './lib/circuit-breaker.js';
 
@@ -562,6 +567,30 @@ async function main() {
     priceFeedService.start();
     logger.info('📈 Price feed started (Coinbase)');
     
+    // Initialize relayer pool (child wallets as fee payers)
+    if (config.relayerPool.enabled) {
+      try {
+        const masterKeypairs: Keypair[] = [];
+        if (config.relayerPrivateKey) {
+          masterKeypairs.push(Keypair.fromSecretKey(bs58.decode(config.relayerPrivateKey)));
+        }
+        if (config.relayerPrivateKey2) {
+          masterKeypairs.push(Keypair.fromSecretKey(bs58.decode(config.relayerPrivateKey2)));
+        }
+
+        if (masterKeypairs.length > 0) {
+          relayerPoolService.init(anchorClient.getConnection(), masterKeypairs);
+          await relayerPoolService.ensurePoolPopulated();
+          const status = await relayerPoolService.getPoolStatus();
+          logger.info(`🏊 Relayer pool ready: ${status.masters} master(s), ${status.active} child wallet(s)`);
+        } else {
+          logger.warn('⚠️  RELAYER_POOL_ENABLED but no master keypairs configured');
+        }
+      } catch (err: any) {
+        logger.error(`❌ Relayer pool init failed (non-fatal): ${err.message}`);
+      }
+    }
+
     // Start keeper jobs (market creator, resolver, settler, etc.)
     startKeeperJobs();
     logger.info('⚙️  Keeper jobs started');

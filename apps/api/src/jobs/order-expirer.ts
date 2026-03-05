@@ -87,13 +87,13 @@ async function cancelOrdersForClosingMarkets(now: Date): Promise<void> {
         await orderService.cancel(order.id, 'MARKET_CLOSING');
       }
       
-      // SINGLE ORDERBOOK MODEL: Only broadcast YES orderbook (NO is derived by frontend)
-      const yesSnapshot = await orderbookService.getSnapshot(market.id, 'YES');
+      // SINGLE ORDERBOOK MODEL: Broadcast composite YES view (merges any NO orders)
+      const compositeSnapshot = await orderbookService.getCompositeSnapshot(market.id);
       broadcastOrderbookUpdate(
         market.pubkey,
-        yesSnapshot.bids.map(l => [l.price, l.size] as [number, number]),
-        yesSnapshot.asks.map(l => [l.price, l.size] as [number, number]),
-        yesSnapshot.sequenceId,
+        compositeSnapshot.bids.map(l => [l.price, l.size] as [number, number]),
+        compositeSnapshot.asks.map(l => [l.price, l.size] as [number, number]),
+        compositeSnapshot.sequenceId,
         'YES'
       );
       
@@ -152,21 +152,17 @@ async function cancelExpiredOrders(now: Date): Promise<void> {
       }
     }
     
-    // Broadcast orderbook update for this market
+    // SINGLE ORDERBOOK MODEL: Broadcast composite YES view (merges any NO orders)
     try {
-      const firstOrder = marketOrders[0];
-      if (firstOrder?.outcome) {
-        const market = await marketService.getById(marketId);
-        const outcome = firstOrder.outcome as 'YES' | 'NO';
-        const snapshot = await orderbookService.getSnapshot(marketId, outcome);
-        broadcastOrderbookUpdate(
-          market?.pubkey || marketId,
-          snapshot.bids.map(l => [l.price, l.size] as [number, number]),
-          snapshot.asks.map(l => [l.price, l.size] as [number, number]),
-          snapshot.sequenceId,
-          outcome  // FIX: Pass the correct outcome!
-        );
-      }
+      const market = await marketService.getById(marketId);
+      const compositeSnapshot = await orderbookService.getCompositeSnapshot(marketId);
+      broadcastOrderbookUpdate(
+        market?.pubkey || marketId,
+        compositeSnapshot.bids.map(l => [l.price, l.size] as [number, number]),
+        compositeSnapshot.asks.map(l => [l.price, l.size] as [number, number]),
+        compositeSnapshot.sequenceId,
+        'YES'  // Always YES for single orderbook model
+      );
     } catch (err) {
       logger.error(`Failed to broadcast orderbook update for market ${marketId}:`, err);
     }

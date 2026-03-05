@@ -265,7 +265,6 @@ export default function TradeBubbles({ mode }: TradeBubblesProps) {
   const positionBubbles = useCallback(() => {
     const mapper = chartCoordsRef.current;
     const bubs = bubblesRef.current;
-    const { w: cw, h: ch } = containerSizeRef.current;
 
     for (const bubble of bubs) {
       const isYes = bubble.outcome === 'yes';
@@ -281,15 +280,21 @@ export default function TradeBubbles({ mode }: TradeBubblesProps) {
         y = mapper.priceToY(bubble.assetPrice);
       }
 
-      if (x === null || y === null || cw <= 0 || ch <= 0) {
+      // Use content area bounds from the mapper (chart area excluding axes/scales).
+      // This prevents the bubble from drifting into price scale or time axis areas
+      // during drag/zoom when coordinates go out of bounds.
+      const contentW = mapper?.contentArea?.width ?? 0;
+      const contentH = mapper?.contentArea?.height ?? 0;
+
+      if (x === null || y === null || contentW <= 0 || contentH <= 0) {
         elBubble.style.display = 'none';
         continue;
       }
 
       const bubbleY = y + BUBBLE_OFFSET_Y;
       const bw = elBubble.offsetWidth || BUBBLE_SIZE;
-      const clampedX = Math.max(6, Math.min(x - bw / 2, cw - bw - 6));
-      const clampedY = Math.max(6, Math.min(bubbleY, ch - 75));
+      const clampedX = Math.max(6, Math.min(x - bw / 2, contentW - bw - 6));
+      const clampedY = Math.max(6, Math.min(bubbleY, contentH - BUBBLE_SIZE));
 
       elBubble.style.display = 'flex';
       elBubble.style.transform = `translate3d(${clampedX}px,${clampedY}px,0)`;

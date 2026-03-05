@@ -55,6 +55,16 @@ export default function RightSidebar() {
     if (!market) return;
 
     const prices = outcome === 'yes' ? yesPrices : noPrices;
+
+    // For market orders, verify liquidity exists before submitting
+    if (orderType === 'market') {
+      const hasLiquidity = side === 'bid' ? prices.bestAskSize > 0 : prices.bestBidSize > 0;
+      if (!hasLiquidity) {
+        showPrompt('No Liquidity', 'No liquidity available in the orderbook. Try placing a limit order instead.', 'warning');
+        return;
+      }
+    }
+
     const price = orderType === 'limit' ? parseFloat(limitPrice) : (prices.bestAsk || 0.50);
     const isLeveraged = leverage > 1;
     const marginAmount = isLeveraged ? amount / leverage : undefined;
@@ -127,6 +137,20 @@ export default function RightSidebar() {
     if (!market) {
       showPrompt('No Market', 'No active market available.', 'error');
       return;
+    }
+
+    // Check liquidity before volatility orders
+    if (orderType === 'market' && type === 'volatile') {
+      if (yesPrices.bestAskSize === 0 || noPrices.bestAskSize === 0) {
+        showPrompt('No Liquidity', 'No liquidity available in the orderbook. Try placing a limit order instead.', 'warning');
+        return;
+      }
+    }
+    if (type === 'stable') {
+      if (yesPrices.bestBidSize === 0 || noPrices.bestBidSize === 0) {
+        showPrompt('No Liquidity', 'No liquidity available to close your position. It will settle automatically at market expiry.', 'warning');
+        return;
+      }
     }
 
     const isLeveraged = leverage > 1;
@@ -206,10 +230,12 @@ export default function RightSidebar() {
   const timeLeft = Math.max(0, Math.floor((expiryMs - Date.now()) / 1000));
   const timeDisplay = isActivating ? '—:——' : `${Math.floor(timeLeft / 60)}:${String(timeLeft % 60).padStart(2, '0')}`;
 
-  const yesMultiplier = yesPrices.bestAsk > 0 ? (1 / yesPrices.bestAsk).toFixed(2) : '--';
-  const noMultiplier = noPrices.bestAsk > 0 ? (1 / noPrices.bestAsk).toFixed(2) : '--';
-  const yesPayout = yesPrices.bestAsk > 0 ? `+$${Math.round(amount * (1 / yesPrices.bestAsk - 1))}` : '--';
-  const noPayout = noPrices.bestAsk > 0 ? `+$${Math.round(amount * (1 / noPrices.bestAsk - 1))}` : '--';
+  const yesHasLiquidity = yesPrices.bestAskSize > 0;
+  const noHasLiquidity = noPrices.bestAskSize > 0;
+  const yesMultiplier = yesHasLiquidity ? (1 / yesPrices.bestAsk).toFixed(2) : '--';
+  const noMultiplier = noHasLiquidity ? (1 / noPrices.bestAsk).toFixed(2) : '--';
+  const yesPayout = yesHasLiquidity ? `+$${Math.round(amount * (1 / yesPrices.bestAsk - 1))}` : '--';
+  const noPayout = noHasLiquidity ? `+$${Math.round(amount * (1 / noPrices.bestAsk - 1))}` : '--';
 
   return (
     <>

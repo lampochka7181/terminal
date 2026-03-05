@@ -51,8 +51,15 @@ impl Default for MarketOutcomeV2 {
 /// Maximum merkle proof depth (supports up to 2^20 = 1M settlements)
 pub const MAX_MERKLE_PROOF_DEPTH: usize = 20;
 
-/// Maximum settlements per batch instruction
+/// Maximum settlements per batch instruction (V2 individual proofs)
 pub const MAX_SETTLEMENTS_PER_BATCH: usize = 15;
+
+/// Maximum entries in a compact settlement batch V3 (must be power of 2)
+pub const MAX_COMPACT_BATCH_SIZE: usize = 16;
+
+/// Maximum bridge proof depth for compact batches
+/// Global tree max depth (20) - log2(MAX_COMPACT_BATCH_SIZE=16) = 16
+pub const MAX_COMPACT_BRIDGE_DEPTH: usize = 16;
 
 /// YES/NO token decimals (same as USDC for simplicity)
 pub const SHARE_TOKEN_DECIMALS: u8 = 6;
@@ -276,7 +283,7 @@ const NODE_PREFIX: u8 = 0x01;
 /// Hash two 32-byte values together using keccak256
 /// For merkle tree construction, we sort the pair to ensure deterministic ordering
 /// Uses NODE_PREFIX (0x01) domain separation to distinguish from leaf hashes
-fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+pub fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     use anchor_lang::solana_program::keccak;
 
     // Domain separation: prefix with 0x01 for internal nodes
@@ -304,6 +311,52 @@ pub fn create_settlement_leaf(recipient: &Pubkey, amount: u64) -> [u8; 32] {
     data[33..41].copy_from_slice(&amount.to_le_bytes());
 
     keccak::hash(&data).0
+}
+
+// ============================================================================
+// V3 COMPACT BATCH SETTLEMENT HELPERS
+// ============================================================================
+
+/// Empty leaf hash for padding subtrees in compact batch settlement.
+/// MUST match TypeScript: keccak256(new Uint8Array(40)) — 40 zero bytes.
+/// This is NOT create_settlement_leaf(Pubkey::default(), 0) which uses 41 bytes
+/// (includes LEAF_PREFIX byte).
+pub fn empty_leaf_hash() -> [u8; 32] {
+    use anchor_lang::solana_program::keccak;
+    keccak::hash(&[0u8; 40]).0
+}
+
+/// Round up to the next power of 2 (for subtree construction).
+/// Returns 1 for n=0 or n=1.
+pub fn next_power_of_2(n: usize) -> usize {
+    let mut v = 1usize;
+    while v < n {
+        v *= 2;
+    }
+    v
+}
+
+/// log2 of a power-of-2 value. Panics if n is not a power of 2.
+pub fn log2_pow2(n: usize) -> usize {
+    assert!(n > 0 && (n & (n - 1)) == 0, "n must be a power of 2");
+    n.trailing_zeros() as usize
+}
+
+/// Build a subtree root from leaf hashes by hashing pairs bottom-up.
+/// `leaves` must have length equal to a power of 2.
+pub fn build_subtree_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    let n = leaves.len();
+    assert!(n > 0 && (n & (n - 1)) == 0, "leaves must be power of 2");
+
+    let mut current: Vec<[u8; 32]> = leaves.to_vec();
+    while current.len() > 1 {
+        let mut next = Vec::with_capacity(current.len() / 2);
+        for i in (0..current.len()).step_by(2) {
+            next.push(hash_pair(&current[i], &current[i + 1]));
+        }
+        current = next;
+    }
+    current[0]
 }
 
 #[cfg(test)]
@@ -365,5 +418,55 @@ mod tests {
         // An internal node hash should differ from a leaf with the same data
         let fake_leaf = hash_pair(&[0u8; 32], &[1u8; 32]);
         assert_ne!(leaf, fake_leaf);
+    }
+
+    #[test]
+    fn test_empty_leaf_hash_differs_from_settlement_leaf() {
+        // empty_leaf_hash = keccak256(40 zeros)
+        // create_settlement_leaf(default, 0) = keccak256(0x00 || 32_zeros || 8_zeros) = keccak256(41 bytes)
+        let empty = empty_leaf_hash();
+        let settlement_default = create_settlement_leaf(&Pubkey::default(), 0);
+        assert_ne!(empty, settlement_default, "empty_leaf_hash must differ from create_settlement_leaf(default, 0)");
+    }
+
+    #[test]
+    fn test_next_power_of_2() {
+        assert_eq!(next_power_of_2(0), 1);
+        assert_eq!(next_power_of_2(1), 1);
+        assert_eq!(next_power_of_2(2), 2);
+        assert_eq!(next_power_of_2(3), 4);
+        assert_eq!(next_power_of_2(5), 8);
+        assert_eq!(next_power_of_2(8), 8);
+        assert_eq!(next_power_of_2(200), 256);
+    }
+
+    #[test]
+    fn test_log2_pow2() {
+        assert_eq!(log2_pow2(1), 0);
+        assert_eq!(log2_pow2(2), 1);
+        assert_eq!(log2_pow2(4), 2);
+        assert_eq!(log2_pow2(8), 3);
+        assert_eq!(log2_pow2(16), 4);
+    }
+
+    #[test]
+    fn test_build_subtree_root() {
+        let r1 = Pubkey::new_unique();
+        let r2 = Pubkey::new_unique();
+        let leaf1 = create_settlement_leaf(&r1, 1_000_000);
+        let leaf2 = create_settlement_leaf(&r2, 2_000_000);
+
+        // 2-leaf subtree: root should equal hash_pair(leaf1, leaf2)
+        let root = build_subtree_root(&[leaf1, leaf2]);
+        let expected = hash_pair(&leaf1, &leaf2);
+        assert_eq!(root, expected);
+
+        // 4-leaf subtree with padding
+        let empty = empty_leaf_hash();
+        let root4 = build_subtree_root(&[leaf1, leaf2, empty, empty]);
+        let pair_left = hash_pair(&leaf1, &leaf2);
+        let pair_right = hash_pair(&empty, &empty);
+        let expected4 = hash_pair(&pair_left, &pair_right);
+        assert_eq!(root4, expected4);
     }
 }

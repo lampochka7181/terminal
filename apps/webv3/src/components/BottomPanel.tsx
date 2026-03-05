@@ -100,7 +100,7 @@ async function renderPnLCanvas(tx: UserTransaction): Promise<HTMLCanvasElement> 
 
   ctx.fillStyle = 'rgba(238,238,238,0.4)';
   ctx.font = '14px system-ui, sans-serif';
-  ctx.fillText('0TDE Binary Options', 32, 64);
+  ctx.fillText('0DTE Binary Options', 32, 64);
 
   ctx.fillStyle = accentColor;
   ctx.font = 'bold 14px system-ui, sans-serif';
@@ -227,7 +227,13 @@ export default function BottomPanel() {
   const [tab, setTab] = useState<'positions' | 'history'>('positions');
   const [shareTx, setShareTx] = useState<UserTransaction | null>(null);
   const { isAuthenticated } = useAuth();
-  const { positions, orders, transactions, positionsLoading, transactionsLoading } = useUser();
+  const { positions, orders, transactions, positionsLoading, transactionsLoading, refetchTransactions } = useUser();
+
+  // Auto-refresh transactions when switching to history tab
+  const switchToHistory = useCallback(() => {
+    setTab('history');
+    if (isAuthenticated) refetchTransactions();
+  }, [isAuthenticated, refetchTransactions]);
   const sessionKey = useSessionKey();
   const { placeOrder, isPlacing, cancelOrder, isCancelling } = useOrder(sessionKey.sessionSigner);
   const prices = usePriceStore(s => s.prices);
@@ -253,7 +259,7 @@ export default function BottomPanel() {
         side: 'ask',
         outcome,
         orderType: 'market',
-        price: outcome === 'yes' ? 0.01 : 0.99,
+        price: 0.01, // Market sell floor — accept any price (NO effective price = 1 - yesAskPrice, so 0.01 allows yesAsk ≤ 0.99)
         size: shares,
       });
       if (result && result.filledSize === 0) {
@@ -332,7 +338,15 @@ export default function BottomPanel() {
     }
     return true;
   });
-  const openOrders = orders.filter(o => o.status === 'open' || o.status === 'partial');
+  const openOrders = orders.filter(o => {
+    if (o.status !== 'open' && o.status !== 'partial') return false;
+    // Don't show orders for expired markets (defense-in-depth)
+    if (o.expiryAt > 0) {
+      const ms = o.expiryAt < 1e12 ? o.expiryAt * 1000 : o.expiryAt;
+      if (Date.now() > ms) return false;
+    }
+    return true;
+  });
   const allItems = [...openPositions, ...openOrders];
 
   // Split positions with both YES and NO shares into separate display rows
@@ -360,9 +374,15 @@ export default function BottomPanel() {
     }
   }
 
-  const totalExposure = posEntries.reduce((sum, e) => sum + e.costBasis, 0);
+  const orderExposure = openOrders.reduce((sum, o) => {
+    const filledNotional = o.filledSize * o.price;
+    return sum + (o.dollarAmount
+      ? Math.max(0, o.dollarAmount - filledNotional)
+      : (o.remainingSize > 0 ? o.remainingSize : o.size) * o.price);
+  }, 0);
+  const totalExposure = posEntries.reduce((sum, e) => sum + e.costBasis, 0) + orderExposure;
 
-  const columns = ['OUTCOME', 'ASSET', 'SIZE', 'ENTRY', 'MARK', 'UNREAL.PNL', 'ACTION'];
+  const columns = ['OUTCOME', 'ASSET', 'SIZE', 'TOKENS', 'ENTRY', 'MARK', 'UNREAL.PNL', 'ACTION'];
 
   return (
     <div style={{ background: '#1e1e1e', borderRadius: 17, display: 'flex', flexDirection: 'column', minHeight: 240 }}>
@@ -372,7 +392,7 @@ export default function BottomPanel() {
             fontSize: 24, fontWeight: 500, background: 'none', border: 'none', cursor: 'pointer',
             color: tab === 'positions' ? '#eee' : dim,
           }}>Positions ({posEntries.length})</button>
-          <button onClick={() => setTab('history')} style={{
+          <button onClick={switchToHistory} style={{
             fontSize: 24, fontWeight: 500, background: 'none', border: 'none', cursor: 'pointer',
             color: tab === 'history' ? '#eee' : dim,
           }}>History</button>
@@ -437,6 +457,7 @@ export default function BottomPanel() {
                   <div key={`${pos.marketAddress}-${isYes ? 'yes' : 'no'}`} style={{ display: 'flex', alignItems: 'center', padding: '6px 24px', fontSize: 18 }}>
                     <div style={{ flex: 1, color: isYes ? '#95ff94' : '#f55252', fontWeight: 500 }}>{outcomeLabel}</div>
                     <div style={{ flex: 1, color: '#eee' }}>{pos.asset}</div>
+                    <div style={{ flex: 1, color: '#eee' }}>${costBasis.toFixed(2)}</div>
                     <div style={{ flex: 1, color: '#eee' }}>{shares.toFixed(1)}</div>
                     <div style={{ flex: 1, color: '#eee' }}>${entryPrice.toFixed(4)}</div>
                     <div style={{ flex: 1, color: (hasLiquidity || hasFallback) ? (liveMark >= entryPrice ? '#95ff94' : '#f55252') : '#f55252' }}>
@@ -461,31 +482,40 @@ export default function BottomPanel() {
                   </div>
                 );
               })}
-              {openOrders.map((order) => (
-                <div key={order.id} style={{ display: 'flex', alignItems: 'center', padding: '6px 24px', fontSize: 18 }}>
-                  <div style={{ flex: 1, color: order.outcome === 'yes' ? '#95ff94' : '#f55252', fontWeight: 500 }}>
-                    {order.outcome === 'yes' ? 'Above' : 'Below'} {order.side === 'bid' ? 'BUY' : 'SELL'}
+              {openOrders.map((order) => {
+                // For dollar-based market orders: remaining = dollarAmount - filledNotional
+                // For limit orders: remaining = remainingSize * price
+                const filledNotional = order.filledSize * order.price;
+                const dollarValue = order.dollarAmount
+                  ? Math.max(0, order.dollarAmount - filledNotional)
+                  : (order.remainingSize > 0 ? order.remainingSize : order.size) * order.price;
+                return (
+                  <div key={order.id} style={{ display: 'flex', alignItems: 'center', padding: '6px 24px', fontSize: 18 }}>
+                    <div style={{ flex: 1, color: order.outcome === 'yes' ? '#95ff94' : '#f55252', fontWeight: 500 }}>
+                      {order.outcome === 'yes' ? 'Above' : 'Below'}
+                    </div>
+                    <div style={{ flex: 1, color: '#eee' }}>{order.asset}</div>
+                    <div style={{ flex: 1, color: '#eee' }}>${dollarValue.toFixed(2)}</div>
+                    <div style={{ flex: 1, color: dim }}>--</div>
+                    <div style={{ flex: 1, color: dim }}>--</div>
+                    <div style={{ flex: 1, color: dim }}>--</div>
+                    <div style={{ flex: 1, color: dim }}>--</div>
+                    <div style={{ flex: 1 }}>
+                      <button
+                        onClick={() => cancelOrder(order.id)}
+                        disabled={isCancelling}
+                        style={{
+                          fontSize: 15, padding: '3px 12px', borderRadius: 6, border: 'none',
+                          background: '#f55252', color: '#fff', cursor: 'pointer',
+                          opacity: isCancelling ? 0.5 : 1,
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
                   </div>
-                  <div style={{ flex: 1, color: '#eee' }}>{order.asset}</div>
-                  <div style={{ flex: 1, color: '#eee' }}>{order.size.toFixed(1)}</div>
-                  <div style={{ flex: 1, color: '#eee' }}>${order.price.toFixed(4)}</div>
-                  <div style={{ flex: 1, color: dim }}>--</div>
-                  <div style={{ flex: 1, color: dim }}>--</div>
-                  <div style={{ flex: 1 }}>
-                    <button
-                      onClick={() => cancelOrder(order.id)}
-                      disabled={isCancelling}
-                      style={{
-                        fontSize: 15, padding: '3px 12px', borderRadius: 6, border: 'none',
-                        background: '#f55252', color: '#fff', cursor: 'pointer',
-                        opacity: isCancelling ? 0.5 : 1,
-                      }}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </>
@@ -523,7 +553,9 @@ export default function BottomPanel() {
                     <div style={{ flex: 1, color: dim }}>{new Date(tx.timestamp).toLocaleTimeString()}</div>
                     <div style={{ flex: 1 }}>
                       {tx.txStatus === 'FAILED' ? (
-                        <span style={{ color: '#f55252', fontWeight: 600, fontSize: 15 }}>Failed</span>
+                        <span style={{ color: '#f55252', fontWeight: 600, fontSize: 15 }} title={tx.errorCode || 'Unknown error'}>
+                          Failed{tx.errorCode === 'INSUFFICIENT_FUNDS' ? ' (Low USDC)' : ''}
+                        </span>
                       ) : tx.txSignature ? (
                         <a
                           href={`https://solscan.io/tx/${tx.txSignature}`}

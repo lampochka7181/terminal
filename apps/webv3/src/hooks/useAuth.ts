@@ -42,12 +42,15 @@ export function useAuth() {
     await fetchAllUser();
   }, [wallet.publicKey, wallet.signMessage, authSignIn, fetchAllUser]);
 
-  // Sign out - stable reference
+  // Sign out - clears auth state and disconnects wallet
   const signOut = useCallback(async () => {
     stopTokenRefresh();
     await authSignOut();
     clearUserData();
-  }, [authSignOut, clearUserData]);
+    // Disconnect wallet so the auto-sign-in effect doesn't immediately
+    // try to re-authenticate and pop up the wallet sign prompt.
+    try { await wallet.disconnect(); } catch {}
+  }, [authSignOut, clearUserData, wallet.disconnect]);
 
   // Auto-restore session when wallet connects (if not already authenticated)
   useEffect(() => {

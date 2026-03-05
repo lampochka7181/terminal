@@ -126,9 +126,10 @@ async function closeMarket(marketId: string, marketPubkey: string): Promise<void
   // Clear orderbook (fast, Redis operation)
   await orderbookService.clearOrderbook(marketId);
 
-  // Force-cancel on-chain Order PDAs (only for user orders).
-  // This is what returns SOL rent to users; DB cancellation alone does not.
-  if (anchorClient.isReady() && openUserOrders.length > 0) {
+  // Force-cancel on-chain Order PDAs (only for V1 user orders).
+  // V2 markets don't create on-chain Order PDAs — orders are matched off-chain
+  // and settled via tokenized shares, so there's nothing to cancel on-chain.
+  if (!config.useV2 && anchorClient.isReady() && openUserOrders.length > 0) {
     try {
       await anchorClient.cancelOrdersByRelayer({
         marketPubkey,
@@ -221,15 +222,15 @@ async function resolveMarket(
     } catch (err: any) {
       const errorMsg = err.message || '';
       
-      // Handle "MarketNotExpired" error (0x1777) - clock skew between server and Solana
+      // Handle "MarketNotExpired" error (6009 / 0x1779) - clock skew between server and Solana
       // Retry once after a short delay to allow Solana clock to catch up
-      if ((errorMsg.includes('MarketNotExpired') || errorMsg.includes('0x1777')) && retryCount < 1) {
+      if ((errorMsg.includes('MarketNotExpired') || errorMsg.includes('0x1779')) && retryCount < 1) {
         logger.warn(`Market ${marketId} not yet expired on-chain (clock skew), retrying in 1s...`);
         await new Promise(resolve => setTimeout(resolve, 1000));
         return attemptResolve(retryCount + 1);
       }
       
-      if (errorMsg.includes('MarketAlreadyResolved') || errorMsg.includes('0x1778')) {
+      if (errorMsg.includes('MarketAlreadyResolved') || errorMsg.includes('0x177B')) {
         logger.debug(`Market ${marketId} already resolved on-chain, continuing`);
       } else if (errorMsg.includes('AccountNotInitialized') || errorMsg.includes('0xbc4')) {
         // L-09: Don't auto-archive on a single RPC failure — could be transient.
@@ -289,9 +290,9 @@ async function resolveMarket(
       } catch (err: any) {
         const errorMsg = err.message || '';
         // Handle clock skew — fall back to separate resolve + postMerkleRoot
-        if (errorMsg.includes('MarketNotExpired') || errorMsg.includes('0x1777')) {
+        if (errorMsg.includes('MarketNotExpired') || errorMsg.includes('0x1779')) {
           logger.warn(`Combined TX failed (clock skew), falling back to separate resolve: ${errorMsg}`);
-        } else if (errorMsg.includes('MarketAlreadyResolved') || errorMsg.includes('0x1778')) {
+        } else if (errorMsg.includes('MarketAlreadyResolved') || errorMsg.includes('0x177B')) {
           logger.debug(`Market ${marketId} already resolved on-chain, continuing`);
         } else if (errorMsg.includes('AccountNotInitialized') || errorMsg.includes('0xbc4')) {
           // L-09: Don't auto-archive on transient RPC — require 3 consecutive confirmations

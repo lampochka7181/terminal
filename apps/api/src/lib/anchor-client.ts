@@ -546,12 +546,12 @@ export class AnchorClient {
    * Get a random Jito tip instruction (SOL transfer to a random tip account).
    * Required by Helius Sender for dual-routing to Jito validators.
    */
-  private getJitoTipInstruction(): TransactionInstruction {
+  private getJitoTipInstruction(feePayer?: PublicKey): TransactionInstruction {
     const tipAccount = this.JITO_TIP_ACCOUNTS[
       Math.floor(Math.random() * this.JITO_TIP_ACCOUNTS.length)
     ];
     return SystemProgram.transfer({
-      fromPubkey: this.relayerKeypair!.publicKey,
+      fromPubkey: feePayer || this.relayerKeypair!.publicKey,
       toPubkey: new PublicKey(tipAccount),
       lamports: this.jitoTipLamports,
     });
@@ -855,12 +855,13 @@ export class AnchorClient {
     instructions: TransactionInstruction[],
     additionalSigners: Keypair[] = [],
     contextLabel: string = 'Transaction',
-    opts?: { priorityMicroLamports?: number; computeUnits?: number }
+    opts?: { priorityMicroLamports?: number; computeUnits?: number; feePayerOverride?: Keypair; skipSimulation?: boolean }
   ): Promise<string> {
     if (!this.relayerKeypair) {
       throw new Error('Relayer keypair not set');
     }
 
+    const feePayer = opts?.feePayerOverride || this.relayerKeypair;
     const transaction = new Transaction();
 
     // Add compute budget with priority fee (override-able for settlement ops)
@@ -878,16 +879,21 @@ export class AnchorClient {
 
     // Add Jito tip instruction when using Helius Sender (required for dual-routing)
     if (this.heliusSenderUrl) {
-      transaction.add(this.getJitoTipInstruction());
+      transaction.add(this.getJitoTipInstruction(feePayer.publicKey));
     }
 
     // Get recent blockhash (cached to save RPC calls under high throughput)
     const { blockhash, lastValidBlockHeight } = await this.getCachedBlockhash();
     transaction.recentBlockhash = blockhash;
-    transaction.feePayer = this.relayerKeypair.publicKey;
+    transaction.feePayer = feePayer.publicKey;
 
-    // Sign with relayer
-    transaction.sign(this.relayerKeypair, ...additionalSigners);
+    // Sign with fee payer + relayer (if different) + additional signers
+    const signers: Keypair[] = [feePayer];
+    if (opts?.feePayerOverride) {
+      signers.push(this.relayerKeypair); // Master also signs as relayer authority
+    }
+    signers.push(...additionalSigners);
+    transaction.sign(...signers);
 
     const serializedTx = transaction.serialize();
     const execConn = this.getNextExecConnection();
@@ -933,44 +939,68 @@ export class AnchorClient {
 
       // Run preflight simulation FIRST to fail fast on invalid transactions
       // instead of waiting ~60s for block height to expire.
-      try {
-        const simResult = await execConn.simulateTransaction(transaction);
-        if (simResult.value.err) {
-          const simLogs = simResult.value.logs || [];
-          const errJson = JSON.stringify(simResult.value.err);
-          const logText = simLogs.join(' ');
+      // Skip simulation for speed-critical paths (match/close) when configured.
+      const shouldSimulate = !opts?.skipSimulation && !config.skipPreflightSimulation;
+      if (shouldSimulate) {
+        try {
+          const simResult = await execConn.simulateTransaction(transaction);
+          if (simResult.value.err) {
+            const simLogs = simResult.value.logs || [];
+            const errJson = JSON.stringify(simResult.value.err);
+            const logText = simLogs.join(' ');
 
-          // Map simulation errors to recognizable keywords that downstream handlers check for.
-          // Without this, the preflight wraps errors in a new message format that breaks
-          // idempotent "already in use" / "AccountNotInitialized" detection.
-          if (logText.includes('already in use') || errJson.includes('"Custom":0}')) {
-            logger.debug(`[${contextLabel}] Preflight: account already in use (idempotent)`);
-            const error = new Error(`already in use (0x0)`);
+            // Map simulation errors to recognizable keywords that downstream handlers check for.
+            // Without this, the preflight wraps errors in a new message format that breaks
+            // idempotent "already in use" / "AccountNotInitialized" detection.
+            if (logText.includes('already in use') || errJson.includes('"Custom":0}')) {
+              logger.debug(`[${contextLabel}] Preflight: account already in use (idempotent)`);
+              const error = new Error(`already in use (0x0)`);
+              (error as any).logs = simLogs;
+              throw error;
+            }
+            if (logText.includes('AccountNotInitialized') || errJson.includes('"Custom":3012')) {
+              logger.debug(`[${contextLabel}] Preflight: AccountNotInitialized (race condition)`);
+              const error = new Error(`AccountNotInitialized (0xbc4)`);
+              (error as any).logs = simLogs;
+              throw error;
+            }
+            if (logText.includes('MarketClosing') || errJson.includes('"Custom":6007')) {
+              logger.warn(`[${contextLabel}] Preflight: MarketClosing (within trading close buffer)`);
+              const error = new Error(`MarketClosing (0x1777)`);
+              (error as any).logs = simLogs;
+              throw error;
+            }
+            if (logText.includes('MarketNotExpired') || errJson.includes('"Custom":6009')) {
+              logger.warn(`[${contextLabel}] Preflight: MarketNotExpired (clock skew)`);
+              const error = new Error(`MarketNotExpired (0x1779)`);
+              (error as any).logs = simLogs;
+              throw error;
+            }
+            if (logText.includes('MarketAlreadyResolved') || errJson.includes('"Custom":6011')) {
+              logger.debug(`[${contextLabel}] Preflight: MarketAlreadyResolved (idempotent)`);
+              const error = new Error(`MarketAlreadyResolved (0x177B)`);
+              (error as any).logs = simLogs;
+              throw error;
+            }
+
+            // Genuinely unexpected failure — log full details at ERROR
+            logger.error(`[${contextLabel}] Preflight simulation FAILED: ${errJson}`);
+            if (simLogs.length > 0) {
+              logger.error(`[${contextLabel}] Simulation logs:\n${simLogs.join('\n')}`);
+            }
+            const error = new Error(`[${contextLabel}] Preflight simulation failed: ${errJson}`);
             (error as any).logs = simLogs;
             throw error;
           }
-          if (logText.includes('AccountNotInitialized') || errJson.includes('"Custom":3012')) {
-            logger.debug(`[${contextLabel}] Preflight: AccountNotInitialized (race condition)`);
-            const error = new Error(`AccountNotInitialized (0xbc4)`);
-            (error as any).logs = simLogs;
-            throw error;
-          }
-
-          // Genuinely unexpected failure — log full details at ERROR
-          logger.error(`[${contextLabel}] Preflight simulation FAILED: ${errJson}`);
-          if (simLogs.length > 0) {
-            logger.error(`[${contextLabel}] Simulation logs:\n${simLogs.join('\n')}`);
-          }
-          const error = new Error(`[${contextLabel}] Preflight simulation failed: ${errJson}`);
-          (error as any).logs = simLogs;
-          throw error;
+          logger.debug(`[${contextLabel}] Preflight simulation OK (units: ${simResult.value.unitsConsumed})`);
+        } catch (simErr: any) {
+          // Re-throw errors from our own preflight handling above
+          if (simErr.logs !== undefined) throw simErr;
+          // Network errors — log and proceed with send anyway (simulation endpoint might be down)
+          logger.warn(`[${contextLabel}] Preflight simulation request failed (proceeding anyway): ${simErr.message?.slice(0, 100)}`);
         }
-        logger.debug(`[${contextLabel}] Preflight simulation OK (units: ${simResult.value.unitsConsumed})`);
-      } catch (simErr: any) {
-        // Re-throw errors from our own preflight handling above
-        if (simErr.logs !== undefined) throw simErr;
-        // Network errors — log and proceed with send anyway (simulation endpoint might be down)
-        logger.warn(`[${contextLabel}] Preflight simulation request failed (proceeding anyway): ${simErr.message?.slice(0, 100)}`);
+      } else {
+        logger.debug(`[${contextLabel}] Skipping preflight simulation (speed-critical path)`);
       }
 
       signature = await execConn.sendRawTransaction(
@@ -1097,6 +1127,7 @@ export class AnchorClient {
     takerSignature?: string;  // Base58 encoded Ed25519 signature
     makerMessage?: string;    // Base64 encoded binary message
     takerMessage?: string;    // Base64 encoded binary message
+    feePayerKeypair?: Keypair; // Pool child wallet as fee payer
   }): Promise<string> {
     if (!this.isReady()) {
       throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
@@ -1153,9 +1184,12 @@ export class AnchorClient {
       takerOrderPda,
     });
 
-    const signature = await this.submitTransaction([ix], [], `Match ${params.matchSize} shares`);
+    const signature = await this.submitTransaction([ix], [], `Match ${params.matchSize} shares`, {
+      feePayerOverride: params.feePayerKeypair,
+      skipSimulation: true, // Speed-critical: skip preflight to save 100-500ms
+    });
     logger.debug(`Match executed on-chain: ${signature}`);
-    
+
     return signature;
   }
 
@@ -1340,6 +1374,7 @@ export class AnchorClient {
     price: number;      // Price in dollars (e.g., 0.52)
     matchSize: number;  // Number of contracts (e.g., 100)
     takerFee: number;   // Fee in USD (e.g., 0.02)
+    feePayerKeypair?: Keypair; // Pool child wallet as fee payer
   }): Promise<string> {
     if (!this.isReady()) {
       throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
@@ -1367,7 +1402,10 @@ export class AnchorClient {
       takerFee: feeU64,
     });
 
-    const signature = await this.submitTransaction([ix], [], `Close Position ${params.matchSize} shares`);
+    const signature = await this.submitTransaction([ix], [], `Close Position ${params.matchSize} shares`, {
+      feePayerOverride: params.feePayerKeypair,
+      skipSimulation: true, // Speed-critical: skip preflight to save 100-500ms
+    });
     logger.debug(`Close executed on-chain: ${signature}`);
     
     return signature;
@@ -1786,18 +1824,20 @@ export class AnchorClient {
   async getDelegationInfo(wallet: string, delegate: string): Promise<{
     delegate: string | null;
     delegatedAmount: number;
+    balance: number;
   }> {
     try {
       const walletPubkey = new PublicKey(wallet);
       const ata = await getAssociatedTokenAddress(USDC_MINT, walletPubkey);
       const account = await getAccount(this.connection, ata);
-      
+
       return {
         delegate: account.delegate ? account.delegate.toBase58() : null,
         delegatedAmount: Number(account.delegatedAmount),
+        balance: Number(account.amount),
       };
     } catch (err) {
-      return { delegate: null, delegatedAmount: 0 };
+      return { delegate: null, delegatedAmount: 0, balance: 0 };
     }
   }
 
@@ -2211,6 +2251,7 @@ export class AnchorClient {
     takerExpiryTs: number;
     makerOrderPda?: string;
     takerOrderPda?: string;
+    feePayerKeypair?: Keypair; // Pool child wallet as fee payer
   }): Promise<string> {
     if (!this.isReady()) {
       throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
@@ -2257,6 +2298,9 @@ export class AnchorClient {
     const takerYesAta = await getAssociatedTokenAddress(yesMint, takerWallet, false, TOKEN_2022_PROGRAM_ID);
     const takerNoAta = await getAssociatedTokenAddress(noMint, takerWallet, false, TOKEN_2022_PROGRAM_ID);
 
+    // ATA creation payer: use fee payer override if available (child pays rent too)
+    const ataPayer = params.feePayerKeypair?.publicKey || this.relayerKeypair!.publicKey;
+
     // Check which ATAs need to be created (avoid idempotent instruction bug with Token-2022)
     const createAtaIxs: TransactionInstruction[] = [];
     const conn = this.getConnection();
@@ -2266,10 +2310,9 @@ export class AnchorClient {
       try {
         const info = await conn.getAccountInfo(ata);
         if (!info) {
-          // Account doesn't exist - add creation instruction
           createAtaIxs.push(
             createAssociatedTokenAccountIdempotentInstruction(
-              this.relayerKeypair!.publicKey,
+              ataPayer,
               ata,
               owner,
               mint,
@@ -2278,12 +2321,10 @@ export class AnchorClient {
             )
           );
         }
-        // If account exists, skip - no instruction needed
       } catch {
-        // Error checking account - add creation instruction to be safe
         createAtaIxs.push(
           createAssociatedTokenAccountIdempotentInstruction(
-            this.relayerKeypair!.publicKey,
+            ataPayer,
             ata,
             owner,
             mint,
@@ -2318,7 +2359,10 @@ export class AnchorClient {
 
     // Combine ATA creation with match in single transaction
     const allIxs = [...createAtaIxs, matchIx];
-    const signature = await this.submitTransaction(allIxs, [], `MatchV2 ${params.matchSize} shares`);
+    const signature = await this.submitTransaction(allIxs, [], `MatchV2 ${params.matchSize} shares`, {
+      feePayerOverride: params.feePayerKeypair,
+      skipSimulation: true, // Speed-critical: skip preflight to save 100-500ms
+    });
     logger.info(`MatchV2 executed on-chain: ${signature}`);
 
     return signature;
@@ -2517,6 +2561,7 @@ export class AnchorClient {
     price: number;      // Price in dollars (e.g., 0.52)
     matchSize: number;  // Number of shares (e.g., 100)
     takerFee: number;   // Fee in USD (e.g., 0.02)
+    feePayerKeypair?: Keypair; // Pool child wallet as fee payer
   }): Promise<string> {
     if (!this.isReady()) {
       throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
@@ -2533,6 +2578,9 @@ export class AnchorClient {
     const sizeU64 = Math.floor(params.matchSize * 1_000_000);
     const feeU64 = Math.floor(params.takerFee * 1_000_000);
 
+    // ATA creation payer: use fee payer override if available (child pays rent too)
+    const ataPayer = params.feePayerKeypair?.publicKey || this.relayerKeypair!.publicKey;
+
     // Pre-create buyer ATAs (idempotent - skips if already exists)
     // Token-2022 program for YES/NO share tokens
     const buyerYesAta = await getAssociatedTokenAddress(yesMint, buyerWallet, false, TOKEN_2022_PROGRAM_ID);
@@ -2540,14 +2588,14 @@ export class AnchorClient {
 
     const createAtaIxs: TransactionInstruction[] = [
       createAssociatedTokenAccountIdempotentInstruction(
-        this.relayerKeypair!.publicKey, // payer
+        ataPayer,
         buyerYesAta,
         buyerWallet,
         yesMint,
         TOKEN_2022_PROGRAM_ID  // Token-2022 for share tokens
       ),
       createAssociatedTokenAccountIdempotentInstruction(
-        this.relayerKeypair!.publicKey,
+        ataPayer,
         buyerNoAta,
         buyerWallet,
         noMint,
@@ -2569,7 +2617,10 @@ export class AnchorClient {
 
     // Combine ATA creation with close in single transaction
     const allIxs = [...createAtaIxs, closeIx];
-    const signature = await this.submitTransaction(allIxs, [], `CloseV2 ${params.matchSize} shares`);
+    const signature = await this.submitTransaction(allIxs, [], `CloseV2 ${params.matchSize} shares`, {
+      feePayerOverride: params.feePayerKeypair,
+      skipSimulation: true, // Speed-critical: skip preflight to save 100-500ms
+    });
     logger.info(`CloseV2 executed on-chain: ${signature}`);
 
     return signature;
@@ -2793,6 +2844,125 @@ export class AnchorClient {
       { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
     );
     logger.info(`BatchSettleV2 executed: ${signature} (${entries.length} settlements)`);
+    return signature;
+  }
+
+  /**
+   * Compact batch settlement (V3).
+   *
+   * Sends N consecutive settlements with a single shared bridge proof instead
+   * of N individual full proofs. 4-8x more TX-efficient for large markets.
+   *
+   * @param params.marketPubkey - Market public key
+   * @param params.bitmapChunkIndex - Settlement bitmap chunk (0 for most markets)
+   * @param params.startIndex - First leaf index (must be aligned to subtreeSize)
+   * @param params.subtreeSize - Power-of-2 subtree size (e.g. 8 or 16)
+   * @param params.settlements - Array of { recipient, amount } (no proofs needed)
+   * @param params.bridgeProof - Shared bridge proof from subtree root to global root
+   */
+  async batchSettleV3(params: {
+    marketPubkey: string;
+    bitmapChunkIndex: number;
+    startIndex: number;
+    subtreeSize: number;
+    settlements: Array<{
+      recipient: string;   // pubkey base58
+      amount: bigint;      // USDC native units
+    }>;
+    bridgeProof: Uint8Array[];  // array of 32-byte hashes
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const [vault] = PublicKey.findProgramAddressSync(
+      [Buffer.from('vault'), market.toBuffer()],
+      PROGRAM_ID
+    );
+    const bitmapPda = getSettlementBitmapPda(market, params.bitmapChunkIndex);
+
+    const discriminator = computeDiscriminator('batch_settle_v3');
+
+    // Borsh-serialize CompactBatchSettlement:
+    // start_index: u64, count: u8, amounts: Vec<u64>, bridge_proof: Vec<[u8;32]>
+    const bufParts: Buffer[] = [];
+
+    // start_index: u64 LE
+    const startIndexBuf = Buffer.alloc(8);
+    startIndexBuf.writeBigUInt64LE(BigInt(params.startIndex), 0);
+    bufParts.push(startIndexBuf);
+
+    // count: u8
+    const countBuf = Buffer.alloc(1);
+    countBuf.writeUInt8(params.settlements.length, 0);
+    bufParts.push(countBuf);
+
+    // amounts: Vec<u64> — u32 length prefix + count × u64 LE
+    const amountsLenBuf = Buffer.alloc(4);
+    amountsLenBuf.writeUInt32LE(params.settlements.length, 0);
+    bufParts.push(amountsLenBuf);
+    for (const entry of params.settlements) {
+      const amountBuf = Buffer.alloc(8);
+      amountBuf.writeBigUInt64LE(entry.amount, 0);
+      bufParts.push(amountBuf);
+    }
+
+    // bridge_proof: Vec<[u8;32]> — u32 length prefix + N × 32 bytes
+    const bridgeLenBuf = Buffer.alloc(4);
+    bridgeLenBuf.writeUInt32LE(params.bridgeProof.length, 0);
+    bufParts.push(bridgeLenBuf);
+    for (const proofElement of params.bridgeProof) {
+      bufParts.push(Buffer.from(proofElement));
+    }
+
+    const argsBuffer = Buffer.concat(bufParts);
+    const data = Buffer.concat([discriminator, argsBuffer]);
+
+    // Build remaining accounts — recipient USDC ATAs in same order as settlements
+    const remainingAccounts = await Promise.all(
+      params.settlements.map(async (entry) => {
+        const recipientPubkey = new PublicKey(entry.recipient);
+        const ata = await getAssociatedTokenAddress(USDC_MINT, recipientPubkey);
+        return { pubkey: ata, isSigner: false, isWritable: true };
+      }),
+    );
+
+    // Pre-create ATAs if needed (idempotent)
+    const createAtaIxs: TransactionInstruction[] = [];
+    for (const entry of params.settlements) {
+      const recipientPubkey = new PublicKey(entry.recipient);
+      createAtaIxs.push(
+        createAssociatedTokenAccountIdempotentInstruction(
+          this.relayerKeypair!.publicKey,
+          await getAssociatedTokenAddress(USDC_MINT, recipientPubkey),
+          recipientPubkey,
+          USDC_MINT,
+        ),
+      );
+    }
+
+    const instruction = new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: market, isSigner: false, isWritable: true },
+        { pubkey: vault, isSigner: false, isWritable: true },
+        { pubkey: bitmapPda, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair!.publicKey, isSigner: true, isWritable: true },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        ...remainingAccounts,
+      ],
+      data,
+    });
+
+    const allIxs = [...createAtaIxs, instruction];
+    const signature = await this.submitTransaction(
+      allIxs, [],
+      `BatchSettleV3 ${params.settlements.length} entries (Market ${params.marketPubkey.slice(0, 8)})`,
+      { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
+    );
+    logger.info(`BatchSettleV3 executed: ${signature} (${params.settlements.length} settlements, subtree=${params.subtreeSize})`);
     return signature;
   }
 

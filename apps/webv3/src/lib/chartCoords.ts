@@ -11,6 +11,8 @@ export interface ChartCoordMapper {
   timeToX: (timeSec: number) => number | null;
   /** Map asset price → y pixel (relative to chart container). Returns null if off-screen. */
   priceToY: (price: number) => number | null;
+  /** Content area dimensions (chart area excluding axes/scales). Used by TradeBubbles for bounds. */
+  contentArea: { width: number; height: number };
 }
 
 /** Mutable ref — updated by active chart component on every frame */

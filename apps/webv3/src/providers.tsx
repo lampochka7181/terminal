@@ -23,6 +23,7 @@ function AuthStateManager({ children }: { children: ReactNode }) {
   const clearUserData = useUserStore((state) => state.clearUserData);
   const lastAuthToken = useRef<string | null>(null);
   const hasSignedOut = useRef(false);
+  const walletWasConnected = useRef(false);
   const lastAutoSignInAttempt = useRef<{ wallet: string | null; at: number }>({ wallet: null, at: 0 });
 
   useEffect(() => {
@@ -61,6 +62,19 @@ function AuthStateManager({ children }: { children: ReactNode }) {
     }
   }, [isAuthenticated, token]);
 
+  // Track when wallet connects so we can distinguish "not yet connected on
+  // page load" from "was connected then disconnected".
+  useEffect(() => {
+    if (wallet.connected) {
+      walletWasConnected.current = true;
+      hasSignedOut.current = false;
+    }
+  }, [wallet.connected]);
+
+  // Auto-sign-in when wallet connects but we don't have a valid session yet.
+  // On a fresh page load with a persisted session the auth store rehydrates
+  // isAuthenticated = true BEFORE the wallet adapter auto-connects, so this
+  // effect correctly skips the sign-in flow (the persisted JWT is still valid).
   useEffect(() => {
     const walletAddress = wallet.publicKey?.toBase58();
     if (!wallet.connected || wallet.connecting || !walletAddress) return;
@@ -94,14 +108,23 @@ function AuthStateManager({ children }: { children: ReactNode }) {
     authSignIn,
   ]);
 
+  // Sign out only when the wallet was previously connected and then
+  // disconnects (real disconnect, not just "hasn't auto-connected yet").
   useEffect(() => {
-    if (!wallet.connected && isAuthenticated && !hasSignedOut.current) {
+    if (
+      !wallet.connected &&
+      !wallet.connecting &&
+      isAuthenticated &&
+      walletWasConnected.current &&
+      !hasSignedOut.current
+    ) {
       hasSignedOut.current = true;
+      walletWasConnected.current = false;
       stopTokenRefresh();
       signOut();
       clearUserData();
     }
-  }, [wallet.connected, isAuthenticated, signOut, clearUserData]);
+  }, [wallet.connected, wallet.connecting, isAuthenticated, signOut, clearUserData]);
 
   return <>{children}</>;
 }

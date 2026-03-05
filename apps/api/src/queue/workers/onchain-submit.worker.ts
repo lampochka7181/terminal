@@ -139,15 +139,83 @@ async function executeBatchSettle(payload: Record<string, any>): Promise<{ succe
   }
 }
 
+/**
+ * Execute a V3 compact batch-settle job: call batchSettleV3 and update settlement_jobs table.
+ */
+async function executeBatchSettleV3(payload: Record<string, any>): Promise<{ success: boolean; signature?: string; error?: string; errorCode?: string }> {
+  const { marketPubkey, bitmapChunkIndex, startIndex, subtreeSize, settlements: batchSettlements, bridgeProof, marketId, batchIndex } = payload;
+
+  try {
+    // Mark as SUBMITTED
+    await db.execute(sql`
+      UPDATE settlement_jobs
+      SET status = 'SUBMITTED', attempts = attempts + 1
+      WHERE market_id = ${marketId}::uuid AND batch_index = ${batchIndex}
+    `);
+
+    // Convert JSON-safe strings back to BigInt/Buffer for on-chain call
+    const deserializedSettlements = batchSettlements.map((s: any) => ({
+      recipient: s.recipient,
+      amount: BigInt(s.amount),
+    }));
+
+    const deserializedBridgeProof = bridgeProof.map((p: string) =>
+      new Uint8Array(Buffer.from(p, 'hex'))
+    );
+
+    const sig = await anchorClient.batchSettleV3({
+      marketPubkey,
+      bitmapChunkIndex: bitmapChunkIndex || 0,
+      startIndex,
+      subtreeSize,
+      settlements: deserializedSettlements,
+      bridgeProof: deserializedBridgeProof,
+    });
+
+    // Mark as COMPLETED
+    await db.execute(sql`
+      UPDATE settlement_jobs
+      SET status = 'COMPLETED', tx_signature = ${sig}, completed_at = NOW()
+      WHERE market_id = ${marketId}::uuid AND batch_index = ${batchIndex}
+    `);
+
+    // Check if all batches done → trigger finalization immediately
+    await checkAndTriggerSettlementCompletion(marketId);
+
+    return { success: true, signature: sig };
+  } catch (err: any) {
+    const msg = err.message || '';
+
+    if (msg.includes('AlreadyClaimed')) {
+      await db.execute(sql`
+        UPDATE settlement_jobs
+        SET status = 'COMPLETED', completed_at = NOW()
+        WHERE market_id = ${marketId}::uuid AND batch_index = ${batchIndex}
+      `);
+      await checkAndTriggerSettlementCompletion(marketId);
+      return { success: true, signature: 'already_claimed' };
+    }
+
+    // Mark as FAILED
+    await db.execute(sql`
+      UPDATE settlement_jobs
+      SET status = 'FAILED', error_message = ${msg}
+      WHERE market_id = ${marketId}::uuid AND batch_index = ${batchIndex}
+    `);
+
+    return { success: false, error: msg };
+  }
+}
+
 async function processJob(job: Job<OnchainSubmitJobData>): Promise<void> {
   const { type, idempotencyKey, payload } = job.data;
 
   const jobStartMs = Date.now();
   logger.info(`[QUEUE:onchain] Processing ${type} job: ${idempotencyKey} (attempt ${job.attemptsMade + 1})`);
 
-  // Try to acquire a relayer from the pool (falls back to default relayer if pool is empty)
-  const acquired = await relayerPoolService.acquireRelayer().catch(() => null);
-  const relayerPubkey = acquired?.pubkey;
+  // Acquire a fee payer from the pool (child wallet → master1 → master2 fallback)
+  const acquired = await relayerPoolService.acquireFeePayer().catch(() => null);
+  const feePayerPubkey = acquired?.pubkey;
 
   let result: { success: boolean; signature?: string; error?: string; errorCode?: string };
 
@@ -160,7 +228,6 @@ async function processJob(job: Job<OnchainSubmitJobData>): Promise<void> {
         const market = await getCachedMarketStatus(marketPubkey);
         if (market && market.status !== 'OPEN') {
           logger.warn(`[QUEUE:onchain] Skipping ${type} job — market ${market.status}: ${idempotencyKey}`);
-          // Enqueue DB sync to mark as failed
           const syncData: DbSyncJobData = {
             tradeId: (payload as any).tradeId,
             makerOrderId: (payload as any).makerOrderId,
@@ -172,14 +239,13 @@ async function processJob(job: Job<OnchainSubmitJobData>): Promise<void> {
           await dbSyncQueue.add('db-sync', syncData, {
             jobId: `dbsync-skip-${idempotencyKey}`,
           });
-          if (relayerPubkey) {
-            await relayerPoolService.releaseRelayer(relayerPubkey, false).catch(() => {});
+          if (feePayerPubkey) {
+            await relayerPoolService.releaseFeePayer(feePayerPubkey, false, acquired?.isMaster).catch(() => {});
           }
           return;
         }
       }
     } catch (err: any) {
-      // Non-fatal: proceed with the TX if we can't check market status
       logger.debug(`[QUEUE:onchain] Market status pre-check failed (non-fatal): ${err.message}`);
     }
   }
@@ -187,31 +253,49 @@ async function processJob(job: Job<OnchainSubmitJobData>): Promise<void> {
   try {
     switch (type) {
       case 'match':
-        result = await transactionService.executeMatch(payload as any);
+        result = await transactionService.executeMatch({
+          ...(payload as any),
+          feePayerKeypair: acquired?.keypair,
+        });
         break;
       case 'close':
-        result = await transactionService.executeClose(payload as any);
+        result = await transactionService.executeClose({
+          ...(payload as any),
+          feePayerKeypair: acquired?.keypair,
+        });
         break;
       case 'settle':
+        // Settlement uses master wallet (market authority) — no child fee payer
         result = await transactionService.executeSettlement(payload as any);
         break;
       case 'batch-settle':
         result = await executeBatchSettle(payload);
         break;
+      case 'batch-settle-v3':
+        result = await executeBatchSettleV3(payload);
+        break;
       default:
         throw new Error(`Unknown job type: ${type}`);
     }
   } catch (err: any) {
-    // Release relayer on exception
-    if (relayerPubkey) {
-      await relayerPoolService.releaseRelayer(relayerPubkey, false).catch(() => {});
+    // Check if failure is due to insufficient SOL on this fee payer
+    const isSolError = err.message?.includes('insufficient lamports') ||
+                        err.message?.includes('Attempt to debit');
+
+    if (feePayerPubkey) {
+      await relayerPoolService.releaseFeePayer(feePayerPubkey, false, acquired?.isMaster).catch(() => {});
     }
+
+    if (isSolError && acquired && !acquired.isMaster) {
+      logger.warn(`[QUEUE:onchain] Fee payer ${feePayerPubkey?.slice(0, 8)} out of SOL, will retry with different wallet`);
+    }
+
     throw err;
   }
 
-  // Release the relayer
-  if (relayerPubkey) {
-    await relayerPoolService.releaseRelayer(relayerPubkey, result.success).catch(() => {});
+  // Release the fee payer
+  if (feePayerPubkey) {
+    await relayerPoolService.releaseFeePayer(feePayerPubkey, result.success, acquired?.isMaster).catch(() => {});
   }
 
   if (result.success) {

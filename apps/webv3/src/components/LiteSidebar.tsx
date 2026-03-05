@@ -169,7 +169,7 @@ export default function LiteSidebar() {
       side: 'ask',
       outcome,
       orderType: 'market',
-      price: outcome === 'yes' ? 0.01 : 0.99,
+      price: 0.01, // Market sell floor — accept any price (NO effective price = 1 - yesAskPrice, so 0.01 allows yesAsk ≤ 0.99)
       size: shares,
     });
     if (result && result.filledSize === 0) {
@@ -282,7 +282,7 @@ export default function LiteSidebar() {
             <div style={{ padding: '11px 27px 3px' }}>
               <h2 style={{ fontSize: 36, fontWeight: 500, color: '#fff', margin: 0, lineHeight: '41px' }}>Up or Down?</h2>
               <p style={{ fontSize: 15, color: 'rgba(238,238,238,0.44)', lineHeight: '20px', margin: '3px 0 0' }}>
-                Predict outcomes within timeframes.<br />0TDE Binary Options.
+                Predict outcomes within timeframes.<br />0DTE Binary Options.
               </p>
             </div>
 

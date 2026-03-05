@@ -33,6 +33,7 @@ console.log('   DATABASE_URL:', process.env.DATABASE_URL ? `${process.env.DATABA
 console.log('   REDIS_URL:', process.env.REDIS_URL || '(using default: redis://localhost:6379)');
 console.log('   SUPABASE_URL:', process.env.SUPABASE_URL || '❌ NOT SET');
 console.log('   JWT_SECRET:', process.env.JWT_SECRET ? '✅ SET' : '⚠️ using default');
+console.log('   RELAYER_POOL:', `enabled=${(process.env.RELAYER_POOL_ENABLED || '').trim()}, size=${process.env.RELAYER_POOL_SIZE ?? '(default 5)'}`);
 
 export const config = {
   // Server
@@ -90,6 +91,16 @@ export const config = {
   jitoTipSol: parseFloat(process.env.JITO_TIP_SOL || '0.0002'),
   programId: process.env.PROGRAM_ID || '5Kq43SR2HUNsyNZWaau1p8kQzAvW2UA2mAvempdchTrk',
   relayerPrivateKey: process.env.RELAYER_PRIVATE_KEY || '',
+  relayerPrivateKey2: process.env.RELAYER_PRIVATE_KEY_2 || '',
+  // Relayer Pool — child wallets as fee payers, masters as authority
+  relayerPool: {
+    enabled: (process.env.RELAYER_POOL_ENABLED || '').trim() === 'true',
+    size: parseInt(process.env.RELAYER_POOL_SIZE ?? '5'),
+    minBalanceSol: parseFloat(process.env.RELAYER_MIN_BALANCE_SOL || '0.1'),
+    fundAmountSol: parseFloat(process.env.RELAYER_FUND_AMOUNT_SOL || '0.5'),
+    maxConsecutiveFailures: parseInt(process.env.RELAYER_MAX_FAILURES || '5'),
+    cooldownDurationMs: parseInt(process.env.RELAYER_COOLDOWN_MS || '60000'),
+  },
   // USDC-dev on devnet (use mainnet USDC for production)
   usdcMint: process.env.USDC_MINT || 'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr',
   // Fee recipient for trading fees
@@ -199,6 +210,17 @@ export const config = {
   //   - Rate limit increased to 10,000/min
   //   - BullMQ concurrency boosted
   perfTestMode: process.env.PERF_TEST_MODE === 'true',
+
+  // ============================================================================
+  // MATCHING ENGINE OPTIMIZATIONS
+  // ============================================================================
+  // Batch-fetch matching: replaces per-fill Redis RTTs with bulk getTopN + batchConsume.
+  // Reduces ~126 RTTs (63 fills × 2) to 2-4 RTTs total. Feature flag for instant rollback.
+  useBatchMatching: process.env.USE_BATCH_MATCHING !== 'false', // Enabled by default
+
+  // Skip preflight simulation for speed-critical TXs (match/close).
+  // Saves 100-500ms on devnet. Safe because relayer is trusted and TXs are idempotent.
+  skipPreflightSimulation: process.env.SKIP_PREFLIGHT_SIMULATION === 'true',
 };
 
 // ============================================================================

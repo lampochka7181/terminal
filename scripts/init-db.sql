@@ -84,6 +84,8 @@ CREATE TABLE orders (
     binary_message TEXT,
     is_mm_order BOOLEAN DEFAULT FALSE NOT NULL,
     is_agent_order BOOLEAN DEFAULT FALSE NOT NULL,
+    -- Dollar-based market orders: original USD amount requested (e.g., $25)
+    dollar_amount DECIMAL(20,6),
     -- Leverage fields (for displaying leverage info before margin account exists)
     leverage DECIMAL(4,2) DEFAULT 1,
     margin_amount DECIMAL(20,6),
@@ -126,6 +128,7 @@ CREATE TABLE trades (
     size DECIMAL(20,6) NOT NULL,
     tx_signature VARCHAR(88),
     tx_status tx_status DEFAULT 'PENDING',
+    error_code VARCHAR(50),
     executed_at TIMESTAMP DEFAULT NOW(),
     confirmed_at TIMESTAMP,
 
@@ -178,7 +181,8 @@ CREATE TABLE settlements (
     tx_status tx_status DEFAULT 'PENDING',
     batch_id UUID,
     created_at TIMESTAMP DEFAULT NOW(),
-    confirmed_at TIMESTAMP
+    confirmed_at TIMESTAMP,
+    UNIQUE(position_id, market_id)
 );
 
 CREATE INDEX idx_settlements_user ON settlements(user_id, created_at DESC);

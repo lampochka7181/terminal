@@ -362,6 +362,24 @@ pub mod degen_terminal {
         instructions::batch_settle_v2(ctx, settlements)
     }
 
+    /// Compact batch settle using shared subtree proofs (V3)
+    ///
+    /// Settles up to 16 consecutive users in one TX using a single shared
+    /// bridge proof instead of individual full proofs. The on-chain program
+    /// reconstructs the subtree from (recipient, amount) pairs and verifies
+    /// the bridge proof against the global merkle root.
+    ///
+    /// This is 4-8x more TX-efficient than V2 for large markets.
+    ///
+    /// # Arguments
+    /// * `settlement` - Compact batch data (start_index, amounts, bridge_proof)
+    pub fn batch_settle_v3<'info>(
+        ctx: Context<'_, '_, 'info, 'info, BatchSettleV3<'info>>,
+        settlement: CompactBatchSettlement,
+    ) -> Result<()> {
+        instructions::batch_settle_v3(ctx, settlement)
+    }
+
     /// Burn remaining share tokens from user ATAs using PermanentDelegate
     ///
     /// Called after batch_settle_v2 completes and before finalize_market_v2.

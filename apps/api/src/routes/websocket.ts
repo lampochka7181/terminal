@@ -4,6 +4,7 @@ import { logger } from '../lib/logger.js';
 import { redis, RedisKeys } from '../db/redis.js';
 import { wsMetrics } from '../metrics/index.js';
 import { orderbookService } from '../services/orderbook.service.js';
+import { marketService } from '../services/market.service.js';
 import {
   registerClients,
   indexSubscribe,
@@ -252,8 +253,9 @@ async function handleAuth(socket: WebSocket, client: ClientState, message: any, 
     client.subscriptions.push({ channel: 'user', market: undefined });
     updateBroadcastClient(socket, client);
 
-    logger.info(`WebSocket authenticated: ${decoded.address}`);
-  } catch {
+    logger.info(`WebSocket authenticated: userId=${decoded.sub.slice(0, 8)} wallet=${decoded.address.slice(0, 8)}`);
+  } catch (err) {
+    logger.warn(`WebSocket auth failed: ${(err as Error).message || 'unknown error'}`);
     socket.send(JSON.stringify({ op: 'auth', status: 'error', error: { code: 'INVALID_TOKEN', message: 'Token verification failed' } }));
   }
 }
@@ -271,35 +273,30 @@ async function handleSnapshot(socket: WebSocket, message: any) {
 
 /**
  * Send orderbook snapshot using the orderbookService (O(levels) from pre-aggregated data).
+ *
+ * SINGLE ORDERBOOK MODEL: Always sends composite YES view.
+ * The frontend derives NO from YES complement, so we merge any NO orders
+ * into the YES snapshot before sending.
+ *
+ * Also resolves pubkey → DB UUID for correct Redis key lookup.
  */
-async function sendOrderbookSnapshot(socket: WebSocket, marketId: string, isFullSnapshot = false) {
+async function sendOrderbookSnapshot(socket: WebSocket, marketPubkey: string, isFullSnapshot = false) {
   try {
-    const [yesSnap, noSnap] = await Promise.all([
-      orderbookService.getSnapshot(marketId, 'YES'),
-      orderbookService.getSnapshot(marketId, 'NO'),
-    ]);
+    // Resolve pubkey to DB UUID for correct Redis key lookup
+    const market = await marketService.getByPubkey(marketPubkey);
+    const dbMarketId = market?.id || marketPubkey;
+
+    const snapshot = await orderbookService.getCompositeSnapshot(dbMarketId);
 
     socket.send(JSON.stringify({
       channel: 'orderbook',
-      market: marketId,
+      market: marketPubkey,
       snapshot: isFullSnapshot,
       data: {
         outcome: 'YES',
-        bids: yesSnap.bids.map(l => [l.price, l.size]),
-        asks: yesSnap.asks.map(l => [l.price, l.size]),
-        sequenceId: yesSnap.sequenceId,
-      },
-    }));
-
-    socket.send(JSON.stringify({
-      channel: 'orderbook',
-      market: marketId,
-      snapshot: isFullSnapshot,
-      data: {
-        outcome: 'NO',
-        bids: noSnap.bids.map(l => [l.price, l.size]),
-        asks: noSnap.asks.map(l => [l.price, l.size]),
-        sequenceId: noSnap.sequenceId,
+        bids: snapshot.bids.map(l => [l.price, l.size]),
+        asks: snapshot.asks.map(l => [l.price, l.size]),
+        sequenceId: snapshot.sequenceId,
       },
     }));
   } catch (err) {

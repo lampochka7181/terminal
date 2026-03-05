@@ -79,7 +79,7 @@ export default function OnboardingOverlay({ onStart }: Props) {
         }}>
           Predict outcomes within timeframes.
           <br />
-          0TDE Binary Options.
+          0DTE Binary Options.
         </p>
 
         {/* Code input */}

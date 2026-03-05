@@ -224,17 +224,22 @@ export default function LiteChart() {
       // ── Expose coordinate mapper for TradeBubbles ──
       const yr = yRangeRef.current;
       const chartH = H - LL_PAD.top - LL_PAD.bottom;
+      const contentW = futureZoneRight - LL_PAD.left;
       chartCoordsRef.current = {
+        contentArea: { width: contentW > 0 ? contentW : W, height: chartH > 0 ? chartH : H },
         timeToX: (timeSec: number) => {
           const x = toX(timeSec);
-          if (x < LL_PAD.left - 50 || x > futureZoneRight + 50) return null;
+          if (x < LL_PAD.left - 20 || x > futureZoneRight + 20) return null;
           return x;
         },
         priceToY: (price: number) => {
           if (!yr || chartH <= 0) return null;
           const range = yr.max - yr.min;
           if (range <= 0) return null;
-          return LL_PAD.top + (1 - (price - yr.min) / range) * chartH;
+          const y = LL_PAD.top + (1 - (price - yr.min) / range) * chartH;
+          // Bounds check: hide if price scrolled out of view
+          if (y < LL_PAD.top - 20 || y > LL_PAD.top + chartH + 20) return null;
+          return y;
         },
       };
       // Notify TradeBubbles in same frame — zero lag

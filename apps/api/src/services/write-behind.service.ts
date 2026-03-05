@@ -42,6 +42,7 @@ export interface PendingOrder {
   status: string;
   filledSize: string;
   remainingSize: string;
+  dollarAmount?: string;  // Original USD amount for dollar-based market orders
   leverage: string;
   marginAmount: string | null;
 }
@@ -221,6 +222,7 @@ class WriteBehindService {
       status: o.status,
       filledSize: o.filledSize,
       remainingSize: o.remainingSize,
+      dollarAmount: o.dollarAmount || null,
       leverage: o.leverage,
       marginAmount: o.marginAmount,
     }));

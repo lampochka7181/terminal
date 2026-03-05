@@ -9,6 +9,7 @@ import { useWallet, useConnection } from '@solana/wallet-adapter-react';
 import { PublicKey, Transaction } from '@solana/web3.js';
 import {
   createApproveInstruction,
+  createAssociatedTokenAccountInstruction,
   getAccount,
   TokenAccountNotFoundError,
 } from '@solana/spl-token';
@@ -111,6 +112,15 @@ export function useDelegation(): UseDelegationReturn {
     }
   }, [connected, publicKey, relayerAddress, checkApproval]);
 
+  // Clear delegation state when wallet disconnects
+  useEffect(() => {
+    if (!connected) {
+      setIsApproved(false);
+      setDelegatedAmount(0);
+      setError(null);
+    }
+  }, [connected]);
+
   // Approve relayer to spend USDC
   const approve = useCallback(async (amount: number = DEFAULT_DELEGATION_AMOUNT): Promise<boolean> => {
     if (!publicKey || !signTransaction || !relayerAddress) {
@@ -125,6 +135,38 @@ export function useDelegation(): UseDelegationReturn {
       const userUsdcAta = getUserUsdcAta(publicKey);
       const relayerPubkey = new PublicKey(relayerAddress);
 
+      // Verify ATA exists before building approve instruction
+      // If the user has never received USDC, the ATA won't exist on-chain
+      // and the Approve instruction would fail with "invalid account data"
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+      const transaction = new Transaction({
+        recentBlockhash: blockhash,
+        feePayer: publicKey,
+      });
+
+      try {
+        const tokenAccount = await getAccount(connection, userUsdcAta);
+        const balance = Number(tokenAccount.amount);
+        if (balance === 0) {
+          setError('You have no USDC in your wallet. Please deposit USDC first.');
+          return false;
+        }
+        if (balance < amount) {
+          const balanceUsd = (balance / 1_000_000).toFixed(2);
+          const requestedUsd = (amount / 1_000_000).toFixed(2);
+          setError(`Not enough USDC. You have $${balanceUsd} but tried to delegate $${requestedUsd}.`);
+          return false;
+        }
+      } catch (err) {
+        if (err instanceof TokenAccountNotFoundError) {
+          // No USDC token account = user has never held USDC
+          setError('You have no USDC in your wallet. Please deposit USDC first.');
+          return false;
+        } else {
+          throw err;
+        }
+      }
+
       // Create approve instruction
       const approveIx = createApproveInstruction(
         userUsdcAta,          // Token account
@@ -133,12 +175,7 @@ export function useDelegation(): UseDelegationReturn {
         BigInt(amount),       // Amount
       );
 
-      // Build transaction
-      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
-      const transaction = new Transaction({
-        recentBlockhash: blockhash,
-        feePayer: publicKey,
-      }).add(approveIx);
+      transaction.add(approveIx);
 
       // Sign and send
       const signedTx = await signTransaction(transaction);
@@ -159,17 +196,22 @@ export function useDelegation(): UseDelegationReturn {
       return true;
     } catch (err) {
       console.error('[Delegation] Failed to approve:', err);
-      
+
       if (err instanceof Error) {
-        if (err.message.includes('User rejected')) {
+        const msg = err.message.toLowerCase();
+        if (msg.includes('user rejected') || msg.includes('rejected')) {
           setError('Transaction rejected');
+        } else if (msg.includes('simulation failed') || msg.includes('insufficient') || msg.includes('0x1')) {
+          setError('Not enough USDC in your wallet. Please deposit USDC first.');
+        } else if (msg.includes('insufficient lamports') || msg.includes('not enough sol')) {
+          setError('Not enough SOL for transaction fees.');
         } else {
           setError(err.message);
         }
       } else {
         setError('Failed to approve delegation');
       }
-      
+
       return false;
     } finally {
       setIsApproving(false);

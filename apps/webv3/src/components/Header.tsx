@@ -178,7 +178,7 @@ export default function Header({ onHowItWorks }: HeaderProps) {
                     onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
                   >
                     <LogOut size={15} />
-                    Disconnect
+                    Log Out
                   </div>
                 </div>
               )}

@@ -109,6 +109,9 @@ export const orders = pgTable('orders', {
   binaryMessage: text('binary_message'), // For signature verification (base64 encoded)
   isMmOrder: boolean('is_mm_order').default(false).notNull(), // True for Market Maker bot orders
   isAgentOrder: boolean('is_agent_order').default(false).notNull(), // True for AI agent orders
+  // Dollar-based market orders: original USD amount requested (e.g., $25)
+  // NULL for limit orders (they use size * price instead)
+  dollarAmount: numeric('dollar_amount', { precision: 20, scale: 6 }),
   // Leverage fields (for displaying leverage info before margin account exists)
   leverage: numeric('leverage', { precision: 4, scale: 2 }).default('1'),
   marginAmount: numeric('margin_amount', { precision: 20, scale: 6 }),
@@ -147,6 +150,7 @@ export const trades = pgTable('trades', {
   size: numeric('size', { precision: 20, scale: 6 }).notNull(), // Number of contracts
   txSignature: varchar('tx_signature', { length: 88 }),
   txStatus: txStatusEnum('tx_status').default('PENDING'),
+  errorCode: varchar('error_code', { length: 50 }),
   executedAt: timestamp('executed_at').defaultNow(),
   confirmedAt: timestamp('confirmed_at'),
   

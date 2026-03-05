@@ -386,29 +386,33 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
         const clipW = overlayClipRef.current?.clientWidth ?? 0;
         const clipH = overlayClipRef.current?.clientHeight ?? 0;
         chartCoordsRef.current = {
+          contentArea: { width: clipW, height: clipH },
           timeToX: (timeSec: number) => {
             const x = chart.timeScale().timeToCoordinate(timeSec as any);
-            if (x !== null) return x;
+            if (x !== null) {
+              // Bounds check: hide if coordinate is outside content area
+              if (x < -20 || x > clipW + 20) return null;
+              return x;
+            }
             const vr = chart.timeScale().getVisibleRange();
             if (!vr || clipW <= 0) return null;
             const from = vr.from as number;
             const to = vr.to as number;
             if (to <= from) return null;
             const frac = (timeSec - from) / (to - from);
-            if (frac < -0.05 || frac > 1.05) return null;
+            if (frac < -0.02 || frac > 1.02) return null;
             return frac * clipW;
           },
           priceToY: (price: number) => {
             const s = seriesRef.current;
             if (!s) return null;
             const y = (s as any).priceToCoordinate(price);
-            if (y !== null) return y;
-            const vpr = (s as any).priceScale?.()?.getVisiblePriceRange?.();
-            if (!vpr || clipH <= 0) return null;
-            const pMin = vpr.minValue as number;
-            const pMax = vpr.maxValue as number;
-            if (pMax <= pMin) return null;
-            return clipH * (1 - (price - pMin) / (pMax - pMin));
+            if (y === null) return null;
+            // Bounds check: priceToCoordinate can return values outside
+            // 0..clipH when the anchor price is scrolled out of visible range.
+            // Hide bubble instead of letting it drift into axis areas.
+            if (y < -20 || y > clipH + 20) return null;
+            return y;
           },
         };
         // Notify TradeBubbles in same frame — zero lag

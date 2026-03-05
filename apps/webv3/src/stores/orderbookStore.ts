@@ -201,9 +201,12 @@ export const useOrderbookStore = create<OrderbookState>()(
       const state = get();
       
       // SINGLE ORDERBOOK MODEL: Only YES updates are real
-      // NO updates are ignored - NO is derived from YES
+      // NO updates should not arrive anymore (backend sends composite YES view)
+      // If they do, log a warning and ignore — NO is derived from YES
       if (outcome === 'NO') {
-        // Ignore NO updates - we derive NO from YES
+        if (bidsData.length > 0 || asksData.length > 0) {
+          console.warn('[orderbookStore] Received unexpected NO update with data — backend should send composite YES view');
+        }
         return;
       }
       

@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { ChevronDown } from 'lucide-react';
 import Header from './components/Header';
 import ChartToolbar from './components/ChartToolbar';
@@ -16,13 +16,47 @@ import { usePrices } from '@/hooks/usePrices';
 import { useLiquidationNotifications } from '@/hooks/useLiquidationNotifications';
 import { useSelectedMarket, useMarketStore } from '@/stores/marketStore';
 import { usePriceStore } from '@/stores/priceStore';
+import { useAuthStore } from '@/stores/authStore';
 import './App.css';
 
+function isWalletOnboarded(wallet: string | null): boolean {
+  if (!wallet) return false;
+  try {
+    const list: string[] = JSON.parse(localStorage.getItem('degen-onboarded-wallets') || '[]');
+    return list.includes(wallet);
+  } catch { return false; }
+}
+
+function markWalletOnboarded(wallet: string | null): void {
+  if (!wallet) return;
+  try {
+    const list: string[] = JSON.parse(localStorage.getItem('degen-onboarded-wallets') || '[]');
+    if (!list.includes(wallet)) {
+      list.push(wallet);
+      localStorage.setItem('degen-onboarded-wallets', JSON.stringify(list));
+    }
+  } catch {
+    localStorage.setItem('degen-onboarded-wallets', JSON.stringify([wallet]));
+  }
+}
+
 export default function App() {
-  const [showOnboarding, setShowOnboarding] = useState(true);
+  const walletAddress = useAuthStore((s) => s.walletAddress);
+  const [showOnboarding, setShowOnboarding] = useState(() => !isWalletOnboarded(walletAddress));
   const [showHowItWorks, setShowHowItWorks] = useState(false);
   const [viewMode, setViewMode] = useState<'pro' | 'lite'>('lite');
   const [liqPrompt, setLiqPrompt] = useState({ open: false, title: '', message: '', type: 'warning' as const });
+
+  // Re-evaluate onboarding when wallet changes (connect, disconnect, switch)
+  useEffect(() => {
+    if (walletAddress) {
+      // Known wallet → skip onboarding, new wallet → show it
+      setShowOnboarding(!isWalletOnboarded(walletAddress));
+    } else {
+      // No wallet connected → show onboarding
+      setShowOnboarding(true);
+    }
+  }, [walletAddress]);
 
   useLiquidationNotifications({
     onLiquidation: useCallback((n: any) => {
@@ -86,7 +120,7 @@ export default function App() {
                     padding: '6px 15px', borderRadius: 8, fontSize: 20, fontWeight: 700,
                     letterSpacing: '0.02em', background: '#001eff', color: '#eee',
                   }}>
-                    0TDE
+                    0DTE
                   </span>
 
                   <span style={{
@@ -153,7 +187,10 @@ export default function App() {
       </div>
 
       {showOnboarding && (
-        <OnboardingOverlay onStart={() => setShowOnboarding(false)} />
+        <OnboardingOverlay onStart={() => {
+          markWalletOnboarded(walletAddress);
+          setShowOnboarding(false);
+        }} />
       )}
 
       {showHowItWorks && (

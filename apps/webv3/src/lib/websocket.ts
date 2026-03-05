@@ -194,6 +194,7 @@ export class WebSocketService {
   private errorHandlers: Set<ErrorHandler> = new Set();
   private subscriptions: Map<string, WSMessage> = new Map();
   private isAuthenticated = false;
+  private lastAuthToken: string | null = null;
   private lastSequenceIds: Map<string, number> = new Map();
 
   constructor(url: string = WS_URL) {
@@ -262,6 +263,7 @@ export class WebSocketService {
           console.log('[WS] Disconnected', event.code, event.reason);
           this.stopPingInterval();
           this.isAuthenticated = false;
+          this.lastAuthToken = null; // Force re-auth on reconnect
           this.disconnectHandlers.forEach((handler) => handler());
 
           // Auto-reconnect unless intentionally closed
@@ -299,6 +301,7 @@ export class WebSocketService {
     this.subscriptions.clear();
     this.lastSequenceIds.clear();
     this.isAuthenticated = false;
+    this.lastAuthToken = null;
   }
 
   private startPingInterval(): void {
@@ -353,7 +356,14 @@ export class WebSocketService {
 
     // Handle auth response
     if (message.op === 'auth') {
+      const wasAuthenticated = this.isAuthenticated;
       this.isAuthenticated = message.status === 'authenticated';
+      if (this.isAuthenticated) {
+        console.log(`[WS] Authenticated${wasAuthenticated ? ' (re-auth)' : ''} — wallet: ${(message as any).wallet || 'unknown'}`);
+      } else {
+        console.warn('[WS] Authentication failed:', (message as any).error?.message || message.status);
+        this.lastAuthToken = null; // Allow retry with same token
+      }
       return;
     }
 
@@ -481,10 +491,16 @@ export class WebSocketService {
 
   // Public API
   authenticate(token: string): void {
-    // Skip if already authenticated to avoid duplicate auth messages
-    if (this.isAuthenticated) {
+    // Skip only if already authenticated with the SAME token.
+    // A new token (e.g., after re-login or token refresh) must always
+    // be sent so the server re-indexes the WS under the new userId.
+    if (this.isAuthenticated && this.lastAuthToken === token) {
       return;
     }
+    if (this.lastAuthToken && this.lastAuthToken !== token) {
+      console.log('[WS] Re-authenticating with new token (userId may have changed)');
+    }
+    this.lastAuthToken = token;
     this.send({ op: 'auth', token });
   }
 

@@ -37,6 +37,9 @@ export interface OrderResponse {
   fills?: number;
   filledSize?: number;
   avgPrice?: number;
+  totalSpent?: number;       // Actual collateral spent (for dollar-based market orders)
+  dollarAmount?: number;     // Original USD amount requested
+  unfilledDollars?: number;  // Remaining unfilled USD amount
   leverage?: number;
   marginAccountId?: string;
   // Position data for immediate frontend update (included in response to avoid refetch)
@@ -103,6 +106,7 @@ export interface Order {
   filledSize: number;
   remainingSize: number;
   status: 'open' | 'partial' | 'filled' | 'cancelled';
+  dollarAmount?: number;   // Original USD amount for dollar-based market orders
   createdAt: number;
   updatedAt?: number;
   // Leverage fields (available before margin account exists, for pending orders)
@@ -143,6 +147,7 @@ export interface UserTransaction {
   loanRepaid?: number; // For liquidations
   txSignature: string;
   txStatus?: string; // 'PENDING' | 'CONFIRMED' | 'FAILED'
+  errorCode?: string; // e.g. 'INSUFFICIENT_FUNDS', 'MARKET_CLOSED'
   timestamp: number;
 }
 

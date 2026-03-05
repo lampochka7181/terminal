@@ -123,6 +123,7 @@ export interface DollarMarketOrder {
 
 export interface DollarMatchResult {
   orderId: string;
+  restingOrderId?: string;  // ID of resting limit order for unfilled portion
   fills: Fill[];
   totalSpent: number;
   totalContracts: number;
@@ -405,92 +406,161 @@ export class MatchingService {
       (isNoOrder ? ` [matching YES ${matchSide}s]` : '')
     );
     
-    while (remainingSize > 0) {
-      // Get best opposing order from YES orderbook
-      const bestOrder = matchSide === 'ASK'
-        ? await orderbookService.getBestAsk(takerOrder.marketId, effectiveOutcome)
-        : await orderbookService.getBestBid(takerOrder.marketId, effectiveOutcome);
-      
-      if (!bestOrder) {
-        logger.debug('No opposing orders in book');
-        break;
+    if (config.useBatchMatching) {
+      // ═══════════════════════════════════════════════════════════════════════
+      // BATCH-FETCH PATH: 2 Redis RTTs total (getTopN + batchConsume)
+      // ═══════════════════════════════════════════════════════════════════════
+      const BATCH_SIZE = 64;
+      let selfTradeError = false;
+
+      while (remainingSize > 0) {
+        const topOrders = await orderbookService.getTopN(takerOrder.marketId, effectiveOutcome, matchSide, BATCH_SIZE);
+        if (topOrders.length === 0) {
+          logger.debug('No opposing orders in book');
+          break;
+        }
+
+        const batchFills: Fill[] = [];
+        const consumptions: Array<{ order: OrderbookOrder; newRemainingSize: number }> = [];
+        let priceStopped = false;
+
+        for (const bestOrder of topOrders) {
+          if (remainingSize <= 0) break;
+
+          const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
+
+          // Check if prices cross (sorted, so once it stops crossing, all remaining won't either)
+          const pricesCross = takerOrder.side === 'BID'
+            ? effectivePrice >= userEffectivePrice
+            : effectivePrice <= userEffectivePrice;
+
+          if (!pricesCross) {
+            logger.debug(`Prices don't cross: taker ${effectivePrice} vs maker ${userEffectivePrice}`);
+            priceStopped = true;
+            break;
+          }
+
+          // Self-trade prevention — return error (limit order behavior)
+          if (bestOrder.userId === takerOrder.userId) {
+            logger.debug(`Self-trade prevented for user ${takerOrder.userId}`);
+            selfTradeError = true;
+            priceStopped = true;
+            break;
+          }
+
+          const fillSize = Math.min(remainingSize, bestOrder.remainingSize);
+          const fillPrice = userEffectivePrice;
+          const notional = fillPrice * fillSize;
+          const { makerFee, takerFee } = calculateFillFees(notional);
+
+          batchFills.push({
+            makerOrderId: bestOrder.id,
+            takerOrderId: takerOrder.id,
+            makerUserId: bestOrder.userId, takerUserId: takerOrder.userId,
+            price: fillPrice, size: fillSize, outcome: takerOrder.outcome,
+            makerFee, takerFee,
+            makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side,
+            takerSide: takerOrder.side,
+            makerClientOrderId: bestOrder.clientOrderId || Date.now(),
+            takerClientOrderId: takerOrder.clientOrderId || Date.now(),
+            makerOrderPda: (bestOrder as any).orderPda,
+            takerOrderPda: (takerOrder as any).orderPda,
+            makerSignature: bestOrder.signature,
+            takerSignature: takerOrder.signature,
+            makerMessage: bestOrder.binaryMessage,
+            takerMessage: takerOrder.binaryMessage,
+            leverage: takerOrder.leverage, marginAmount: takerOrder.marginAmount, loanAmount: takerOrder.loanAmount,
+          });
+
+          const newMakerRemaining = bestOrder.remainingSize - fillSize;
+          consumptions.push({ order: bestOrder, newRemainingSize: Math.max(0, newMakerRemaining) });
+          remainingSize -= fillSize;
+        }
+
+        // Batch-consume all matched orders
+        if (consumptions.length > 0) {
+          const { consumed } = await orderbookService.batchConsume(
+            takerOrder.marketId, effectiveOutcome, matchSide, consumptions,
+          );
+
+          for (let i = consumed.length - 1; i >= 0; i--) {
+            if (!consumed[i]) {
+              remainingSize += batchFills[i].size;
+              batchFills.splice(i, 1);
+              logger.debug(`[BATCH] Limit fill lost to race: order ${consumptions[i].order.id.slice(0, 8)}`);
+            }
+          }
+
+          fills.push(...batchFills);
+        }
+
+        // Stop if price didn't cross, self-trade, or book exhausted
+        if (priceStopped || topOrders.length < BATCH_SIZE) break;
       }
-      
-      // SINGLE ORDERBOOK MODEL: Calculate user's effective price
-      // For NO orders, the user's price is the complement of the YES order price
-      const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
-      
-      // Check if prices cross using user's effective price
-      // For market orders, use extreme price (0.99 for BID, 0.01 for ASK) to guarantee crossing
-      const pricesCross = takerOrder.side === 'BID'
-        ? effectivePrice >= userEffectivePrice  // Buyer willing to pay >= seller asking
-        : effectivePrice <= userEffectivePrice; // Seller willing to accept <= buyer bidding
-      
-      if (!pricesCross) {
-        logger.debug(`Prices don't cross: taker ${effectivePrice} vs maker ${userEffectivePrice}`);
-        break;
+
+      if (selfTradeError) {
+        return { matched: fills.length > 0, fills, remainingSize, error: 'SELF_TRADE_PREVENTED' };
       }
-      
-      // Self-trade prevention
-      if (bestOrder.userId === takerOrder.userId) {
-        logger.debug(`Self-trade prevented for user ${takerOrder.userId}`);
-        return {
-          matched: fills.length > 0,
-          fills,
-          remainingSize,
-          error: 'SELF_TRADE_PREVENTED',
-        };
+    } else {
+      // ═══════════════════════════════════════════════════════════════════════
+      // PER-FILL PATH (legacy): USE_BATCH_MATCHING=false
+      // ═══════════════════════════════════════════════════════════════════════
+      while (remainingSize > 0) {
+        const bestOrder = matchSide === 'ASK'
+          ? await orderbookService.getBestAsk(takerOrder.marketId, effectiveOutcome)
+          : await orderbookService.getBestBid(takerOrder.marketId, effectiveOutcome);
+
+        if (!bestOrder) {
+          logger.debug('No opposing orders in book');
+          break;
+        }
+
+        const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
+
+        const pricesCross = takerOrder.side === 'BID'
+          ? effectivePrice >= userEffectivePrice
+          : effectivePrice <= userEffectivePrice;
+
+        if (!pricesCross) {
+          logger.debug(`Prices don't cross: taker ${effectivePrice} vs maker ${userEffectivePrice}`);
+          break;
+        }
+
+        if (bestOrder.userId === takerOrder.userId) {
+          logger.debug(`Self-trade prevented for user ${takerOrder.userId}`);
+          return { matched: fills.length > 0, fills, remainingSize, error: 'SELF_TRADE_PREVENTED' };
+        }
+
+        const fillSize = Math.min(remainingSize, bestOrder.remainingSize);
+        const fillPrice = userEffectivePrice;
+        const notional = fillPrice * fillSize;
+        const { makerFee, takerFee } = calculateFillFees(notional);
+
+        fills.push({
+          makerOrderId: bestOrder.id,
+          takerOrderId: takerOrder.id,
+          makerUserId: bestOrder.userId, takerUserId: takerOrder.userId,
+          price: fillPrice, size: fillSize, outcome: takerOrder.outcome,
+          makerFee, takerFee,
+          makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side,
+          takerSide: takerOrder.side,
+          makerClientOrderId: bestOrder.clientOrderId || Date.now(),
+          takerClientOrderId: takerOrder.clientOrderId || Date.now(),
+          makerOrderPda: (bestOrder as any).orderPda,
+          takerOrderPda: (takerOrder as any).orderPda,
+          makerSignature: bestOrder.signature,
+          takerSignature: takerOrder.signature,
+          makerMessage: bestOrder.binaryMessage,
+          takerMessage: takerOrder.binaryMessage,
+          leverage: takerOrder.leverage, marginAmount: takerOrder.marginAmount, loanAmount: takerOrder.loanAmount,
+        });
+
+        const newMakerRemaining = bestOrder.remainingSize - fillSize;
+        await orderbookService.consumeOrder(bestOrder, Math.max(0, newMakerRemaining));
+        remainingSize -= fillSize;
+
+        logger.debug(`Fill: ${fillSize} @ ${fillPrice} (maker: ${bestOrder.id}, taker: ${takerOrder.id})`);
       }
-      
-      // Calculate fill size (minimum of both remaining sizes)
-      const fillSize = Math.min(remainingSize, bestOrder.remainingSize);
-      
-      // Execute at user's effective price
-      const fillPrice = userEffectivePrice;
-      
-      // Calculate fees based on user's cost (tiered fee structure)
-      const notional = fillPrice * fillSize;
-      const { makerFee, takerFee } = calculateFillFees(notional);
-      
-      // Create fill record with order PDAs for on-chain verification
-      const fill: Fill = {
-        makerOrderId: bestOrder.id,
-        takerOrderId: takerOrder.id,
-        makerUserId: bestOrder.userId,
-        takerUserId: takerOrder.userId,
-        price: fillPrice,  // User's effective price
-        size: fillSize,
-        outcome: takerOrder.outcome,  // User's original outcome
-        makerFee,
-        takerFee,
-        makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side,
-        takerSide: takerOrder.side,
-        makerClientOrderId: bestOrder.clientOrderId || Date.now(),
-        takerClientOrderId: takerOrder.clientOrderId || Date.now(),
-        // On-chain Order PDAs (if user orders)
-        makerOrderPda: (bestOrder as any).orderPda,
-        takerOrderPda: (takerOrder as any).orderPda,
-        // Legacy: signatures for MM orders
-        makerSignature: bestOrder.signature,
-        takerSignature: takerOrder.signature,
-        makerMessage: bestOrder.binaryMessage,
-        takerMessage: takerOrder.binaryMessage,
-        // Leverage fields (for on-chain execution routing)
-        leverage: takerOrder.leverage,
-        marginAmount: takerOrder.marginAmount,
-        loanAmount: takerOrder.loanAmount,
-      };
-      
-      fills.push(fill);
-      
-      // Update maker order in orderbook (atomic: 1 Redis round-trip via Lua)
-      const newMakerRemaining = bestOrder.remainingSize - fillSize;
-      await orderbookService.consumeOrder(bestOrder, Math.max(0, newMakerRemaining));
-      
-      // Update remaining taker size
-      remainingSize -= fillSize;
-      
-      logger.debug(`Fill: ${fillSize} @ ${fillPrice} (maker: ${bestOrder.id}, taker: ${takerOrder.id})`);
     }
     
     return {
@@ -538,17 +608,17 @@ export class MatchingService {
     };
 
     // CONTINUOUS MATCHING CONFIG
-    // Retry delays were reduced from 100ms→20ms after profiling showed empty-book
-    // retries were the dominant contributor to matching latency (~1-2s per order).
+    // With batch-fetch (getTopN), most fills happen in-memory without per-fill RTTs,
+    // so retries are only needed when the book is truly empty (taker > all available depth).
     const isPerfMode = config.perfTestMode;
-    const MAX_RETRIES = isPerfMode ? 3 : 10;            // Reduced from 5/20
-    const RETRY_DELAY_MS = isPerfMode ? 10 : 20;        // Reduced from 50/100ms
-    const MAX_MATCHING_TIME_MS = isPerfMode ? 200 : 3000; // Reduced from 500/5000ms
+    const MAX_RETRIES = isPerfMode ? 2 : 3;              // Reduced: batch-fetch grabs full depth at once
+    const RETRY_DELAY_MS = isPerfMode ? 5 : 5;           // Reduced: 5ms × 3 = 15ms max wait
+    const MAX_MATCHING_TIME_MS = isPerfMode ? 200 : 1000; // Reduced: prevent pathological event loop blocking
     const startTime = Date.now();
     let emptyBookRetries = 0;
-    
+
     // SINGLE ORDERBOOK MODEL: Transform NO orders to match against YES orderbook
-    // 
+    //
     // NO price derivation from YES:
     // - NO ASK (what user pays to buy NO) = 1 - YES BID
     // - NO BID (what user receives to sell NO) = 1 - YES ASK
@@ -569,233 +639,333 @@ export class MatchingService {
       matchSide = order.side === 'BID' ? 'ASK' : 'BID';  // Opposite for YES
     }
     
-    while (remainingDollars > 0) {
-      perf.iterations++;
-      // Check timeout
-      if (Date.now() - startTime > MAX_MATCHING_TIME_MS) {
-        if (perfEnabled) {
-          // For BID NO, we match against YES:BID. For other cases, the key still provides useful context.
-          const { RedisKeys } = await import('../db/redis.js');
-          const key = RedisKeys.orderbook(order.marketId, effectiveOutcome, matchSide);
-          perf.zcardAtTimeout = await this.safeZcard(key);
+    // Minimum fill threshold: 0.01 contracts (1 cent payout worth)
+    const MIN_FILL_SIZE = 0.01;
+
+    if (config.useBatchMatching) {
+      // ═══════════════════════════════════════════════════════════════════════
+      // BATCH-FETCH PATH: 2-4 Redis RTTs total instead of 2 per fill (~1600ms saved)
+      // Fetches top 64 orders in 1 RTT → matches in-memory → consumes all in 1 RTT
+      // ═══════════════════════════════════════════════════════════════════════
+      const BATCH_SIZE = 64;
+
+      while (remainingDollars > 0) {
+        perf.iterations++;
+        if (Date.now() - startTime > MAX_MATCHING_TIME_MS) {
+          if (perfEnabled) {
+            const { RedisKeys } = await import('../db/redis.js');
+            const key = RedisKeys.orderbook(order.marketId, effectiveOutcome, matchSide);
+            perf.zcardAtTimeout = await this.safeZcard(key);
+          }
+          logger.warn(`Matching timeout after ${MAX_MATCHING_TIME_MS}ms, remaining $${remainingDollars.toFixed(2)}`);
+          break;
         }
-        logger.warn(`Matching timeout after ${MAX_MATCHING_TIME_MS}ms, remaining $${remainingDollars.toFixed(2)}`);
-        if (perfEnabled) {
-          logger.warn(
-            {
-              marketId: order.marketId,
-              side: order.side,
-              outcome: order.outcome,
-              matchSide,
-              elapsedMs: Date.now() - startTime,
-              fills: fills.length,
-              remainingDollars,
-              perf,
-            },
-            '[MATCH PERF] Timeout'
-          );
-        }
-        break;
-      }
-      
-      // Get best opposing order from YES orderbook
-      const tBest = Date.now();
-      const bestOrder = matchSide === 'ASK'
-        ? await orderbookService.getBestAsk(order.marketId, effectiveOutcome)
-        : await orderbookService.getBestBid(order.marketId, effectiveOutcome);
-      perf.getBestMs += Date.now() - tBest;
-      
-      if (!bestOrder) {
-        // CONTINUOUS MATCHING: Wait and retry for MM to replenish orderbook
-        if (emptyBookRetries < MAX_RETRIES) {
-          emptyBookRetries++;
-          perf.emptyRetries = emptyBookRetries;
-          logger.debug(`Orderbook empty, retry ${emptyBookRetries}/${MAX_RETRIES} in ${RETRY_DELAY_MS}ms...`);
-          const tSleep = Date.now();
-          await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
-          perf.sleepMs += Date.now() - tSleep;
-          continue; // Retry the loop
-        }
-        
-        // Exhausted retries - use DEV synthetic fill if enabled
-        if (config.devAlwaysFillMarketOrders) {
-          const mmUserId = getMMUserId();
-          if (!mmUserId) {
-            logger.warn('DEV_ALWAYS_FILL_MARKET_ORDERS enabled but MM user is not initialized');
+
+        // 1 RTT: fetch top N orders from the book
+        const tBest = Date.now();
+        const topOrders = await orderbookService.getTopN(order.marketId, effectiveOutcome, matchSide, BATCH_SIZE);
+        perf.getBestMs += Date.now() - tBest;
+
+        if (topOrders.length === 0) {
+          // Early partial-fill exit: book exhausted, execute what we have immediately
+          if (fills.length > 0) {
+            logger.info(`Book exhausted with ${fills.length} fills, cancelling remainder — executing partial fill`);
             break;
           }
 
-          // Use current market prices as a sane fill price (defaults to 0.50).
-          const market = await marketService.getById(order.marketId);
-          const yesPx = market?.yesPrice ? parseFloat(market.yesPrice) : 0.5;
-          const noPx = market?.noPrice ? parseFloat(market.noPrice) : 0.5;
-          const basePrice = order.outcome === 'YES' ? yesPx : noPx;
-          const price = Math.min(0.99, Math.max(0.01, basePrice || 0.5));
+          // CONTINUOUS MATCHING: Wait and retry for MM to replenish orderbook
+          if (emptyBookRetries < MAX_RETRIES) {
+            emptyBookRetries++;
+            perf.emptyRetries = emptyBookRetries;
+            logger.debug(`Orderbook empty, retry ${emptyBookRetries}/${MAX_RETRIES} in ${RETRY_DELAY_MS}ms...`);
+            const tSleep = Date.now();
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+            perf.sleepMs += Date.now() - tSleep;
+            continue;
+          }
 
-          const fillSize = remainingDollars / price;
-          const fillCost = fillSize * price;
+          // Exhausted retries - use DEV synthetic fill if enabled
+          if (config.devAlwaysFillMarketOrders) {
+            const mmUserId = getMMUserId();
+            if (mmUserId) {
+              const market = await marketService.getById(order.marketId);
+              const yesPx = market?.yesPrice ? parseFloat(market.yesPrice) : 0.5;
+              const noPx = market?.noPrice ? parseFloat(market.noPrice) : 0.5;
+              const basePrice = order.outcome === 'YES' ? yesPx : noPx;
+              const price = Math.min(0.99, Math.max(0.01, basePrice || 0.5));
+              const fillSize = remainingDollars / price;
+              const fillCost = fillSize * price;
+              const { makerFee } = calculateFillFees(fillCost);
+
+              fills.push({
+                makerOrderId: `mm_synth_${Date.now()}`,
+                takerOrderId: 'pending',
+                makerUserId: mmUserId,
+                takerUserId: order.userId,
+                price, size: fillSize, outcome: order.outcome,
+                makerFee, takerFee: 0,
+                makerSide: matchSide, takerSide: order.side,
+                makerClientOrderId: Date.now(),
+                takerClientOrderId: order.clientOrderId || Date.now(),
+                leverage: order.leverage, marginAmount: order.marginAmount, loanAmount: order.loanAmount,
+              });
+              totalContracts += fillSize;
+              totalSpent += fillCost;
+              remainingDollars -= fillCost;
+              logger.info(`DEV fill: synthetic MM liquidity ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for ${order.side} ${order.outcome}`);
+            }
+          }
+
+          logger.info(`Orderbook exhausted after ${emptyBookRetries} retries, remaining $${remainingDollars.toFixed(2)}`);
+          break;
+        }
+
+        // Reset retry counter when we find orders
+        emptyBookRetries = 0;
+
+        // In-memory matching: 0 RTTs
+        const batchFills: Fill[] = [];
+        const consumptions: Array<{ order: OrderbookOrder; newRemainingSize: number }> = [];
+        let batchBudgetExhausted = false;
+
+        for (const bestOrder of topOrders) {
+          if (remainingDollars <= 0) { batchBudgetExhausted = true; break; }
+
+          // Self-trade prevention — skip this order (don't stop matching, more depth may exist)
+          if (bestOrder.userId === order.userId) continue;
+
+          const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
+          const maxContractsAtPrice = remainingDollars / userEffectivePrice;
+
+          if (maxContractsAtPrice < MIN_FILL_SIZE) { batchBudgetExhausted = true; break; }
+
+          const fillSize = Math.min(maxContractsAtPrice, bestOrder.remainingSize);
+          const fillPrice = userEffectivePrice;
+          const fillCost = fillSize * fillPrice;
           const { makerFee } = calculateFillFees(fillCost);
 
-          const fill: Fill = {
-            makerOrderId: `mm_synth_${Date.now()}`,
+          batchFills.push({
+            makerOrderId: bestOrder.id,
             takerOrderId: 'pending',
-            makerUserId: mmUserId,
+            makerUserId: bestOrder.userId,
             takerUserId: order.userId,
-            price,
-            size: fillSize,
-            outcome: order.outcome,
-            makerFee,
-            takerFee: 0, // Placeholder — distributed proportionally after matching
-            makerSide: matchSide, // maker provides the opposing side
+            price: fillPrice, size: fillSize, outcome: order.outcome,
+            makerFee, takerFee: 0,
+            makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side,
             takerSide: order.side,
-            makerClientOrderId: Date.now(),
+            makerClientOrderId: bestOrder.clientOrderId || Date.now(),
             takerClientOrderId: order.clientOrderId || Date.now(),
-            // Leverage fields
-            leverage: order.leverage,
-            marginAmount: order.marginAmount,
-            loanAmount: order.loanAmount,
-          };
+            makerOrderPda: (bestOrder as any).orderPda,
+            makerSignature: bestOrder.signature,
+            makerMessage: bestOrder.binaryMessage,
+            takerSignature: order.signature,
+            takerMessage: order.binaryMessage,
+            leverage: order.leverage, marginAmount: order.marginAmount, loanAmount: order.loanAmount,
+          });
 
-          fills.push(fill);
+          const newMakerRemaining = bestOrder.remainingSize - fillSize;
+          consumptions.push({ order: bestOrder, newRemainingSize: Math.max(0, newMakerRemaining) });
+
           totalContracts += fillSize;
           totalSpent += fillCost;
           remainingDollars -= fillCost;
-
-          logger.info(
-            `DEV fill: synthetic MM liquidity ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for ${order.side} ${order.outcome}` +
-            (order.leverage && order.leverage > 1 ? ` (${order.leverage}x leverage)` : '')
-          );
         }
-        
-        logger.info(`Orderbook exhausted after ${emptyBookRetries} retries, remaining $${remainingDollars.toFixed(2)}`);
-        break;
+
+        // 1 RTT: batch-consume all matched orders
+        if (consumptions.length > 0) {
+          const tConsume = Date.now();
+          const { consumed } = await orderbookService.batchConsume(
+            order.marketId, effectiveOutcome, matchSide, consumptions,
+          );
+          perf.updateOrderMs += Date.now() - tConsume;
+
+          // Filter out fills where another instance consumed the order first (race protection)
+          for (let i = consumed.length - 1; i >= 0; i--) {
+            if (!consumed[i]) {
+              const lostFill = batchFills[i];
+              totalContracts -= lostFill.size;
+              totalSpent -= lostFill.price * lostFill.size;
+              remainingDollars += lostFill.price * lostFill.size;
+              batchFills.splice(i, 1);
+              logger.debug(`[BATCH] Fill lost to race: order ${consumptions[i].order.id.slice(0, 8)}`);
+            }
+          }
+
+          fills.push(...batchFills);
+        }
+
+        logger.debug(
+          `[BATCH] ${batchFills.length} fills from ${topOrders.length} orders, ` +
+          `remaining $${remainingDollars.toFixed(4)}`
+        );
+
+        // If book returned fewer than BATCH_SIZE, no more depth exists — stop
+        if (topOrders.length < BATCH_SIZE || batchBudgetExhausted) break;
       }
-      
-      // Reset retry counter when we find an order
-      emptyBookRetries = 0;
-      
-      // Log each fill's price to show we're getting fresh best prices
-      logger.debug(`[MATCH] Best ${matchSide} found: $${bestOrder.price.toFixed(4)} (order ${bestOrder.id.slice(0,8)})`);
-      
-      // SINGLE ORDERBOOK MODEL: Calculate effective price for user
-      // For NO orders, the user's price is the complement of the YES order price
-      // YES BID @ $0.56 → User pays $0.44 for NO
-      const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
-      
-      // NO maxPrice check - market orders fill at any available price
-      // This enables continuous matching as MM replenishes at different prices
-      
-      // Self-trade prevention - if best order is yours, stop matching
-      if (bestOrder.userId === order.userId) {
-        logger.debug(`Self-trade prevented for user ${order.userId}`);
-        break;
+    } else {
+      // ═══════════════════════════════════════════════════════════════════════
+      // PER-FILL PATH (legacy): 2 Redis RTTs per fill — USE_BATCH_MATCHING=false to activate
+      // ═══════════════════════════════════════════════════════════════════════
+      while (remainingDollars > 0) {
+        perf.iterations++;
+        if (Date.now() - startTime > MAX_MATCHING_TIME_MS) {
+          if (perfEnabled) {
+            const { RedisKeys } = await import('../db/redis.js');
+            const key = RedisKeys.orderbook(order.marketId, effectiveOutcome, matchSide);
+            perf.zcardAtTimeout = await this.safeZcard(key);
+          }
+          logger.warn(`Matching timeout after ${MAX_MATCHING_TIME_MS}ms, remaining $${remainingDollars.toFixed(2)}`);
+          break;
+        }
+
+        const tBest = Date.now();
+        const bestOrder = matchSide === 'ASK'
+          ? await orderbookService.getBestAsk(order.marketId, effectiveOutcome)
+          : await orderbookService.getBestBid(order.marketId, effectiveOutcome);
+        perf.getBestMs += Date.now() - tBest;
+
+        if (!bestOrder) {
+          if (emptyBookRetries < MAX_RETRIES) {
+            emptyBookRetries++;
+            perf.emptyRetries = emptyBookRetries;
+            logger.debug(`Orderbook empty, retry ${emptyBookRetries}/${MAX_RETRIES} in ${RETRY_DELAY_MS}ms...`);
+            const tSleep = Date.now();
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+            perf.sleepMs += Date.now() - tSleep;
+            continue;
+          }
+
+          if (config.devAlwaysFillMarketOrders) {
+            const mmUserId = getMMUserId();
+            if (mmUserId) {
+              const market = await marketService.getById(order.marketId);
+              const yesPx = market?.yesPrice ? parseFloat(market.yesPrice) : 0.5;
+              const noPx = market?.noPrice ? parseFloat(market.noPrice) : 0.5;
+              const basePrice = order.outcome === 'YES' ? yesPx : noPx;
+              const price = Math.min(0.99, Math.max(0.01, basePrice || 0.5));
+              const fillSize = remainingDollars / price;
+              const fillCost = fillSize * price;
+              const { makerFee } = calculateFillFees(fillCost);
+
+              fills.push({
+                makerOrderId: `mm_synth_${Date.now()}`,
+                takerOrderId: 'pending',
+                makerUserId: mmUserId,
+                takerUserId: order.userId,
+                price, size: fillSize, outcome: order.outcome,
+                makerFee, takerFee: 0,
+                makerSide: matchSide, takerSide: order.side,
+                makerClientOrderId: Date.now(),
+                takerClientOrderId: order.clientOrderId || Date.now(),
+                leverage: order.leverage, marginAmount: order.marginAmount, loanAmount: order.loanAmount,
+              });
+              totalContracts += fillSize;
+              totalSpent += fillCost;
+              remainingDollars -= fillCost;
+              logger.info(`DEV fill: synthetic MM liquidity ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for ${order.side} ${order.outcome}`);
+            }
+          }
+
+          logger.info(`Orderbook exhausted after ${emptyBookRetries} retries, remaining $${remainingDollars.toFixed(2)}`);
+          break;
+        }
+
+        emptyBookRetries = 0;
+
+        const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
+
+        if (bestOrder.userId === order.userId) {
+          logger.debug(`Self-trade prevented for user ${order.userId}`);
+          break;
+        }
+
+        const maxContractsAtPrice = remainingDollars / userEffectivePrice;
+        if (maxContractsAtPrice < MIN_FILL_SIZE) {
+          logger.debug(`Walk-the-book: Remaining $${remainingDollars.toFixed(4)} not enough for minimum ${MIN_FILL_SIZE} contracts`);
+          break;
+        }
+
+        const fillSize = Math.min(maxContractsAtPrice, bestOrder.remainingSize);
+        const fillPrice = userEffectivePrice;
+        const fillCost = fillSize * fillPrice;
+        const { makerFee } = calculateFillFees(fillCost);
+
+        fills.push({
+          makerOrderId: bestOrder.id,
+          takerOrderId: 'pending',
+          makerUserId: bestOrder.userId,
+          takerUserId: order.userId,
+          price: fillPrice, size: fillSize, outcome: order.outcome,
+          makerFee, takerFee: 0,
+          makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side,
+          takerSide: order.side,
+          makerClientOrderId: bestOrder.clientOrderId || Date.now(),
+          takerClientOrderId: order.clientOrderId || Date.now(),
+          makerOrderPda: (bestOrder as any).orderPda,
+          makerSignature: bestOrder.signature,
+          makerMessage: bestOrder.binaryMessage,
+          takerSignature: order.signature,
+          takerMessage: order.binaryMessage,
+          leverage: order.leverage, marginAmount: order.marginAmount, loanAmount: order.loanAmount,
+        });
+        totalContracts += fillSize;
+        totalSpent += fillCost;
+        remainingDollars -= fillCost;
+
+        const newMakerRemaining = bestOrder.remainingSize - fillSize;
+        const tConsume = Date.now();
+        await orderbookService.consumeOrder(bestOrder, Math.max(0, newMakerRemaining));
+        if (newMakerRemaining > 0) {
+          perf.updateOrderMs += Date.now() - tConsume;
+        } else {
+          perf.removeOrderMs += Date.now() - tConsume;
+        }
+
+        logger.debug(
+          `Walk-the-book fill: ${fillSize.toFixed(6)} contracts @ ${fillPrice} = $${fillCost.toFixed(4)} ` +
+          `(remaining: $${remainingDollars.toFixed(4)})`
+        );
       }
-      
-      // Calculate how many contracts we can afford at the user's effective price
-      const maxContractsAtPrice = remainingDollars / userEffectivePrice;
-      
-      // Minimum fill threshold: 0.01 contracts (1 cent payout worth)
-      const MIN_FILL_SIZE = 0.01;
-      if (maxContractsAtPrice < MIN_FILL_SIZE) {
-        logger.debug(`Walk-the-book: Remaining $${remainingDollars.toFixed(4)} not enough for minimum ${MIN_FILL_SIZE} contracts`);
-        break;
-      }
-      
-      // Calculate fill size (minimum of what we can afford and what's available)
-      // No Math.floor() - allow fractional contracts
-      const fillSize = Math.min(maxContractsAtPrice, bestOrder.remainingSize);
-      const fillPrice = userEffectivePrice;  // User sees their effective price
-      const fillCost = fillSize * fillPrice;
-      
-      // Maker fee per fill (always 0 currently); taker fee distributed after loop
-      const { makerFee } = calculateFillFees(fillCost);
-      
-      // Placeholder for taker order ID - will be replaced after order is created
-      const takerOrderId = 'pending';
-      
-      // Create fill record
-      // For NO orders: record the user's outcome (NO) and their effective price
-      const fill: Fill = {
-        makerOrderId: bestOrder.id,
-        takerOrderId,
-        makerUserId: bestOrder.userId,
-        takerUserId: order.userId,
-        price: fillPrice,  // User's effective price (complement for NO)
-        size: fillSize,
-        outcome: order.outcome,  // User's original outcome (YES or NO)
-        makerFee,
-        takerFee: 0, // Placeholder — distributed proportionally after matching
-        makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side, // Flip for NO
-        takerSide: order.side,
-        makerClientOrderId: bestOrder.clientOrderId || Date.now(),
-        takerClientOrderId: order.clientOrderId || Date.now(),
-        makerOrderPda: (bestOrder as any).orderPda,
-        makerSignature: bestOrder.signature,
-        makerMessage: bestOrder.binaryMessage,
-        takerSignature: order.signature,
-        takerMessage: order.binaryMessage,
-        // Leverage fields (for on-chain execution routing)
-        leverage: order.leverage,
-        marginAmount: order.marginAmount,
-        loanAmount: order.loanAmount,
-      };
-      
-      fills.push(fill);
-      totalContracts += fillSize;
-      totalSpent += fillCost;
-      remainingDollars -= fillCost;
-      
-      // Update maker order in orderbook (atomic: 1 Redis round-trip via Lua)
-      const newMakerRemaining = bestOrder.remainingSize - fillSize;
-      const tConsume = Date.now();
-      await orderbookService.consumeOrder(bestOrder, Math.max(0, newMakerRemaining));
-      if (newMakerRemaining > 0) {
-        perf.updateOrderMs += Date.now() - tConsume;
-      } else {
-        perf.removeOrderMs += Date.now() - tConsume;
-      }
-      
-      logger.debug(
-        `Walk-the-book fill: ${fillSize.toFixed(6)} contracts @ ${fillPrice} = $${fillCost.toFixed(4)} ` +
-        `(remaining: $${remainingDollars.toFixed(4)})`
-      );
     }
     
     // TWO-PASS FEE ADJUSTMENT:
     // Pass 1 (above) matched with full dollarAmount to discover fill count & prices.
-    // Pass 2 (below) calculates actual per-fill fees, then scales fills down so
-    // collateral + fees = dollarAmount exactly. This prevents overcharging when
-    // user has exactly dollarAmount in their wallet.
+    // Pass 2 (below) calculates fee on AGGREGATE notional (not per-fill), then scales
+    // fills down so collateral + fees = dollarAmount exactly.
+    // Using aggregate prevents flat fees from being multiplied by fill count.
     let upfrontFee = 0;
     if (fills.length > 0 && totalSpent > 0) {
-      // Calculate real per-fill fees
+      // Calculate fee on AGGREGATE notional (one fee for entire order)
+      const aggregateFee = calculateFillFees(totalSpent).takerFee;
+
+      // Distribute proportionally across fills (for per-fill accounting in DB)
       for (const fill of fills) {
         const fillCost = fill.price * fill.size;
-        fill.takerFee = calculateFillFees(fillCost).takerFee;
+        fill.takerFee = aggregateFee * (fillCost / totalSpent);
       }
-      const grossFees = fills.reduce((sum, f) => sum + f.takerFee, 0);
-      
+      const grossFees = aggregateFee;
+
       // Scale fills down so totalSpent_scaled + grossFees_scaled = dollarAmount
-      // Since flat fees don't change with fill size (below tier1Max), we just need:
-      //   targetCollateral = dollarAmount - totalFees
-      //   scaleFactor = targetCollateral / totalSpent
       const targetCollateral = order.dollarAmount - grossFees;
-      
+
       if (targetCollateral > 0 && targetCollateral < totalSpent) {
         const scale = targetCollateral / totalSpent;
         totalContracts = 0;
         totalSpent = 0;
-        
+
         for (const fill of fills) {
           fill.size = fill.size * scale;
-          const newCost = fill.price * fill.size;
           totalContracts += fill.size;
-          totalSpent += newCost;
-          // Recalculate fee on scaled cost (may change for percentage tiers)
-          fill.takerFee = calculateFillFees(newCost).takerFee;
+          totalSpent += fill.price * fill.size;
+        }
+        // Recalculate aggregate fee on scaled total
+        const scaledFee = calculateFillFees(totalSpent).takerFee;
+        for (const fill of fills) {
+          const fillCost = fill.price * fill.size;
+          fill.takerFee = scaledFee * (fillCost / totalSpent);
         }
       }
-      
+
       totalTakerFees = fills.reduce((sum, f) => sum + f.takerFee, 0);
       upfrontFee = totalTakerFees;
     }
@@ -870,10 +1040,8 @@ export class MatchingService {
     //    The actual DB INSERT happens asynchronously via write-behind queue
     const orderId = randomUUID();
     const filledSize = result.totalContracts;
-    const remainingSize = 0;
-    const orderStatus = result.unfilledDollars > 0.01 ? 'PARTIAL' : 'FILLED';
-    
-    // Enqueue order for batch DB persistence (write-behind)
+
+    // Enqueue the MARKET order (filled portion) for batch DB persistence
     writeBehindService.enqueueOrder({
       id: orderId,
       clientOrderId: order.clientOrderId || Date.now(),
@@ -888,50 +1056,114 @@ export class MatchingService {
       encodedInstruction: null,
       isMmOrder: false,
       expiresAt: order.expiresAt ? new Date(order.expiresAt) : new Date(Date.now() + 3600000),
-      status: orderStatus,
+      status: result.totalContracts > 0 ? 'FILLED' : 'CANCELLED',
       filledSize: filledSize.toString(),
-      remainingSize: Math.max(0, remainingSize).toString(),
+      remainingSize: '0',
+      dollarAmount: order.dollarAmount.toString(),
       leverage: order.leverage ? order.leverage.toString() : '1',
       marginAmount: order.marginAmount ? order.marginAmount.toString() : null,
     });
-    
+
     // Update fills with the pre-generated order ID
     for (const fill of result.fills) {
       fill.takerOrderId = orderId;
     }
-    
+
     const matchMs = Date.now() - t0;
     if (matchMs > 10) {
       logger.info(`[⏱️ MATCHING] ${matchMs}ms: ${result.fills.length} fills, orderId=${orderId.slice(0,8)} (write-behind)`);
     }
-    
-    // 4. For LEVERAGED orders: Create taker position SYNCHRONOUSLY
+
+    // 4. RESTING ORDER: If unfilled dollars remain, create a LIMIT order on the orderbook
+    //    This converts the unfilled portion of a dollar market order into a resting bid
+    //    that will match when new liquidity arrives (e.g., MM reposts asks).
+    let restingOrderId: string | undefined;
+    if (result.unfilledDollars > 0.01) {
+      // Use avgPrice from fills as the limit price (represents current market level).
+      // If no fills (empty book), use maxPrice so order fills at any available price.
+      const restingPrice = result.fills.length > 0 ? result.avgPrice : order.maxPrice;
+      const restingSize = Math.floor((result.unfilledDollars / restingPrice) * 1e6) / 1e6;
+
+      if (restingSize > 0.001) {
+        restingOrderId = randomUUID();
+        const expiresAt = order.expiresAt ? new Date(order.expiresAt) : new Date(Date.now() + 3600000);
+
+        // Enqueue resting LIMIT order for DB persistence
+        writeBehindService.enqueueOrder({
+          id: restingOrderId,
+          clientOrderId: Date.now(),
+          marketId: order.marketId,
+          userId: order.userId,
+          side: order.side,
+          outcome: order.outcome,
+          orderType: 'LIMIT',
+          price: restingPrice.toString(),
+          size: restingSize.toString(),
+          signature: order.signature || null,
+          encodedInstruction: null,
+          isMmOrder: false,
+          expiresAt,
+          status: 'OPEN',
+          filledSize: '0',
+          remainingSize: restingSize.toString(),
+          dollarAmount: result.unfilledDollars.toString(),
+          leverage: order.leverage ? order.leverage.toString() : '1',
+          marginAmount: null,
+        });
+
+        // Add to Redis orderbook so it matches against future asks
+        await orderbookService.addOrder({
+          id: restingOrderId,
+          marketId: order.marketId,
+          userId: order.userId,
+          side: order.side,
+          outcome: order.outcome,
+          orderType: 'LIMIT',
+          price: restingPrice,
+          size: restingSize,
+          remainingSize: restingSize,
+          createdAt: Date.now(),
+          clientOrderId: Date.now(),
+          expiresAt: order.expiresAt,
+        });
+
+        // Broadcast updated orderbook to WebSocket clients
+        const snapshot = await orderbookService.getCompositeSnapshot(order.marketId);
+        broadcastOrderbookUpdate(
+          market.pubkey || order.marketId,
+          snapshot.bids.map(l => [l.price, l.size] as [number, number]),
+          snapshot.asks.map(l => [l.price, l.size] as [number, number]),
+          snapshot.sequenceId,
+          'YES'
+        );
+
+        logger.info(
+          `[RESTING] Created resting limit order ${restingOrderId.slice(0,8)}: ` +
+          `${restingSize.toFixed(6)} contracts @ $${restingPrice.toFixed(4)} ` +
+          `from unfilled $${result.unfilledDollars.toFixed(2)} of $${order.dollarAmount}`
+        );
+      }
+    }
+
+    // 5. For LEVERAGED orders: Create taker position SYNCHRONOUSLY
     //    Required because orders.ts needs the position to create the margin account
     //    For regular orders, positions are created in background for speed
     if (order.leverage && order.leverage > 1) {
       const takerIsBuy = order.side === 'BID';
-      
+
       // Aggregate all fills by outcome for taker position
       const outcomeShares = new Map<'YES' | 'NO', number>();
       for (const fill of result.fills) {
         const current = outcomeShares.get(fill.outcome) || 0;
         outcomeShares.set(fill.outcome, current + fill.size);
       }
-      
+
       // Update taker position for each outcome
-      // Use dollarAmount as cost for buy orders so fee is baked into PnL
-      const useDollarAmountAsCost = takerIsBuy && outcomeShares.size === 1;
+      // Use pure notional (no fees) so avgEntryPrice = fill price
       for (const [outcome, shares] of outcomeShares) {
-        let cost: number;
-        if (useDollarAmountAsCost) {
-          cost = result.dollarAmount;
-        } else {
-          const outcomeFills = result.fills.filter(f => f.outcome === outcome);
-          const outcomeNotional = outcomeFills.reduce((sum, f) => sum + f.price * f.size, 0);
-          const outcomeFee = outcomeFills.reduce((sum, f) => sum + f.takerFee, 0);
-          cost = takerIsBuy ? outcomeNotional + outcomeFee : outcomeNotional - outcomeFee;
-        }
-        
+        const outcomeFills = result.fills.filter(f => f.outcome === outcome);
+        const cost = outcomeFills.reduce((sum, f) => sum + f.price * f.size, 0);
+
         await positionService.updateAfterTrade(
           order.userId,
           order.marketId,
@@ -942,29 +1174,33 @@ export class MatchingService {
         );
       }
     }
-    
-    // 5. EXECUTE ON-CHAIN (async with error tracking)
+
+    // 6. EXECUTE ON-CHAIN (async with error tracking)
     // If on-chain execution fails, trades are marked with FAILED tx status for reconciliation
-    this.executeFillsOnChain(result.fills, order.marketId)
-      .catch(err => {
-        logger.error(`[CRITICAL] On-chain execution failed for ${result.fills.length} fills: ${err.message}`);
-        // Mark affected trades as FAILED so reconciliation job can detect phantom positions
-        this.markFillsAsFailed(result.fills).catch(e => logger.error(`Failed to mark fills as failed: ${e.message}`));
-      });
-    
-    // 6. PROCESS DB UPDATES IN BACKGROUND (trades, positions, stats — batched)
+    if (result.fills.length > 0) {
+      this.executeFillsOnChain(result.fills, order.marketId)
+        .catch(err => {
+          logger.error(`[CRITICAL] On-chain execution failed for ${result.fills.length} fills: ${err.message}`);
+          // Mark affected trades as FAILED so reconciliation job can detect phantom positions
+          this.markFillsAsFailed(result.fills).catch(e => logger.error(`Failed to mark fills as failed: ${e.message}`));
+        });
+    }
+
+    // 7. PROCESS DB UPDATES IN BACKGROUND (trades, positions, stats — batched)
     //    Trades are also enqueued to write-behind for batch insert
-    this.processFillsInBackground(result.fills, order, {
-      id: market.id,
-      pubkey: market.pubkey,
-      asset: market.asset,
-      timeframe: market.timeframe,
-    }, !!(order.leverage && order.leverage > 1), {
-      dollarAmount: result.dollarAmount,
-      upfrontFee: result.upfrontFee,
-    }).catch(err => logger.error(`Background DB processing failed: ${err.message}`));
-    
-    return { ...result, orderId };
+    if (result.fills.length > 0) {
+      this.processFillsInBackground(result.fills, order, {
+        id: market.id,
+        pubkey: market.pubkey,
+        asset: market.asset,
+        timeframe: market.timeframe,
+      }, !!(order.leverage && order.leverage > 1), {
+        dollarAmount: result.dollarAmount,
+        upfrontFee: result.upfrontFee,
+      }).catch(err => logger.error(`Background DB processing failed: ${err.message}`));
+    }
+
+    return { ...result, orderId, restingOrderId };
   }
 
   /**
@@ -991,11 +1227,11 @@ export class MatchingService {
       zcardAtTimeout: null as number | null,
     };
 
-    // CONTINUOUS MATCHING CONFIG (same as buy orders for consistency)
+    // CONTINUOUS MATCHING CONFIG (same as buy orders)
     const isPerfMode = config.perfTestMode;
-    const MAX_RETRIES = isPerfMode ? 3 : 10;
-    const RETRY_DELAY_MS = isPerfMode ? 10 : 20;
-    const MAX_MATCHING_TIME_MS = isPerfMode ? 200 : 3000;
+    const MAX_RETRIES = isPerfMode ? 2 : 3;              // Reduced: batch-fetch grabs full depth at once
+    const RETRY_DELAY_MS = isPerfMode ? 5 : 5;           // Reduced: 5ms × 3 = 15ms max wait
+    const MAX_MATCHING_TIME_MS = isPerfMode ? 200 : 1000; // Reduced: prevent pathological event loop blocking
     const startTime = Date.now();
     let emptyBookRetries = 0;
     
@@ -1008,211 +1244,296 @@ export class MatchingService {
       (isNoOrder ? ` [matching YES ASKs]` : '')
     );
     
-    while (remainingSize > 0.001) {  // Min 0.001 contracts
-      perf.iterations++;
-      // Check total matching time
-      if (Date.now() - startTime > MAX_MATCHING_TIME_MS) {
-        if (perfEnabled) {
-          const { RedisKeys } = await import('../db/redis.js');
-          // For sell NO, we match YES:ASK; for sell YES, YES:BID. Either way, the key is helpful context.
-          const key = RedisKeys.orderbook(order.marketId, effectiveOutcome, isNoOrder ? 'ASK' : 'BID');
-          perf.zcardAtTimeout = await this.safeZcard(key);
+    // Match side: Sell YES → YES:BID, Sell NO → YES:ASK
+    const matchSide: 'BID' | 'ASK' = isNoOrder ? 'ASK' : 'BID';
+
+    if (config.useBatchMatching) {
+      // ═══════════════════════════════════════════════════════════════════════
+      // BATCH-FETCH PATH: 2-4 Redis RTTs total instead of 2 per fill
+      // ═══════════════════════════════════════════════════════════════════════
+      const BATCH_SIZE = 64;
+
+      while (remainingSize > 0.001) {
+        perf.iterations++;
+        if (Date.now() - startTime > MAX_MATCHING_TIME_MS) {
+          logger.warn(`Sell order matching timed out after ${MAX_MATCHING_TIME_MS}ms, remaining: ${remainingSize.toFixed(6)}`);
+          break;
         }
-        logger.warn(`Sell order matching timed out after ${MAX_MATCHING_TIME_MS}ms, remaining: ${remainingSize.toFixed(6)}`);
-        if (perfEnabled) {
-          logger.warn(
-            {
-              marketId: order.marketId,
-              outcome: order.outcome,
-              elapsedMs: Date.now() - startTime,
-              fills: fills.length,
-              remainingSize,
-              perf,
-            },
-            '[MATCH PERF] Sell timeout'
-          );
-        }
-        break;
-      }
-      
-      // SINGLE ORDERBOOK: 
-      // - Sell YES → Get best YES BID (buyer for YES)
-      // - Sell NO → Get best YES ASK (MM selling YES = buying NO from user)
-      const tBest = Date.now();
-      const bestOrder = isNoOrder
-        ? await orderbookService.getBestAsk(order.marketId, effectiveOutcome)
-        : await orderbookService.getBestBid(order.marketId, effectiveOutcome);
-      perf.getBestMs += Date.now() - tBest;
-      
-      if (!bestOrder) {
-        // CONTINUOUS MATCHING: Wait and retry for MM to replenish orderbook
-        if (emptyBookRetries < MAX_RETRIES) {
-          emptyBookRetries++;
-          perf.emptyRetries = emptyBookRetries;
-          logger.debug(`Sell: Orderbook empty, retry ${emptyBookRetries}/${MAX_RETRIES} in ${RETRY_DELAY_MS}ms...`);
-          const tSleep = Date.now();
-          await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
-          perf.sleepMs += Date.now() - tSleep;
-          continue; // Retry the loop
-        }
-        
-        // Exhausted retries - use DEV synthetic fill if enabled
-        if (config.devAlwaysFillMarketOrders) {
-          const mmUserId = getMMUserId();
-          if (!mmUserId) {
-            logger.warn('DEV_ALWAYS_FILL_MARKET_ORDERS enabled but MM user is not initialized');
+
+        // 1 RTT: fetch top N orders
+        const tBest = Date.now();
+        const topOrders = await orderbookService.getTopN(order.marketId, effectiveOutcome, matchSide, BATCH_SIZE);
+        perf.getBestMs += Date.now() - tBest;
+
+        if (topOrders.length === 0) {
+          // Early partial-fill exit: book exhausted, execute what we have immediately
+          if (fills.length > 0) {
+            logger.info(`Sell: Book exhausted with ${fills.length} fills, cancelling remainder — executing partial fill`);
             break;
           }
 
-          // Use current market prices as a sane fill price (defaults to 0.50)
-          const market = await marketService.getById(order.marketId);
-          const yesPx = market?.yesPrice ? parseFloat(market.yesPrice) : 0.5;
-          const noPx = market?.noPrice ? parseFloat(market.noPrice) : 0.5;
-          const basePrice = order.outcome === 'YES' ? yesPx : noPx;
-          // For sells, use the market price but ensure it meets min price
-          const price = Math.max(order.minPrice, Math.min(0.99, Math.max(0.01, basePrice || 0.5)));
+          if (emptyBookRetries < MAX_RETRIES) {
+            emptyBookRetries++;
+            perf.emptyRetries = emptyBookRetries;
+            logger.debug(`Sell: Orderbook empty, retry ${emptyBookRetries}/${MAX_RETRIES} in ${RETRY_DELAY_MS}ms...`);
+            const tSleep = Date.now();
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+            perf.sleepMs += Date.now() - tSleep;
+            continue;
+          }
 
-          const fillSize = remainingSize;
-          const fillProceeds = fillSize * price;
+          // Exhausted retries - use DEV synthetic fill if enabled
+          if (config.devAlwaysFillMarketOrders) {
+            const mmUserId = getMMUserId();
+            if (mmUserId) {
+              const market = await marketService.getById(order.marketId);
+              const yesPx = market?.yesPrice ? parseFloat(market.yesPrice) : 0.5;
+              const noPx = market?.noPrice ? parseFloat(market.noPrice) : 0.5;
+              const basePrice = order.outcome === 'YES' ? yesPx : noPx;
+              const price = Math.max(order.minPrice, Math.min(0.99, Math.max(0.01, basePrice || 0.5)));
+              const fillSize = remainingSize;
+              const fillProceeds = fillSize * price;
+              const { makerFee, takerFee } = calculateFillFees(fillProceeds);
+
+              fills.push({
+                makerOrderId: `mm_synth_${Date.now()}`,
+                takerOrderId: 'pending',
+                makerUserId: mmUserId, takerUserId: order.userId,
+                price, size: fillSize, outcome: order.outcome,
+                makerFee, takerFee,
+                makerSide: 'BID', takerSide: 'ASK',
+                makerClientOrderId: Date.now(),
+                takerClientOrderId: order.clientOrderId || Date.now(),
+              });
+              totalProceeds += fillProceeds;
+              remainingSize = 0;
+              logger.info(`DEV fill: synthetic MM bid ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for SELL ${order.outcome}`);
+            }
+          }
+          logger.debug('Sell order: No more orders to match after retries');
+          break;
+        }
+
+        emptyBookRetries = 0;
+
+        // In-memory matching: 0 RTTs
+        const batchFills: Fill[] = [];
+        const consumptions: Array<{ order: OrderbookOrder; newRemainingSize: number }> = [];
+        let priceFloorHit = false;
+
+        for (const bestOrder of topOrders) {
+          if (remainingSize <= 0.001) break;
+
+          // Self-trade prevention — skip this order
+          if (bestOrder.userId === order.userId) continue;
+
+          const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
+
+          // Check price floor (seller won't accept below minPrice)
+          if (userEffectivePrice < order.minPrice) {
+            priceFloorHit = true;
+            // For BIDs, lower prices follow → no point continuing
+            // For ASKs (NO sell), higher ASK prices = lower NO prices → also stop
+            break;
+          }
+
+          const fillSize = Math.min(remainingSize, bestOrder.remainingSize);
+          const fillPrice = userEffectivePrice;
+          const fillProceeds = fillSize * fillPrice;
           const { makerFee, takerFee } = calculateFillFees(fillProceeds);
 
-          const fill: Fill = {
-            makerOrderId: `mm_synth_${Date.now()}`,
+          batchFills.push({
+            makerOrderId: bestOrder.id,
             takerOrderId: 'pending',
-            makerUserId: mmUserId,
-            takerUserId: order.userId,
-            price,
-            size: fillSize,
-            outcome: order.outcome,
-            makerFee,
-            takerFee,
-            makerSide: 'BID',   // MM is buying
-            takerSide: 'ASK',   // User is selling
-            makerClientOrderId: Date.now(),
+            makerUserId: bestOrder.userId, takerUserId: order.userId,
+            price: fillPrice, size: fillSize, outcome: order.outcome,
+            makerFee, takerFee,
+            makerSide: isNoOrder ? 'ASK' : 'BID',
+            takerSide: 'ASK',
+            makerClientOrderId: bestOrder.clientOrderId || Date.now(),
             takerClientOrderId: order.clientOrderId || Date.now(),
-          };
+            makerOrderPda: (bestOrder as any).orderPda,
+            makerSignature: bestOrder.signature,
+            makerMessage: bestOrder.binaryMessage,
+            takerSignature: order.signature,
+            takerMessage: order.binaryMessage,
+            isLeveragedClose: order.isLeveragedClose,
+          });
 
-          fills.push(fill);
+          const newMakerRemaining = bestOrder.remainingSize - fillSize;
+          consumptions.push({ order: bestOrder, newRemainingSize: Math.max(0, newMakerRemaining) });
+
           totalProceeds += fillProceeds;
-          remainingSize = 0;
+          remainingSize -= fillSize;
+        }
 
-          logger.info(
-            `DEV fill: synthetic MM bid ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for SELL ${order.outcome}`
+        // 1 RTT: batch-consume all matched orders
+        if (consumptions.length > 0) {
+          const tConsume = Date.now();
+          const { consumed } = await orderbookService.batchConsume(
+            order.marketId, effectiveOutcome, matchSide, consumptions,
           );
-        } else {
-          logger.debug('Sell order: No more orders to match after retries');
-        }
-        break;
-      }
-      
-      // Reset retry counter on successful order fetch
-      emptyBookRetries = 0;
-      
-      // SINGLE ORDERBOOK MODEL: Calculate user's effective price
-      // For NO sells, user's price is complement of YES order price
-      // YES ASK @ $0.56 → User sells NO @ $0.44
-      const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
-      
-      // Check price floor (seller won't accept below minPrice)
-      if (userEffectivePrice < order.minPrice) {
-        // Devnet/testing: still fill at the user's min price if MM is available
-        if (config.devAlwaysFillMarketOrders) {
-          const mmUserId = getMMUserId();
-          if (mmUserId) {
-            const fillSize = remainingSize;
-            const price = order.minPrice;
-            const fillProceeds = fillSize * price;
-            const { makerFee, takerFee } = calculateFillFees(fillProceeds);
+          perf.updateOrderMs += Date.now() - tConsume;
 
-            const fill: Fill = {
-              makerOrderId: `mm_synth_${Date.now()}`,
-              takerOrderId: 'pending',
-              makerUserId: mmUserId,
-              takerUserId: order.userId,
-              price,
-              size: fillSize,
-              outcome: order.outcome,
-              makerFee,
-              takerFee,
-              makerSide: 'BID',
-              takerSide: 'ASK',
-              makerClientOrderId: Date.now(),
-              takerClientOrderId: order.clientOrderId || Date.now(),
-              // Leveraged close: on-chain shares are owned by Lending Pool
-              isLeveragedClose: order.isLeveragedClose,
-            };
-
-            fills.push(fill);
-            totalProceeds += fillProceeds;
-            remainingSize = 0;
-
-            logger.info(
-              `DEV fill: synthetic MM bid at min price ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for SELL ${order.outcome}` +
-              (order.isLeveragedClose ? ' [LEVERAGED CLOSE]' : '')
-            );
-            break;
+          // Filter out fills lost to race condition
+          for (let i = consumed.length - 1; i >= 0; i--) {
+            if (!consumed[i]) {
+              const lostFill = batchFills[i];
+              totalProceeds -= lostFill.price * lostFill.size;
+              remainingSize += lostFill.size;
+              batchFills.splice(i, 1);
+              logger.debug(`[BATCH] Sell fill lost to race: order ${consumptions[i].order.id.slice(0, 8)}`);
+            }
           }
+
+          fills.push(...batchFills);
         }
-        logger.debug(`Sell order: Price ${userEffectivePrice} below min ${order.minPrice}`);
-        break;
+
+        logger.debug(
+          `[BATCH SELL] ${batchFills.length} fills from ${topOrders.length} orders, ` +
+          `remaining ${remainingSize.toFixed(6)}`
+        );
+
+        // Stop if book exhausted or price floor hit
+        if (topOrders.length < BATCH_SIZE || priceFloorHit) break;
       }
-      
-      // Self-trade prevention
-      if (bestOrder.userId === order.userId) {
-        logger.debug(`Sell order: Self-trade prevented for user ${order.userId}`);
-        break;
+    } else {
+      // ═══════════════════════════════════════════════════════════════════════
+      // PER-FILL PATH (legacy): USE_BATCH_MATCHING=false
+      // ═══════════════════════════════════════════════════════════════════════
+      while (remainingSize > 0.001) {
+        perf.iterations++;
+        if (Date.now() - startTime > MAX_MATCHING_TIME_MS) {
+          logger.warn(`Sell order matching timed out after ${MAX_MATCHING_TIME_MS}ms, remaining: ${remainingSize.toFixed(6)}`);
+          break;
+        }
+
+        const tBest = Date.now();
+        const bestOrder = isNoOrder
+          ? await orderbookService.getBestAsk(order.marketId, effectiveOutcome)
+          : await orderbookService.getBestBid(order.marketId, effectiveOutcome);
+        perf.getBestMs += Date.now() - tBest;
+
+        if (!bestOrder) {
+          if (emptyBookRetries < MAX_RETRIES) {
+            emptyBookRetries++;
+            perf.emptyRetries = emptyBookRetries;
+            logger.debug(`Sell: Orderbook empty, retry ${emptyBookRetries}/${MAX_RETRIES} in ${RETRY_DELAY_MS}ms...`);
+            const tSleep = Date.now();
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+            perf.sleepMs += Date.now() - tSleep;
+            continue;
+          }
+
+          if (config.devAlwaysFillMarketOrders) {
+            const mmUserId = getMMUserId();
+            if (mmUserId) {
+              const market = await marketService.getById(order.marketId);
+              const yesPx = market?.yesPrice ? parseFloat(market.yesPrice) : 0.5;
+              const noPx = market?.noPrice ? parseFloat(market.noPrice) : 0.5;
+              const basePrice = order.outcome === 'YES' ? yesPx : noPx;
+              const price = Math.max(order.minPrice, Math.min(0.99, Math.max(0.01, basePrice || 0.5)));
+              const fillSize = remainingSize;
+              const fillProceeds = fillSize * price;
+              const { makerFee, takerFee } = calculateFillFees(fillProceeds);
+
+              fills.push({
+                makerOrderId: `mm_synth_${Date.now()}`,
+                takerOrderId: 'pending',
+                makerUserId: mmUserId, takerUserId: order.userId,
+                price, size: fillSize, outcome: order.outcome,
+                makerFee, takerFee,
+                makerSide: 'BID', takerSide: 'ASK',
+                makerClientOrderId: Date.now(),
+                takerClientOrderId: order.clientOrderId || Date.now(),
+              });
+              totalProceeds += fillProceeds;
+              remainingSize = 0;
+              logger.info(`DEV fill: synthetic MM bid ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for SELL ${order.outcome}`);
+            }
+          }
+          logger.debug('Sell order: No more orders to match after retries');
+          break;
+        }
+
+        emptyBookRetries = 0;
+
+        const userEffectivePrice = isNoOrder ? (1 - bestOrder.price) : bestOrder.price;
+
+        if (userEffectivePrice < order.minPrice) {
+          if (config.devAlwaysFillMarketOrders) {
+            const mmUserId = getMMUserId();
+            if (mmUserId) {
+              const fillSize = remainingSize;
+              const price = order.minPrice;
+              const fillProceeds = fillSize * price;
+              const { makerFee, takerFee } = calculateFillFees(fillProceeds);
+
+              fills.push({
+                makerOrderId: `mm_synth_${Date.now()}`,
+                takerOrderId: 'pending',
+                makerUserId: mmUserId, takerUserId: order.userId,
+                price, size: fillSize, outcome: order.outcome,
+                makerFee, takerFee,
+                makerSide: 'BID', takerSide: 'ASK',
+                makerClientOrderId: Date.now(),
+                takerClientOrderId: order.clientOrderId || Date.now(),
+                isLeveragedClose: order.isLeveragedClose,
+              });
+              totalProceeds += fillProceeds;
+              remainingSize = 0;
+              logger.info(`DEV fill: synthetic MM bid at min price ${fillSize.toFixed(6)} @ ${price.toFixed(4)} for SELL ${order.outcome}`);
+              break;
+            }
+          }
+          logger.debug(`Sell order: Price ${userEffectivePrice} below min ${order.minPrice}`);
+          break;
+        }
+
+        if (bestOrder.userId === order.userId) {
+          logger.debug(`Sell order: Self-trade prevented for user ${order.userId}`);
+          break;
+        }
+
+        const fillSize = Math.min(remainingSize, bestOrder.remainingSize);
+        const fillPrice = userEffectivePrice;
+        const fillProceeds = fillSize * fillPrice;
+        const { makerFee, takerFee } = calculateFillFees(fillProceeds);
+
+        fills.push({
+          makerOrderId: bestOrder.id,
+          takerOrderId: 'pending',
+          makerUserId: bestOrder.userId, takerUserId: order.userId,
+          price: fillPrice, size: fillSize, outcome: order.outcome,
+          makerFee, takerFee,
+          makerSide: isNoOrder ? 'ASK' : 'BID',
+          takerSide: 'ASK',
+          makerClientOrderId: bestOrder.clientOrderId || Date.now(),
+          takerClientOrderId: order.clientOrderId || Date.now(),
+          makerOrderPda: (bestOrder as any).orderPda,
+          makerSignature: bestOrder.signature,
+          makerMessage: bestOrder.binaryMessage,
+          takerSignature: order.signature,
+          takerMessage: order.binaryMessage,
+          isLeveragedClose: order.isLeveragedClose,
+        });
+        totalProceeds += fillProceeds;
+        remainingSize -= fillSize;
+
+        const newMakerRemaining = bestOrder.remainingSize - fillSize;
+        const tConsume = Date.now();
+        await orderbookService.consumeOrder(bestOrder, Math.max(0, newMakerRemaining));
+        if (newMakerRemaining > 0) {
+          perf.updateOrderMs += Date.now() - tConsume;
+        } else {
+          perf.removeOrderMs += Date.now() - tConsume;
+        }
+
+        logger.debug(
+          `Sell fill: ${fillSize.toFixed(6)} contracts @ ${fillPrice} = $${fillProceeds.toFixed(4)} ` +
+          `(remaining: ${remainingSize.toFixed(6)})`
+        );
       }
-      
-      // Calculate fill size and proceeds using user's effective price
-      const fillSize = Math.min(remainingSize, bestOrder.remainingSize);
-      const fillPrice = userEffectivePrice;  // User sees their effective price
-      const fillProceeds = fillSize * fillPrice;
-      
-      // Calculate fees (tiered fee structure)
-      const { makerFee, takerFee } = calculateFillFees(fillProceeds);
-      
-      // Create fill record (seller is taker, buyer is maker)
-      const fill: Fill = {
-        makerOrderId: bestOrder.id,
-        takerOrderId: 'pending',  // Will be replaced
-        makerUserId: bestOrder.userId,  // Buyer (maker)
-        takerUserId: order.userId,       // Seller (taker)
-        price: fillPrice,  // User's effective price
-        size: fillSize,
-        outcome: order.outcome,  // User's original outcome
-        makerFee,
-        takerFee,
-        makerSide: isNoOrder ? 'ASK' : 'BID',  // For NO: maker was YES ASK
-        takerSide: 'ASK',   // Seller is asking
-        makerClientOrderId: bestOrder.clientOrderId || Date.now(),
-        takerClientOrderId: order.clientOrderId || Date.now(),
-        makerOrderPda: (bestOrder as any).orderPda,
-        makerSignature: bestOrder.signature,
-        makerMessage: bestOrder.binaryMessage,
-        takerSignature: order.signature,
-        takerMessage: order.binaryMessage,
-        // Leveraged close: on-chain shares are owned by Lending Pool
-        isLeveragedClose: order.isLeveragedClose,
-      };
-      
-      fills.push(fill);
-      totalProceeds += fillProceeds;
-      remainingSize -= fillSize;
-      
-      // Update maker order in orderbook (atomic: 1 Redis round-trip via Lua)
-      const newMakerRemaining = bestOrder.remainingSize - fillSize;
-      const tConsume = Date.now();
-      await orderbookService.consumeOrder(bestOrder, Math.max(0, newMakerRemaining));
-      if (newMakerRemaining > 0) {
-        perf.updateOrderMs += Date.now() - tConsume;
-      } else {
-        perf.removeOrderMs += Date.now() - tConsume;
-      }
-      
-      logger.debug(
-        `Sell fill: ${fillSize.toFixed(6)} contracts @ ${fillPrice} = $${fillProceeds.toFixed(4)} ` +
-        `(remaining: ${remainingSize.toFixed(6)})`
-      );
     }
     
     const avgPrice = fills.length > 0 && (order.size - remainingSize) > 0 
@@ -1618,15 +1939,59 @@ export class MatchingService {
     return wallet;
   }
 
+  // Delegation info cache: avoids ~100ms Solana RPC call per order.
+  // On-chain TX is still the source of truth — if delegation is revoked between
+  // cache and TX, the TX fails with INSUFFICIENT_FUNDS (same race that already exists).
+  private delegationCache = new Map<string, {
+    isApproved: boolean;
+    delegatedAmount: number;
+    walletBalance: number;
+    expiresAt: number;
+  }>();
+  private readonly DELEGATION_CACHE_TTL_MS = 60_000; // 60 seconds
+
+  /** Invalidate cached delegation for a user (e.g., on delegation toggle) */
+  invalidateDelegationCache(userId: string): void {
+    this.delegationCache.delete(userId);
+  }
+
   /**
    * Check if a user has approved the relayer to spend USDC
-   * and if the delegated amount is sufficient for the order.
+   * and if the delegated amount AND actual USDC balance are sufficient.
+   *
+   * Uses a 60s in-memory cache to avoid ~100ms Solana RPC round-trip per order.
+   * On-chain TX is the final authority — if the race condition hits, the TX fails
+   * with INSUFFICIENT_FUNDS and the failure is surfaced to the user in trade history.
    */
   async checkDelegation(userId: string, requiredAmount: number): Promise<{
     isApproved: boolean;
     delegatedAmount: number;
     error?: string;
   }> {
+    // Check cache first (saves ~100ms RPC call)
+    const cached = this.delegationCache.get(userId);
+    if (cached && cached.expiresAt > Date.now()) {
+      if (!cached.isApproved) {
+        return { isApproved: false, delegatedAmount: 0, error: 'Instant trading not enabled. Please click "Enable fast mode" in the trade modal.' };
+      }
+      if (cached.delegatedAmount < requiredAmount) {
+        return {
+          isApproved: true,
+          delegatedAmount: cached.delegatedAmount,
+          error: `Insufficient delegation. You delegated $${cached.delegatedAmount.toFixed(2)}, but this order requires $${requiredAmount.toFixed(2)} (including fees).`
+        };
+      }
+      if (cached.walletBalance < requiredAmount) {
+        return {
+          isApproved: true,
+          delegatedAmount: cached.delegatedAmount,
+          error: `Insufficient USDC balance. You have $${cached.walletBalance.toFixed(2)} but this order requires $${requiredAmount.toFixed(2)} (including fees).`,
+        };
+      }
+      return { isApproved: true, delegatedAmount: cached.delegatedAmount };
+    }
+
+    // Cache miss — fetch from Solana RPC (~100ms)
     const userWallet = await this.getWalletForUser(userId);
     if (!userWallet) return { isApproved: false, delegatedAmount: 0, error: 'User wallet not found' };
 
@@ -1637,16 +2002,34 @@ export class MatchingService {
       const balanceInfo = await anchorClient.getDelegationInfo(userWallet, relayerAddress);
       const isApproved = balanceInfo.delegate === relayerAddress;
       const delegatedAmount = balanceInfo.delegatedAmount / 1_000_000;
+      const walletBalance = balanceInfo.balance / 1_000_000;
+
+      // Cache the result
+      this.delegationCache.set(userId, {
+        isApproved,
+        delegatedAmount,
+        walletBalance,
+        expiresAt: Date.now() + this.DELEGATION_CACHE_TTL_MS,
+      });
 
       if (!isApproved) {
         return { isApproved: false, delegatedAmount: 0, error: 'Instant trading not enabled. Please click "Enable fast mode" in the trade modal.' };
       }
 
       if (delegatedAmount < requiredAmount) {
-        return { 
-          isApproved: true, 
-          delegatedAmount, 
-          error: `Insufficient delegation. You delegated $${delegatedAmount.toFixed(2)}, but this order requires $${requiredAmount.toFixed(2)} (including fees).` 
+        return {
+          isApproved: true,
+          delegatedAmount,
+          error: `Insufficient delegation. You delegated $${delegatedAmount.toFixed(2)}, but this order requires $${requiredAmount.toFixed(2)} (including fees).`
+        };
+      }
+
+      // Check actual USDC balance — delegation limit means nothing if the wallet is empty
+      if (walletBalance < requiredAmount) {
+        return {
+          isApproved: true,
+          delegatedAmount,
+          error: `Insufficient USDC balance. You have $${walletBalance.toFixed(2)} but this order requires $${requiredAmount.toFixed(2)} (including fees).`,
         };
       }
 
@@ -1762,15 +2145,17 @@ export class MatchingService {
       sequenceId = result.sequenceId;
       addedToBook = true;
       
-      // Broadcast orderbook update (use pubkey for channel, frontend subscribes by address)
-      const snapshot = await orderbookService.getSnapshot(order.marketId, order.outcome);
+      // SINGLE ORDERBOOK MODEL: Always broadcast composite YES view
+      // This merges any NO orders into YES at complement prices so the
+      // frontend's single-orderbook model works for both YES and NO limit orders.
+      const snapshot = await orderbookService.getCompositeSnapshot(order.marketId);
       const marketForBroadcast = await marketService.getById(order.marketId);
       broadcastOrderbookUpdate(
         marketForBroadcast?.pubkey || order.marketId,
         snapshot.bids.map(l => [l.price, l.size] as [number, number]),
         snapshot.asks.map(l => [l.price, l.size] as [number, number]),
-        sequenceId,
-        order.outcome  // FIX: Pass the correct outcome so YES/NO don't get mixed up!
+        snapshot.sequenceId,
+        'YES'  // Always YES for single orderbook model
       );
     } else if (matchResult.remainingSize > 0 && orderType !== 'LIMIT') {
       // Log that the order was partially filled but remainder was cancelled
@@ -1797,10 +2182,18 @@ export class MatchingService {
     const takerPrice = fill.price; // Price per contract for taker's outcome
     const takerNotional = takerPrice * fill.size; // Total taker pays
     
-    // Maker gets the opposite outcome
-    const makerOutcome = takerOutcome === 'YES' ? 'NO' : 'YES';
-    const makerPrice = 1 - takerPrice; // Complementary price (e.g., 0.48 if taker pays 0.52)
-    const makerNotional = makerPrice * fill.size; // Total maker pays
+    // Complement values (used for positions when taker buys, and market volume stats)
+    const complementOutcome = takerOutcome === 'YES' ? 'NO' : 'YES';
+    const complementPrice = 1 - takerPrice;
+    const complementNotional = complementPrice * fill.size;
+
+    // Maker's actual perspective for trade record:
+    // When taker BIDs: maker has ASK → selling fill.outcome → complement perspective
+    // When taker ASKs: maker has BID → buying fill.outcome → same perspective (resting order)
+    const makerIsBidder = takerSide === 'ASK';
+    const makerOutcome = makerIsBidder ? takerOutcome : complementOutcome;
+    const makerPrice = makerIsBidder ? takerPrice : complementPrice;
+    const makerNotional = makerIsBidder ? takerNotional : complementNotional;
     
     // Create trade record in database with both perspectives
     logger.debug(`Inserting trade: taker=${takerSide} ${takerOutcome}@${takerPrice}, maker=${makerOutcome}@${makerPrice}, size=${fill.size}`);
@@ -1860,13 +2253,13 @@ export class MatchingService {
         true  // Taker is BUYING their outcome
       );
       
-      // Maker gains opposite outcome shares  
+      // Maker has ASK → gains complement outcome shares
       await positionService.updateAfterTrade(
         fill.makerUserId,
         marketId,
-        makerOutcome,
+        complementOutcome,
         fill.size,
-        makerNotional - fill.makerFee,
+        complementNotional - fill.makerFee,
         true  // Maker is ACQUIRING the opposite outcome
       );
     } else {
@@ -1894,10 +2287,10 @@ export class MatchingService {
     
     // Update user stats
     await userService.updateTradeStats(fill.takerUserId, takerNotional);
-    await userService.updateTradeStats(fill.makerUserId, makerNotional);
-    
-    // Update market stats (total volume = both sides)
-    await marketService.incrementStats(marketId, takerNotional + makerNotional);
+    await userService.updateTradeStats(fill.makerUserId, complementNotional);
+
+    // Update market stats (total volume = both sides, always $1/contract)
+    await marketService.incrementStats(marketId, takerNotional + complementNotional);
     await marketService.updatePrices(marketId, fill.price, 1 - fill.price);
     
     // Get market for broadcast and on-chain execution
@@ -2314,17 +2707,10 @@ export class MatchingService {
       const current = takerOutcomes.get(fill.outcome) || { shares: 0, cost: 0 };
       const notional = fill.price * fill.size;
       current.shares += fill.size;
-      current.cost += takerIsBuy ? notional + fill.takerFee : notional - fill.takerFee;
+      // Use pure notional (no takerFee) so avgEntryPrice = fill price.
+      // Fees are charged separately from position cost basis.
+      current.cost += notional;
       takerOutcomes.set(fill.outcome, current);
-    }
-    
-    // When upfrontFee is provided (dollar market orders), use dollarAmount as the
-    // taker's total cost so the DB position reflects the user's full selected amount.
-    // This ensures PnL shows the fee as an initial loss.
-    if (opts?.dollarAmount && opts?.upfrontFee && takerIsBuy && takerOutcomes.size === 1) {
-      const [outcome, data] = [...takerOutcomes.entries()][0];
-      data.cost = opts.dollarAmount;
-      takerOutcomes.set(outcome, data);
     }
     
     for (const [outcome, data] of takerOutcomes) {
@@ -2415,18 +2801,15 @@ export class MatchingService {
     // Update database
     await orderService.cancel(orderId, 'USER');
     
-    // Broadcast orderbook update (use pubkey for channel, frontend subscribes by address)
-    const snapshot = await orderbookService.getSnapshot(
-      order.marketId!,
-      order.outcome as 'YES' | 'NO'
-    );
+    // SINGLE ORDERBOOK MODEL: Always broadcast composite YES view
+    const snapshot = await orderbookService.getCompositeSnapshot(order.marketId!);
     const marketForCancel = await marketService.getById(order.marketId!);
     broadcastOrderbookUpdate(
       marketForCancel?.pubkey || order.marketId!,
       snapshot.bids.map(l => [l.price, l.size] as [number, number]),
       snapshot.asks.map(l => [l.price, l.size] as [number, number]),
-      sequenceId,
-      order.outcome as 'YES' | 'NO'  // FIX: Pass the correct outcome!
+      snapshot.sequenceId,
+      'YES'  // Always YES for single orderbook model
     );
     
     return true;

@@ -439,8 +439,9 @@ export async function marketRoutes(app: FastifyInstance) {
       });
     }
     
-    // Use orderbookService.getSnapshot() — O(levels) from pre-aggregated data
-    const yesSnap = await orderbookService.getSnapshot(market.id, 'YES');
+    // SINGLE ORDERBOOK MODEL: Use composite snapshot that merges YES + NO orders
+    // NO BID @ p → YES ASK @ (1-p), NO ASK @ p → YES BID @ (1-p)
+    const yesSnap = await orderbookService.getCompositeSnapshot(market.id);
 
     const yesBids: [number, number][] = yesSnap.bids.map(l => [l.price, l.size]);
     const yesAsks: [number, number][] = yesSnap.asks.map(l => [l.price, l.size]);

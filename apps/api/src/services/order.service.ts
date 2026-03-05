@@ -12,6 +12,7 @@ export interface OrderWithMarket extends Order {
     pubkey: string;
     asset: string;
     timeframe: string;
+    expiryAt?: Date;
   };
 }
 
@@ -52,6 +53,7 @@ export class OrderService {
           pubkey: markets.pubkey,
           asset: markets.asset,
           timeframe: markets.timeframe,
+          expiryAt: markets.expiryAt,
         },
       })
       .from(orders)

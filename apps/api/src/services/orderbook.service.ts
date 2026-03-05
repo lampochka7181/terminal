@@ -151,6 +151,91 @@ local seq = redis.call('INCR', seqKey)
 return seq
 `;
 
+// ── Lua: batch fetch top N orders in 1 round-trip ──
+// KEYS[1] = ob ZSET key
+// ARGV[1] = N (max orders to fetch)
+// Returns flat array: [orderId, score, fieldCount, f1, v1, f2, v2, ..., orderId2, ...]
+// Cleans orphaned entries (ZSET member with missing hash) inline.
+const BATCH_GET_TOP_N_LUA = `
+local n = tonumber(ARGV[1])
+local res = redis.call('ZRANGE', KEYS[1], 0, n - 1, 'WITHSCORES')
+local result = {}
+local orphans = {}
+for i = 1, #res, 2 do
+  local orderId = res[i]
+  local score = res[i+1]
+  local orderKey = 'order:' .. orderId
+  local data = redis.call('HGETALL', orderKey)
+  if #data > 0 then
+    result[#result + 1] = orderId
+    result[#result + 1] = score
+    result[#result + 1] = tostring(#data / 2)
+    for j = 1, #data do result[#result + 1] = data[j] end
+  else
+    orphans[#orphans + 1] = orderId
+  end
+end
+for _, oid in ipairs(orphans) do
+  redis.call('ZREM', KEYS[1], oid)
+end
+return result
+`;
+
+// ── Lua: batch consume multiple orders in 1 round-trip ──
+// KEYS[1] = ob ZSET key
+// KEYS[2] = levels hash key
+// KEYS[3] = sequence key
+// ARGV[1] = count of orders
+// Then groups of 4: orderId, orderHashKey, newRemainingSize, priceKey
+// Returns: [seq, consumed1, consumed2, ...] where consumed=1 means order was consumed, 0=already gone
+const BATCH_CONSUME_LUA = `
+local obKey = KEYS[1]
+local lvlKey = KEYS[2]
+local seqKey = KEYS[3]
+local count = tonumber(ARGV[1])
+local result = {}
+
+for i = 0, count - 1 do
+  local base = 2 + i * 4
+  local orderId = ARGV[base]
+  local orderKey = ARGV[base + 1]
+  local newRemaining = tonumber(ARGV[base + 2])
+  local priceKey = ARGV[base + 3]
+
+  local oldSize = tonumber(redis.call('HGET', orderKey, 'remainingSize') or '0')
+  if oldSize == 0 then
+    -- Order already consumed by another instance — skip
+    result[#result + 1] = 0
+  else
+    local sizeDelta = newRemaining - oldSize
+
+    if newRemaining > 0 then
+      redis.call('HSET', orderKey, 'remainingSize', tostring(newRemaining))
+    else
+      redis.call('ZREM', obKey, orderId)
+      redis.call('DEL', orderKey)
+    end
+
+    local countDelta = newRemaining > 0 and 0 or -1
+    local sField = priceKey .. ':s'
+    local cField = priceKey .. ':c'
+    local newLvlSize = redis.call('HINCRBYFLOAT', lvlKey, sField, sizeDelta)
+    local newLvlCount = redis.call('HINCRBY', lvlKey, cField, countDelta)
+    newLvlSize = tonumber(newLvlSize)
+    newLvlCount = tonumber(newLvlCount)
+    if newLvlCount <= 0 or newLvlSize < 0.000001 then
+      redis.call('HDEL', lvlKey, sField, cField)
+    end
+    result[#result + 1] = 1
+  end
+end
+
+local seq = redis.call('INCR', seqKey)
+-- Prepend sequence ID to results
+table.insert(result, 1, seq)
+return result
+`;
+
 function priceToKey(price: number): string {
   return Math.round(price * PRICE_MULTIPLIER).toString();
 }
@@ -306,6 +391,113 @@ export class OrderbookService {
     return { sequenceId };
   }
 
+  /**
+   * Batch-fetch top N orders from one side of the book in 1 Redis round-trip.
+   * Used by batch-matching to replace per-fill getBestAsk/getBestBid calls.
+   * Cleans orphaned ZSET entries (missing hash) inline.
+   */
+  async getTopN(
+    marketId: string,
+    outcome: 'YES' | 'NO',
+    side: 'BID' | 'ASK',
+    n: number = 64,
+  ): Promise<OrderbookOrder[]> {
+    const timer = startTimer();
+    const obKey = RedisKeys.orderbook(marketId, outcome, side);
+
+    const result = await redis.eval(BATCH_GET_TOP_N_LUA, 1, obKey, n.toString()) as string[];
+    if (!result || result.length === 0) return [];
+
+    const orders: OrderbookOrder[] = [];
+    let i = 0;
+    while (i < result.length) {
+      const orderId = result[i++];
+      const _score = result[i++];   // score from ZSET (not needed — price is in hash)
+      const fieldCount = parseInt(result[i++]);
+
+      // Parse hash fields: fieldCount pairs of (key, value)
+      const data: Record<string, string> = {};
+      for (let f = 0; f < fieldCount; f++) {
+        const key = result[i++];
+        const val = result[i++];
+        data[key] = val;
+      }
+
+      if (!data.id) continue; // safety
+
+      orders.push({
+        id: data.id || orderId,
+        marketId: data.marketId,
+        userId: data.userId,
+        side: data.side as 'BID' | 'ASK',
+        outcome: data.outcome as 'YES' | 'NO',
+        price: parseFloat(data.price),
+        size: parseFloat(data.size),
+        remainingSize: parseFloat(data.remainingSize),
+        createdAt: parseInt(data.createdAt),
+        clientOrderId: data.clientOrderId ? parseInt(data.clientOrderId) : undefined,
+        signature: data.signature || undefined,
+        binaryMessage: data.binaryMessage || undefined,
+      });
+    }
+
+    redisMetrics.orderbookOperations.inc({ operation: 'getTopN' });
+    redisMetrics.orderbookOperationDuration.observe({ operation: 'getTopN' }, timer.elapsed());
+
+    return orders;
+  }
+
+  /**
+   * Batch-consume multiple orders in 1 Redis round-trip.
+   * Handles race conditions: if another instance consumed an order between
+   * getTopN() and batchConsume(), that order returns consumed=false.
+   *
+   * @param consumptions Array of {order, newRemainingSize} for each fill
+   * @returns sequenceId and consumed[] bitmap (true = successfully consumed)
+   */
+  async batchConsume(
+    marketId: string,
+    outcome: 'YES' | 'NO',
+    side: 'BID' | 'ASK',
+    consumptions: Array<{ order: OrderbookOrder; newRemainingSize: number }>,
+  ): Promise<{ sequenceId: number; consumed: boolean[] }> {
+    if (consumptions.length === 0) {
+      const seq = await this.getSequence(marketId);
+      return { sequenceId: seq, consumed: [] };
+    }
+
+    const timer = startTimer();
+    const obKey = RedisKeys.orderbook(marketId, outcome, side);
+    const lvlKey = levelsKey(marketId, outcome, side);
+    const seqKey = RedisKeys.sequence(marketId);
+
+    // Build ARGV: [count, orderId1, orderHashKey1, newRemaining1, priceKey1, ...]
+    const args: string[] = [consumptions.length.toString()];
+    for (const { order, newRemainingSize } of consumptions) {
+      args.push(
+        order.id,
+        `order:${order.id}`,
+        Math.max(0, newRemainingSize).toString(),
+        priceToKey(order.price),
+      );
+    }
+
+    const result = await redis.eval(
+      BATCH_CONSUME_LUA, 3,
+      obKey, lvlKey, seqKey,
+      ...args,
+    ) as number[];
+
+    // result = [sequenceId, consumed1, consumed2, ...]
+    const sequenceId = result[0];
+    const consumed = result.slice(1).map(v => v === 1);
+
+    redisMetrics.orderbookOperations.inc({ operation: 'batchConsume' });
+    redisMetrics.orderbookOperationDuration.observe({ operation: 'batchConsume' }, timer.elapsed());
+
+    return { sequenceId, consumed };
+  }
+
   // ───────────────────────── queries ──────────────────────────
 
   /**
@@ -426,6 +618,79 @@ export class OrderbookService {
     redisMetrics.orderbookOperationDuration.observe({ operation: 'snapshot' }, timer.elapsed());
 
     return { marketId, outcome, bids, asks, sequenceId };
+  }
+
+  /**
+   * Get composite YES snapshot that merges both YES and NO orderbooks.
+   *
+   * SINGLE ORDERBOOK MODEL:
+   * - NO BID @ p  → YES ASK @ (1-p)  (buying NO ≡ selling YES)
+   * - NO ASK @ p  → YES BID @ (1-p)  (selling NO ≡ buying YES)
+   *
+   * This ensures the frontend always receives a unified YES view
+   * regardless of whether orders were placed for YES or NO outcome.
+   */
+  async getCompositeSnapshot(marketId: string): Promise<OrderbookSnapshot> {
+    const [yesSnap, noSnap] = await Promise.all([
+      this.getSnapshot(marketId, 'YES'),
+      this.getSnapshot(marketId, 'NO'),
+    ]);
+
+    // If no NO orders, return YES snapshot directly (common case)
+    if (noSnap.bids.length === 0 && noSnap.asks.length === 0) {
+      return yesSnap;
+    }
+
+    // Merge NO into YES at complement prices
+    const compositeBids = this.mergeLevels(
+      yesSnap.bids,
+      noSnap.asks.map(l => ({
+        price: Math.round((1 - l.price) * 100) / 100,
+        size: l.size,
+        orderCount: l.orderCount,
+      }))
+    );
+
+    const compositeAsks = this.mergeLevels(
+      yesSnap.asks,
+      noSnap.bids.map(l => ({
+        price: Math.round((1 - l.price) * 100) / 100,
+        size: l.size,
+        orderCount: l.orderCount,
+      }))
+    );
+
+    // Sort: bids descending, asks ascending
+    compositeBids.sort((a, b) => b.price - a.price);
+    compositeAsks.sort((a, b) => a.price - b.price);
+
+    return {
+      marketId,
+      outcome: 'YES',
+      bids: compositeBids,
+      asks: compositeAsks,
+      sequenceId: Math.max(yesSnap.sequenceId, noSnap.sequenceId),
+    };
+  }
+
+  /**
+   * Merge two level arrays, aggregating size at matching prices.
+   */
+  private mergeLevels(a: OrderbookLevel[], b: OrderbookLevel[]): OrderbookLevel[] {
+    const priceMap = new Map<number, OrderbookLevel>();
+    for (const level of a) {
+      priceMap.set(level.price, { ...level });
+    }
+    for (const level of b) {
+      const existing = priceMap.get(level.price);
+      if (existing) {
+        existing.size += level.size;
+        existing.orderCount += level.orderCount;
+      } else {
+        priceMap.set(level.price, { ...level });
+      }
+    }
+    return Array.from(priceMap.values());
   }
 
   /**

@@ -217,4 +217,11 @@ pub enum DegenError {
 
     #[msg("Market has open interest - cannot close directly, use merkle settlement")]
     MarketHasOpenInterest,
+
+    // =========================================================================
+    // Compact Settlement V3 Errors (6140-6149)
+    // =========================================================================
+
+    #[msg("Invalid compact batch alignment - start_index must be multiple of subtree_size")]
+    InvalidCompactAlignment,
 }

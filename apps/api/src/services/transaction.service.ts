@@ -57,6 +57,8 @@ export interface MatchParams {
   yesMint?: string;         // YES token mint pubkey
   noMint?: string;          // NO token mint pubkey
   useV2?: boolean;          // Force V2 execution
+  // Relayer pool: child wallet as fee payer
+  feePayerKeypair?: import('@solana/web3.js').Keypair;
 }
 
 export interface SettlementParams {
@@ -83,6 +85,8 @@ export interface CloseParams {
   yesMint?: string;         // YES token mint pubkey
   noMint?: string;          // NO token mint pubkey
   useV2?: boolean;          // Force V2 execution
+  // Relayer pool: child wallet as fee payer
+  feePayerKeypair?: import('@solana/web3.js').Keypair;
 }
 
 // Leveraged match params - Lending Pool executes on behalf of user
@@ -187,6 +191,7 @@ class TransactionService {
             takerExpiryTs: params.takerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
             makerOrderPda: params.makerOrderPda,
             takerOrderPda: params.takerOrderPda,
+            feePayerKeypair: params.feePayerKeypair,
           });
         } else {
           // V1: Position PDAs
@@ -207,6 +212,7 @@ class TransactionService {
             // Order PDAs for user orders (enables trustless escrow)
             makerOrderPda: params.makerOrderPda,
             takerOrderPda: params.takerOrderPda,
+            feePayerKeypair: params.feePayerKeypair,
           });
         }
 
@@ -465,6 +471,7 @@ class TransactionService {
             price: params.price,
             matchSize: params.matchSize,
             takerFee: params.takerFee,
+            feePayerKeypair: params.feePayerKeypair,
           });
         } else {
           // V1: Position PDAs
@@ -476,6 +483,7 @@ class TransactionService {
             price: params.price,
             matchSize: params.matchSize,
             takerFee: params.takerFee,  // Tiered fee from fee.service.ts
+            feePayerKeypair: params.feePayerKeypair,
           });
         }
 
@@ -661,7 +669,8 @@ class TransactionService {
   private isPermanentError(error: Error): string | null {
     const message = error.message.toLowerCase();
 
-    if (message.includes('insufficient funds') || message.includes('insufficient balance')) {
+    if (message.includes('insufficient funds') || message.includes('insufficient balance')
+        || message.includes('"custom":1}')) {  // SPL Token error 0x1 = insufficient funds
       return 'INSUFFICIENT_FUNDS';
     }
     if (message.includes('insufficientshares') || message.includes('insufficient shares') || message.includes('0x178d')) {
@@ -673,7 +682,8 @@ class TransactionService {
     if (message.includes('position limit')) {
       return 'POSITION_LIMIT';
     }
-    if (message.includes('market closed') || message.includes('market not open')) {
+    if (message.includes('market closed') || message.includes('market not open')
+        || message.includes('marketclosing') || message.includes('market is closing') || message.includes('0x1777') || message.includes('"custom":6007')) {
       return 'MARKET_CLOSED';
     }
     if (message.includes('invalid signature')) {

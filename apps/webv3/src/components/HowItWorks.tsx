@@ -211,7 +211,7 @@ export default function HowItWorks({ onClose }: Props) {
             <SectionTitle>How Payouts Work</SectionTitle>
             <Card>
               <p style={{ fontSize: 18, color: 'rgba(238,238,238,0.66)', margin: '0 0 15px', lineHeight: 1.6 }}>
-                Each round is a <strong style={{ color: '#eee' }}>0TDE binary option</strong> — zero days to expiry. When a round starts, a strike price is set at the current BTC price.
+                Each round is a <strong style={{ color: '#eee' }}>0DTE binary option</strong> — zero days to expiry. When a round starts, a strike price is set at the current BTC price.
               </p>
               <div style={{ display: 'flex', gap: 15, marginBottom: 15 }}>
                 <div style={{

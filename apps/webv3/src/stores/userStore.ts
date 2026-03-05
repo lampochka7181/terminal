@@ -371,17 +371,17 @@ export const useUserStore = create<UserState>((set, get) => ({
     }
     delayedRefetchTimer = null;
 
-    // Immediate fetch for positions/balance
+    // Immediate fetch for positions/balance/transactions
     get().fetchAllImmediate();
 
-    // Poll for settlement data: first at 3s, then every 5s until new transactions appear
+    // Poll for settlement data: every 3s until new transactions appear
     const txCountBefore = get().transactions.length;
     let attempts = 0;
-    const maxAttempts = 6; // up to ~33s total
-    const poll = () => {
+    const maxAttempts = 4; // up to ~12s total
+    const poll = async () => {
       attempts++;
-      get().fetchTransactions();
-      get().fetchBalance();
+      await get().fetchTransactions();
+      await get().fetchBalance();
       if (get().transactions.length > txCountBefore || attempts >= maxAttempts) {
         if (delayedRefetchTimer) clearInterval(delayedRefetchTimer);
         delayedRefetchTimer = null;
@@ -389,8 +389,8 @@ export const useUserStore = create<UserState>((set, get) => ({
     };
     delayedRefetchTimer = setTimeout(() => {
       poll();
-      delayedRefetchTimer = setInterval(poll, 5000) as any;
-    }, 3000) as any;
+      delayedRefetchTimer = setInterval(poll, 3000) as any;
+    }, 1500) as any;
   },
 
   setPendingOrder: (order) => {
@@ -460,38 +460,72 @@ export const useUserStore = create<UserState>((set, get) => ({
 // Subscribe to user-specific WebSocket updates
 export function subscribeToUserUpdates(): () => void {
   const ws = getWebSocket();
-  
+  let settlementPollTimer: ReturnType<typeof setTimeout> | null = null;
+
   const unsubscribe = ws.onMessage((message) => {
-    if (message.channel !== 'user') return;
-    
-    console.log('[UserStore] WebSocket update received:', message);
-    const store = useUserStore.getState();
-    
-    if (message.event === 'fill') {
-      const fillMessage = message as UserFillUpdate;
-      store.handleFill(fillMessage.data);
-    } else if (message.event === 'settlement') {
-      const settlementMessage = message as UserSettlementUpdate;
-      store.handleSettlement(settlementMessage.data);
-    } else if (message.event === 'trade_failed') {
-      // On-chain match failed — position was reversed in DB, re-fetch everything
-      const failedMessage = message as UserTradeFailedUpdate;
-      console.warn('[UserStore] Trade failed on-chain, removing phantom position:', failedMessage.data);
-      // Immediately remove the phantom position for this market
-      if (failedMessage.data.marketAddress) {
-        store.removePosition(failedMessage.data.marketAddress);
+    // Handle user-specific events
+    if (message.channel === 'user') {
+      console.log('[UserStore] WebSocket update received:', message);
+      const store = useUserStore.getState();
+
+      if (message.event === 'fill') {
+        const fillMessage = message as UserFillUpdate;
+        store.handleFill(fillMessage.data);
+      } else if (message.event === 'settlement') {
+        const settlementMessage = message as UserSettlementUpdate;
+        store.handleSettlement(settlementMessage.data);
+      } else if (message.event === 'trade_failed') {
+        // On-chain match failed — position was reversed in DB, re-fetch everything
+        const failedMessage = message as UserTradeFailedUpdate;
+        console.warn('[UserStore] Trade failed on-chain, removing phantom position:', failedMessage.data);
+        // Immediately remove the phantom position for this market
+        if (failedMessage.data.marketAddress) {
+          store.removePosition(failedMessage.data.marketAddress);
+        }
+        // Re-fetch positions, transactions, and balance to sync with DB
+        store.fetchAllImmediate();
+      } else if (message.event === 'liquidation') {
+        // Position was liquidated - refresh positions to get updated state
+        const liquidationMessage = message as UserLiquidationUpdate;
+        console.log('[UserStore] Position liquidated, refreshing positions:', liquidationMessage.data);
+        store.fetchPositions('open').catch(err => console.error('[UserStore] Failed to refresh positions after liquidation:', err));
       }
-      // Re-fetch positions, transactions, and balance to sync with DB
-      store.fetchAllImmediate();
-    } else if (message.event === 'liquidation') {
-      // Position was liquidated - refresh positions to get updated state
-      const liquidationMessage = message as UserLiquidationUpdate;
-      console.log('[UserStore] Position liquidated, refreshing positions:', liquidationMessage.data);
-      store.fetchPositions('open').catch(err => console.error('[UserStore] Failed to refresh positions after liquidation:', err));
+      return;
+    }
+
+    // Handle market_resolved — if user has a position, poll for settlement
+    const m = message as any;
+    const isResolved = m.type === 'market_resolved' ||
+      (m.channel === 'market' && (m.event === 'resolved' || m.type === 'market_resolved'));
+
+    if (isResolved) {
+      const store = useUserStore.getState();
+      const hasPositionOrOrder = store.positions.length > 0 || store.orders.length > 0;
+      if (!hasPositionOrOrder) return;
+
+      console.log('[UserStore] Market resolved — polling for settlement + order cleanup');
+
+      // Poll positions + orders + transactions + balance at 2s, 5s, 8s after resolution
+      // Settlement typically completes ~3-5s after resolution
+      // Orders are cancelled on market close — poll to pick up CANCELLED status
+      if (settlementPollTimer) clearTimeout(settlementPollTimer);
+      const pollDelays = [2000, 5000, 8000];
+      pollDelays.forEach(delay => {
+        setTimeout(async () => {
+          const s = useUserStore.getState();
+          await s.fetchPositions();
+          await s.fetchOrders();
+          await s.fetchTransactions();
+          await s.fetchBalance();
+        }, delay);
+      });
     }
   });
 
-  return unsubscribe;
+  return () => {
+    unsubscribe();
+    if (settlementPollTimer) clearTimeout(settlementPollTimer);
+  };
 }
 
 

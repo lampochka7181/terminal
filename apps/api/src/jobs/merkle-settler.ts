@@ -6,7 +6,7 @@ import { positionService } from '../services/position.service.js';
 import { marketService } from '../services/market.service.js';
 import { anchorClient, getYesMintPda, getNoMintPda } from '../lib/anchor-client.js';
 import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
-import { buildMerkleTree, createSettlementLeaf, verifyMerkleProof, type SettlementLeaf, type MerkleTree } from '../lib/merkle-tree.js';
+import { buildMerkleTree, createSettlementLeaf, verifyMerkleProof, verifyCompactBridgeProof, type SettlementLeaf, type MerkleTree } from '../lib/merkle-tree.js';
 import { broadcastUserSettlement } from '../lib/broadcasts.js';
 import { onchainSubmitQueue } from '../queue/queues.js';
 import { tryAdvisoryLock, releaseAdvisoryLock } from '../lib/advisory-lock.js';
@@ -96,8 +96,9 @@ export async function merkleSettlerJob(): Promise<void> {
   for (const market of resolvedMarkets) {
     if (processingMarkets.has(market.id)) continue;
 
-    const hasTrades = parseFloat(market.totalVolume || '0') > 0;
-    if (!hasTrades) {
+    const hasDbVolume = parseFloat(market.totalVolume || '0') > 0;
+    const hasPreSeededState = settlingState.has(market.id);
+    if (!hasDbVolume && !hasPreSeededState) {
       // Zero-trade markets: skip merkle settlement, mark as SETTLED so market-closer
       // picks them up and closes on-chain accounts to recover rent (~0.009 SOL each)
       logger.info(`[MerkleSettler] Marking zero-trade market ${market.asset}-${market.timeframe} (${market.pubkey.slice(0, 8)}) as SETTLED for cleanup`);
@@ -105,17 +106,23 @@ export async function merkleSettlerJob(): Promise<void> {
       continue;
     }
 
-    // M-04: Acquire DB advisory lock (multi-instance safe)
-    const lockAcquired = await tryAdvisoryLock('settle', market.id);
-    if (!lockAcquired) continue; // Another instance is settling this market
+    // SYNCHRONOUS add — close the TOCTOU race window before any await.
+    // Previously, `add()` was after `await tryAdvisoryLock()`, allowing multiple
+    // concurrent calls to pass the `has()` check before any reached `add()`.
     processingMarkets.add(market.id);
     try {
-      await processMarketSettlement(market);
-    } catch (err: any) {
-      logger.error(`[MerkleSettler] Failed for market ${market.id} (${market.asset}-${market.timeframe}): ${err.message}`);
+      // M-04: Acquire DB advisory lock (multi-instance safe)
+      const lockAcquired = await tryAdvisoryLock('settle', market.id);
+      if (!lockAcquired) continue; // Another instance is settling this market (finally still runs)
+      try {
+        await processMarketSettlement(market);
+      } catch (err: any) {
+        logger.error(`[MerkleSettler] Failed for market ${market.id} (${market.asset}-${market.timeframe}): ${err.message}`);
+      } finally {
+        await releaseAdvisoryLock('settle', market.id);
+      }
     } finally {
       processingMarkets.delete(market.id);
-      await releaseAdvisoryLock('settle', market.id);
     }
   }
 }
@@ -205,26 +212,43 @@ export async function triggerMerkleSettlement(
   if (!config.useV2 || !anchorClient.isReady()) return;
   if (processingMarkets.has(marketId)) return;
 
-  const market = marketObj ?? (await db.select().from(markets).where(eq(markets.id, marketId)).limit(1))[0];
-  if (!market || market.status !== 'RESOLVED') return;
-  if (parseFloat(market.totalVolume || '0') <= 0) {
-    // Zero-trade market: mark as SETTLED for cleanup
-    logger.info(`[MerkleSettler] Marking zero-trade market ${market.asset}-${market.timeframe} (${market.pubkey.slice(0, 8)}) as SETTLED for cleanup`);
-    await marketService.markSettled(market.id);
-    return;
-  }
-
-  // M-04: Acquire DB advisory lock (multi-instance safe)
-  const lockAcquired = await tryAdvisoryLock('settle', marketId);
-  if (!lockAcquired) return;
+  // SYNCHRONOUS add — close the TOCTOU race window before any await.
+  // Previously, `add()` was after `await tryAdvisoryLock()`, allowing the
+  // worker completion callback + periodic merkleSettlerJob to both pass `has()`
+  // before either reached `add()`, causing duplicate settlement pipeline runs.
   processingMarkets.add(marketId);
+
   try {
-    await processMarketSettlement(market);
-  } catch (err: any) {
-    logger.error(`[MerkleSettler] Triggered settlement failed for ${marketId}: ${err.message}`);
+    // Always fetch fresh from DB for the totalVolume check — the passed marketObj
+    // may have stale totalVolume=0 from getById cache (30s TTL). This caused markets
+    // with actual trades to be incorrectly marked as "zero-trade" and skip settlement.
+    const market = (await db.select().from(markets).where(eq(markets.id, marketId)).limit(1))[0];
+    if (!market || market.status !== 'RESOLVED') return;
+
+    // Check both DB totalVolume AND pre-seeded settling state (defense-in-depth).
+    // The settling state is pre-built from positions during resolve, so it's reliable
+    // even if totalVolume hasn't been flushed to DB yet (write-behind race).
+    const hasDbVolume = parseFloat(market.totalVolume || '0') > 0;
+    const hasPreSeededState = settlingState.has(marketId);
+    if (!hasDbVolume && !hasPreSeededState) {
+      // Truly zero-trade market: mark as SETTLED for cleanup
+      logger.info(`[MerkleSettler] Marking zero-trade market ${market.asset}-${market.timeframe} (${market.pubkey.slice(0, 8)}) as SETTLED for cleanup`);
+      await marketService.markSettled(market.id);
+      return;
+    }
+
+    // M-04: Acquire DB advisory lock (multi-instance safe)
+    const lockAcquired = await tryAdvisoryLock('settle', marketId);
+    if (!lockAcquired) return;
+    try {
+      await processMarketSettlement(market);
+    } catch (err: any) {
+      logger.error(`[MerkleSettler] Triggered settlement failed for ${marketId}: ${err.message}`);
+    } finally {
+      await releaseAdvisoryLock('settle', marketId);
+    }
   } finally {
     processingMarkets.delete(marketId);
-    await releaseAdvisoryLock('settle', marketId);
   }
 }
 
@@ -304,86 +328,172 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
   }
 
   // Step 3: Create settlement_jobs and enqueue to BullMQ (parallel!)
-  const proofDepth = Math.ceil(Math.log2(Math.max(state.leaves.length, 2)));
-  const entrySize = 52 + proofDepth * 32;  // Borsh data per entry: pubkey(32) + amount(8) + index(8) + proof_len(4) + proofs
-  // Solana TX limit is 1232 bytes. Must account for TOTAL TX size, not just instruction data:
-  //   Fixed overhead (~400 bytes): signature(64), header(3), blockhash(32), 8 fixed account keys(256),
-  //     instruction framing, compact-u16 lengths, discriminator(8), vec_len(4)
-  //   Per entry (~80 bytes beyond instruction data): 2 account keys (recipient + ATA = 64 bytes),
-  //     createAssociatedTokenAccountIdempotent ix overhead (~16 bytes)
+  //
+  // V3 compact batching: instead of per-leaf full proofs, we group consecutive
+  // leaves into subtree-aligned batches with a single shared bridge proof.
+  // This saves ~4-8x TX space, allowing 8-16 settlements per TX vs 1-2 in V2.
+  //
+  // Fallback to V2 for tiny trees where compact batching doesn't help.
+
   const TX_LIMIT = 1232;
-  const FIXED_OVERHEAD = 400;
-  const PER_ENTRY_ACCOUNTS_OVERHEAD = 80;
-  const effectiveEntrySize = entrySize + PER_ENTRY_ACCOUNTS_OVERHEAD;
-  const batchSize = Math.min(15, Math.max(1, Math.floor((TX_LIMIT - FIXED_OVERHEAD) / effectiveEntrySize)));
-  const totalBatches = Math.ceil(state.leaves.length / batchSize);
-  state.totalBatches = totalBatches;
+  const FIXED_OVERHEAD = 425;  // sig + header + blockhash + 6 fixed accounts + ix framing + discriminator
+  const PER_ENTRY_OVERHEAD = 44;  // amount(8) + ATA account key(32) + createATA dedup(~4)
+
+  const treeDepth = Math.ceil(Math.log2(Math.max(state.leaves.length, 2)));
+  const paddedCount = state.tree.paddedSize;
+
+  /**
+   * Find optimal subtree size (largest power-of-2 that fits in TX).
+   * Returns 0 to signal V2 fallback when compact batching doesn't help.
+   */
+  function getOptimalSubtreeSize(depth: number): number {
+    for (const k of [16, 8, 4]) {
+      const bridgeDepth = depth - Math.log2(k);
+      if (bridgeDepth < 0) continue;
+      const txSize = FIXED_OVERHEAD + bridgeDepth * 32 + k * PER_ENTRY_OVERHEAD;
+      if (txSize <= TX_LIMIT - 52) return k; // 52-byte safety margin
+    }
+    return 0; // V2 fallback
+  }
+
+  const subtreeSize = getOptimalSubtreeSize(treeDepth);
+  const useV3 = subtreeSize > 0 && state.leaves.length > 2;
 
   if (!state.batchesCreated) {
-    logger.info(`[MerkleSettler] Creating ${totalBatches} settlement batches for parallel execution`);
+    if (useV3) {
+      // ── V3 Compact Batch Settlement ──
+      const totalSubtrees = paddedCount / subtreeSize;
+      let batchIdx = 0;
 
-    for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
-      const start = batchIdx * batchSize;
-      const end = Math.min(start + batchSize, state.leaves.length);
-      const batchLeaves = state.leaves.slice(start, end);
+      for (let i = 0; i < totalSubtrees; i++) {
+        const startIndex = i * subtreeSize;
+        const realCount = Math.min(subtreeSize, state.leaves.length - startIndex);
+        if (realCount <= 0) continue; // skip all-padding subtrees
 
-      const batchSettlements = batchLeaves.map((leaf, i) => {
-        const leafIndex = start + i;
-        const proof = state!.tree.getProof(leafIndex);
+        const batchLeaves = state.leaves.slice(startIndex, startIndex + realCount);
+        const bridgeProof = state.tree.getSubtreeBridgeProof(startIndex, subtreeSize);
 
-        const leafHash = createSettlementLeaf(leaf.recipient, leaf.amount);
-        if (!verifyMerkleProof(proof, state!.tree.root, leafHash, leafIndex)) {
-          throw new Error(`[MerkleSettler] Local proof verification failed for leaf ${leafIndex}`);
+        // Local verification before submission
+        const leafHashes = batchLeaves.map(l =>
+          createSettlementLeaf(l.recipient, l.amount)
+        );
+        if (!verifyCompactBridgeProof(leafHashes, bridgeProof, state.tree.root, startIndex, subtreeSize)) {
+          throw new Error(`[MerkleSettler] V3 local bridge proof verification failed for subtree at index ${startIndex}`);
         }
 
-        return {
-          recipient: leaf.recipient.toBase58(),
-          amount: leaf.amount.toString(),
-          index: leafIndex,
-          proof: proof.map(p => Buffer.from(p).toString('hex')),
-        };
-      });
+        // Insert settlement_job row
+        await db.execute(sql`
+          INSERT INTO settlement_jobs (market_id, batch_index, recipients, amounts, proofs, status)
+          VALUES (
+            ${marketId}::uuid,
+            ${batchIdx},
+            ${JSON.stringify(batchLeaves.map(l => l.recipient.toBase58()))}::jsonb,
+            ${JSON.stringify(batchLeaves.map(l => l.amount.toString()))}::jsonb,
+            ${JSON.stringify({ version: 'v3', startIndex, subtreeSize, bridgeProof: bridgeProof.map(p => Buffer.from(p).toString('hex')) })}::jsonb,
+            'PENDING'
+          )
+          ON CONFLICT (market_id, batch_index) DO NOTHING
+        `);
 
-      // Insert settlement_job row
-      await db.execute(sql`
-        INSERT INTO settlement_jobs (market_id, batch_index, recipients, amounts, proofs, status)
-        VALUES (
-          ${marketId}::uuid,
-          ${batchIdx},
-          ${JSON.stringify(batchSettlements.map(s => s.recipient))}::jsonb,
-          ${JSON.stringify(batchSettlements.map(s => s.amount))}::jsonb,
-          ${JSON.stringify(batchSettlements.map(s => ({ index: s.index, proof: s.proof })))}::jsonb,
-          'PENDING'
-        )
-        ON CONFLICT (market_id, batch_index) DO NOTHING
-      `);
+        // Enqueue as V3 batch-settle job
+        const jobId = `batch-settle-v3-${marketId}-${batchIdx}`;
+        await onchainSubmitQueue.add('batch-settle-v3', {
+          type: 'batch-settle-v3' as const,
+          idempotencyKey: jobId,
+          payload: {
+            marketPubkey,
+            bitmapChunkIndex: 0,
+            startIndex,
+            subtreeSize,
+            settlements: batchLeaves.map(l => ({
+              recipient: l.recipient.toBase58(),
+              amount: l.amount.toString(),
+            })),
+            bridgeProof: bridgeProof.map(p => Buffer.from(p).toString('hex')),
+            marketId,
+            batchIndex: batchIdx,
+          },
+        }, { jobId }).catch(err => {
+          logger.error(`[MerkleSettler] Failed to enqueue V3 batch ${batchIdx}: ${err.message}`);
+        });
 
-      // Enqueue to BullMQ for parallel execution
-      // NOTE: BullMQ serializes via JSON — keep BigInt as string, Buffer as hex.
-      // The worker converts them back before calling the on-chain instruction.
-      const jobId = `batch-settle-${marketId}-${batchIdx}`;
-      await onchainSubmitQueue.add('batch-settle', {
-        type: 'batch-settle' as const,
-        idempotencyKey: jobId,
-        payload: {
-          marketPubkey,
-          bitmapChunkIndex: 0,
-          settlements: batchSettlements.map(s => ({
-            recipient: s.recipient,
-            amount: s.amount,          // already a string from .toString() above
-            index: s.index,
-            proof: s.proof,            // already hex strings
-          })),
-          marketId,
-          batchIndex: batchIdx,
-        },
-      }, { jobId }).catch(err => {
-        logger.error(`[MerkleSettler] Failed to enqueue batch ${batchIdx}: ${err.message}`);
-      });
+        batchIdx++;
+      }
+
+      state.totalBatches = batchIdx;
+      state.batchesCreated = true;
+      logger.info(`[MerkleSettler] V3: ${batchIdx} compact batches (subtreeSize=${subtreeSize}) enqueued for ${state.leaves.length} settlements`);
+    } else {
+      // ── V2 Fallback (small trees) ──
+      const proofDepth = treeDepth;
+      const entrySize = 52 + proofDepth * 32;
+      const PER_ENTRY_ACCOUNTS_OVERHEAD = 80;
+      const effectiveEntrySize = entrySize + PER_ENTRY_ACCOUNTS_OVERHEAD;
+      const batchSize = Math.min(15, Math.max(1, Math.floor((TX_LIMIT - FIXED_OVERHEAD) / effectiveEntrySize)));
+      const totalBatches = Math.ceil(state.leaves.length / batchSize);
+      state.totalBatches = totalBatches;
+
+      logger.info(`[MerkleSettler] V2 fallback: ${totalBatches} batches (batchSize=${batchSize}) for ${state.leaves.length} settlements`);
+
+      for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+        const start = batchIdx * batchSize;
+        const end = Math.min(start + batchSize, state.leaves.length);
+        const batchLeaves = state.leaves.slice(start, end);
+
+        const batchSettlements = batchLeaves.map((leaf, i) => {
+          const leafIndex = start + i;
+          const proof = state!.tree.getProof(leafIndex);
+
+          const leafHash = createSettlementLeaf(leaf.recipient, leaf.amount);
+          if (!verifyMerkleProof(proof, state!.tree.root, leafHash, leafIndex)) {
+            throw new Error(`[MerkleSettler] Local proof verification failed for leaf ${leafIndex}`);
+          }
+
+          return {
+            recipient: leaf.recipient.toBase58(),
+            amount: leaf.amount.toString(),
+            index: leafIndex,
+            proof: proof.map(p => Buffer.from(p).toString('hex')),
+          };
+        });
+
+        await db.execute(sql`
+          INSERT INTO settlement_jobs (market_id, batch_index, recipients, amounts, proofs, status)
+          VALUES (
+            ${marketId}::uuid,
+            ${batchIdx},
+            ${JSON.stringify(batchSettlements.map(s => s.recipient))}::jsonb,
+            ${JSON.stringify(batchSettlements.map(s => s.amount))}::jsonb,
+            ${JSON.stringify(batchSettlements.map(s => ({ index: s.index, proof: s.proof })))}::jsonb,
+            'PENDING'
+          )
+          ON CONFLICT (market_id, batch_index) DO NOTHING
+        `);
+
+        const jobId = `batch-settle-${marketId}-${batchIdx}`;
+        await onchainSubmitQueue.add('batch-settle', {
+          type: 'batch-settle' as const,
+          idempotencyKey: jobId,
+          payload: {
+            marketPubkey,
+            bitmapChunkIndex: 0,
+            settlements: batchSettlements.map(s => ({
+              recipient: s.recipient,
+              amount: s.amount,
+              index: s.index,
+              proof: s.proof,
+            })),
+            marketId,
+            batchIndex: batchIdx,
+          },
+        }, { jobId }).catch(err => {
+          logger.error(`[MerkleSettler] Failed to enqueue batch ${batchIdx}: ${err.message}`);
+        });
+      }
+
+      state.batchesCreated = true;
+      logger.info(`[MerkleSettler] ${totalBatches} V2 settlement batches enqueued`);
     }
-
-    state.batchesCreated = true;
-    logger.info(`[MerkleSettler] ${totalBatches} settlement batches enqueued for parallel execution`);
   }
 
   // Step 4: Check if all batches are completed
@@ -436,9 +546,12 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
   `);
   state.batchSignatures = (completedBatches.rows || []).map((r: any) => r.tx_signature).filter(Boolean);
 
-  logger.info(`[MerkleSettler] All ${totalBatches} batches completed for ${marketId}`);
+  logger.info(`[MerkleSettler] All ${state.totalBatches} batches completed for ${marketId}`);
 
-  // Step 5: Burn remaining share tokens
+  // Step 5: Sync settlements to DB immediately (user-facing — don't wait for cleanup)
+  await syncSettlementToDb(market, state, outcome);
+
+  // Step 6: Burn remaining share tokens (cleanup — non-blocking for UX)
   const marketPk = new PublicKey(marketPubkey);
   const yesMint = getYesMintPda(marketPk);
   const noMint = getNoMintPda(marketPk);
@@ -481,7 +594,7 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
     logger.warn(`[MerkleSettler] Share burn step failed (non-fatal): ${err.message}`);
   }
 
-  // Step 6: Finalize market on-chain
+  // Step 8: Finalize market on-chain
   try {
     const sig = await anchorClient.finalizeMarketV2({
       marketPubkey,
@@ -500,9 +613,10 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
     }
   }
 
-  // Step 7: Verify on-chain state, then sync DB
+  // Step 9: Mark market settled + archived (after on-chain cleanup)
   await syncMarketStatusFromChain(marketId, marketPubkey, 'RESOLVED');
-  await syncSettlementToDb(market, state, outcome);
+  await marketService.markSettled(market.id);
+  await marketService.markArchived(market.id);
 
   // Cleanup
   settlingState.delete(marketId);
@@ -583,6 +697,17 @@ async function syncSettlementToDb(
   state: SettlingState,
   outcome: 'YES' | 'NO',
 ): Promise<void> {
+  // Defense-in-depth: if settlements already exist for this market, skip entirely.
+  // This guards against duplicate runs that bypassed the processingMarkets guard
+  // (e.g., TOCTOU race or advisory lock reentrance on the same DB connection).
+  const existingCheck = await db.execute(sql`
+    SELECT COUNT(*)::int AS cnt FROM settlements WHERE market_id = ${market.id}::uuid
+  `);
+  if (((existingCheck.rows?.[0] as any)?.cnt || 0) > 0) {
+    logger.warn(`[MerkleSettler] Settlements already exist for market ${market.id} — skipping duplicate sync`);
+    return;
+  }
+
   const lastSig = state.batchSignatures[state.batchSignatures.length - 1] || null;
   const allPositions = await positionService.getPositionsForSettlement(market.id);
 
@@ -634,8 +759,6 @@ async function syncSettlementToDb(
     });
   }
 
-  await marketService.markSettled(market.id);
-
   const totalPayout = state.leaves.reduce((sum, l) => sum + Number(l.amount) / 1_000_000, 0);
   logEvents.marketSettled({
     marketId: market.id,
@@ -644,6 +767,4 @@ async function syncSettlementToDb(
     positionsSettled: allPositions.length,
     totalPayout,
   });
-
-  await marketService.markArchived(market.id);
 }

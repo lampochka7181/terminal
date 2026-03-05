@@ -87,7 +87,7 @@ export async function drainAllQueues(): Promise<{ drained: Record<string, number
 // ──────────────────────── Job type definitions ──────────────────
 
 export interface OnchainSubmitJobData {
-  type: 'match' | 'close' | 'settle' | 'batch-settle';
+  type: 'match' | 'close' | 'settle' | 'batch-settle' | 'batch-settle-v3';
   idempotencyKey: string;
   payload: Record<string, any>;
 }

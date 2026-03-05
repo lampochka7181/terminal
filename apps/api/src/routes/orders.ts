@@ -211,8 +211,9 @@ export async function orderRoutes(app: FastifyInstance) {
       });
     }
 
-    // Reject orders too close to market expiry — they'll likely fail on-chain with MarketNotOpen
-    const EXPIRY_BUFFER_MS = 3_000; // 3 seconds
+    // Reject orders too close to market expiry — on-chain has 2s TRADING_CLOSE_BUFFER,
+    // plus ~1-2s for TX submission + confirmation latency. Use 5s to be safe.
+    const EXPIRY_BUFFER_MS = 5_000; // 5 seconds (on-chain buffer is 2s)
     if (market.expiryAt) {
       const expiryMs = new Date(market.expiryAt).getTime();
       const remainingMs = expiryMs - Date.now();
@@ -788,12 +789,13 @@ export async function orderRoutes(app: FastifyInstance) {
       }
       
       // Build position data for immediate frontend update
-      // totalCost = dollarAmount (what user selected), fee baked into PnL as initial loss
+      // totalCost = pure collateral (notional) spent — fees are separate.
+      // This ensures avgEntryPrice = fill price and SIZE displays correctly.
       let positionData = null;
       if (result.totalContracts > 0) {
         const yesShares = outcomeUpper === 'YES' ? result.totalContracts : 0;
         const noShares = outcomeUpper === 'NO' ? result.totalContracts : 0;
-        const totalCost = result.dollarAmount;
+        const totalCost = result.totalSpent;
         const currentPrice = outcomeUpper === 'YES' 
           ? parseFloat(market.yesPrice || '0.50')
           : parseFloat(market.noPrice || '0.50');
@@ -830,10 +832,14 @@ export async function orderRoutes(app: FastifyInstance) {
       
       return {
         orderId: result.orderId,
-        status: result.totalContracts > 0 ? (result.unfilledDollars > 0.01 ? 'partial' : 'filled') : 'cancelled',
+        restingOrderId: result.restingOrderId,
+        status: result.totalContracts > 0 ? 'filled' : (result.restingOrderId ? 'resting' : 'cancelled'),
         fills: result.fills.length,
         filledSize: result.totalContracts,
         avgPrice: result.avgPrice,
+        totalSpent: result.totalSpent,
+        dollarAmount: result.dollarAmount,
+        unfilledDollars: result.unfilledDollars,
         createdAt: Date.now(),
         leverage: isLeveraged ? leverage : undefined,
         marginAccountId: marginAccountId || undefined,

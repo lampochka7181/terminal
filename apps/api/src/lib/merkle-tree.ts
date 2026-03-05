@@ -67,8 +67,22 @@ export interface SettlementLeaf {
 export interface MerkleTree {
   root: Uint8Array;
   leafCount: number;
+  /** Total padded size of the tree (next power of 2 >= leafCount). */
+  paddedSize: number;
   /** Get the proof (array of sibling hashes) for leaf at the given index. */
   getProof(index: number): Uint8Array[];
+  /**
+   * Get a bridge proof from a subtree root to the global root.
+   *
+   * Used by V3 compact batch settlement. Instead of per-leaf proofs, a batch
+   * of consecutive leaves shares one bridge proof that connects their subtree
+   * root to the global merkle root.
+   *
+   * @param startIndex - First leaf index of the subtree (must be aligned to subtreeSize)
+   * @param subtreeSize - Size of the subtree (must be a power of 2)
+   * @returns Array of sibling hashes from subtree level up to the root
+   */
+  getSubtreeBridgeProof(startIndex: number, subtreeSize: number): Uint8Array[];
 }
 
 /**
@@ -114,6 +128,7 @@ export function buildMerkleTree(leaves: SettlementLeaf[]): MerkleTree {
   return {
     root: current[0],
     leafCount: realCount,
+    paddedSize: n,
     getProof(index: number): Uint8Array[] {
       if (index < 0 || index >= realCount) {
         throw new Error(`Leaf index ${index} out of range [0, ${realCount})`);
@@ -121,6 +136,30 @@ export function buildMerkleTree(leaves: SettlementLeaf[]): MerkleTree {
       const proof: Uint8Array[] = [];
       let idx = index;
       for (let level = 0; level < levels.length - 1; level++) {
+        const sibling = idx % 2 === 0 ? idx + 1 : idx - 1;
+        proof.push(levels[level][sibling]);
+        idx = Math.floor(idx / 2);
+      }
+      return proof;
+    },
+    getSubtreeBridgeProof(startIndex: number, subtreeSize: number): Uint8Array[] {
+      // subtreeDepth = log2(subtreeSize)
+      // The subtree root lives at levels[subtreeDepth][startIndex / subtreeSize]
+      // Bridge proof = siblings from that level up to the global root
+      if (subtreeSize <= 0 || (subtreeSize & (subtreeSize - 1)) !== 0) {
+        throw new Error(`subtreeSize must be a power of 2, got ${subtreeSize}`);
+      }
+      if (startIndex % subtreeSize !== 0) {
+        throw new Error(`startIndex ${startIndex} must be aligned to subtreeSize ${subtreeSize}`);
+      }
+      const subtreeDepth = Math.log2(subtreeSize);
+      if (subtreeDepth >= levels.length) {
+        throw new Error(`subtreeDepth ${subtreeDepth} exceeds tree depth ${levels.length - 1}`);
+      }
+
+      const proof: Uint8Array[] = [];
+      let idx = startIndex / subtreeSize;
+      for (let level = subtreeDepth; level < levels.length - 1; level++) {
         const sibling = idx % 2 === 0 ? idx + 1 : idx - 1;
         proof.push(levels[level][sibling]);
         idx = Math.floor(idx / 2);
@@ -153,6 +192,50 @@ export function verifyMerkleProof(
   }
 
   return compareBytes(computedHash, root) === 0;
+}
+
+/**
+ * Verify a compact bridge proof (V3).
+ *
+ * Reconstructs the subtree root from leaf hashes, then verifies the bridge
+ * proof against the global root. Mirrors on-chain batch_settle_v3 logic.
+ *
+ * @param leafHashes - Array of leaf hashes (real entries, will be padded)
+ * @param bridgeProof - Sibling hashes from subtree root to global root
+ * @param globalRoot - Expected global merkle root
+ * @param startIndex - First leaf index in the global tree
+ * @param subtreeSize - Power-of-2 subtree size
+ */
+export function verifyCompactBridgeProof(
+  leafHashes: Uint8Array[],
+  bridgeProof: Uint8Array[],
+  globalRoot: Uint8Array,
+  startIndex: number,
+  subtreeSize: number,
+): boolean {
+  if (leafHashes.length > subtreeSize) return false;
+
+  // Pad with empty leaf hash
+  const emptyLeaf = keccak_256(new Uint8Array(40));
+  const padded = [...leafHashes];
+  while (padded.length < subtreeSize) {
+    padded.push(emptyLeaf);
+  }
+
+  // Build subtree root bottom-up
+  let current = padded;
+  while (current.length > 1) {
+    const next: Uint8Array[] = [];
+    for (let i = 0; i < current.length; i += 2) {
+      next.push(hashPair(current[i], current[i + 1]));
+    }
+    current = next;
+  }
+  const subtreeRoot = current[0];
+
+  // Verify bridge proof
+  const subtreeIndex = startIndex / subtreeSize;
+  return verifyMerkleProof(bridgeProof, globalRoot, subtreeRoot, subtreeIndex);
 }
 
 function nextPowerOf2(n: number): number {

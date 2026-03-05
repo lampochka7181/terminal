@@ -154,13 +154,8 @@ pub fn execute_close_v2(
         .checked_add(SHARE_MULTIPLIER - 1).ok_or(DegenError::MathOverflow)?
         .checked_div(SHARE_MULTIPLIER).ok_or(DegenError::DivisionByZero)?;
 
-    // Validate fee (minimum and maximum bounds)
+    // Validate minimum fee (covers relayer gas costs)
     require!(args.taker_fee >= MIN_TAKER_FEE, DegenError::FeeTooLow);
-    // Cap fee at 5% of the transfer amount to prevent fee extraction attacks
-    let max_fee = transfer_amount
-        .checked_mul(5).ok_or(DegenError::MathOverflow)?
-        .checked_div(100).ok_or(DegenError::DivisionByZero)?;
-    require!(args.taker_fee <= max_fee.max(MIN_TAKER_FEE), DegenError::FeeTooHigh);
 
     let fee = args.taker_fee;
     let seller_receives = transfer_amount.saturating_sub(fee);

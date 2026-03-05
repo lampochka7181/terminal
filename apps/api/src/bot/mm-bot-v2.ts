@@ -1511,25 +1511,37 @@ function generateQuotes(
       if (config.baseSize >= 100000 && bidPrice < 0.01) {
         bidPrice = 0.01 + i * 0.005; // Stack bids at floor prices in perf mode
       }
-      const bidSize = calculateDynamicSize(fairValueYes, timeRemainingPct, yesPosition, 'bid', 'YES', config);
-      
-      if (bidPrice >= 0.01 && bidPrice <= 0.98) {
+      let bidSize = calculateDynamicSize(fairValueYes, timeRemainingPct, yesPosition, 'bid', 'YES', config);
+      const roundedBidPrice = Math.round(bidPrice * 100) / 100;
+
+      // Enforce $1 minimum notional: bump size up if needed
+      if (roundedBidPrice > 0 && bidSize * roundedBidPrice < 1.0) {
+        bidSize = Math.ceil(1.0 / roundedBidPrice);
+      }
+
+      if (roundedBidPrice >= 0.01 && roundedBidPrice <= 0.98) {
         yesBids.push({
-          price: Math.round(bidPrice * 100) / 100,
+          price: roundedBidPrice,
           size: bidSize,
         });
       }
     }
-    
+
     // YES ask (we sell YES / user buys YES / user sells NO)
     // When user sells NO @ (1-ask), they match against this YES ask
     if (shouldQuoteSide(fairValueYes, timeRemainingPct, 'ask', 'YES', config)) {
       const askPrice = fairValueYes + halfSpread + levelOffset - skew;
-      const askSize = calculateDynamicSize(fairValueYes, timeRemainingPct, -noPosition, 'ask', 'YES', config);
-      
-      if (askPrice >= 0.02 && askPrice <= 0.99) {
+      let askSize = calculateDynamicSize(fairValueYes, timeRemainingPct, -noPosition, 'ask', 'YES', config);
+      const roundedAskPrice = Math.round(askPrice * 100) / 100;
+
+      // Enforce $1 minimum notional: bump size up if needed
+      if (roundedAskPrice > 0 && askSize * roundedAskPrice < 1.0) {
+        askSize = Math.ceil(1.0 / roundedAskPrice);
+      }
+
+      if (roundedAskPrice >= 0.02 && roundedAskPrice <= 0.99) {
         yesAsks.push({
-          price: Math.round(askPrice * 100) / 100,
+          price: roundedAskPrice,
           size: askSize,
         });
       }
@@ -2464,18 +2476,16 @@ class MarketMakerBotV2 {
     // 4. Broadcast orderbook updates - only YES orderbook is real
     // Frontend derives NO prices as complements (1 - YES price)
     try {
-      const yesSnapshot = await orderbookService.getSnapshot(marketId, 'YES');
-      
-      // Broadcast YES orderbook (the only real orderbook)
+      // SINGLE ORDERBOOK MODEL: Composite YES view merges any user NO orders
+      const compositeSnapshot = await orderbookService.getCompositeSnapshot(marketId);
+
       broadcastOrderbookUpdate(
         state.pubkey,
-        yesSnapshot.bids.map(l => [l.price, l.size] as [number, number]),
-        yesSnapshot.asks.map(l => [l.price, l.size] as [number, number]),
-        yesSnapshot.sequenceId,
+        compositeSnapshot.bids.map(l => [l.price, l.size] as [number, number]),
+        compositeSnapshot.asks.map(l => [l.price, l.size] as [number, number]),
+        compositeSnapshot.sequenceId,
         'YES'
       );
-      
-      // NO orderbook broadcast removed - frontend derives from YES
     } catch {}
   }
 
@@ -2498,9 +2508,13 @@ class MarketMakerBotV2 {
       return;
     }
     
-    // Validate size
+    // Validate size (contracts) and notional ($)
     if (size < this.config.minSize) {
       return;
+    }
+    const notional = price * size;
+    if (notional < 1.0) {
+      return; // Enforce $1 minimum notional per MM quote
     }
     
     try {

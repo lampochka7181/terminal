@@ -317,10 +317,13 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
       }
       // Note: If order was cancelled (status !== 'filled'), don't remove position - it still exists
       
-      // Background refresh for balance and transaction history
+      // Background refresh for balance, orders, and transaction history
       setTimeout(() => {
         useUserStore.getState().fetchBalance();
       }, 100);
+      setTimeout(() => {
+        useUserStore.getState().fetchOrders();
+      }, 500);
       setTimeout(() => {
         useUserStore.getState().fetchTransactions();
       }, 2000);
@@ -462,7 +465,7 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
           return false;
         }
 
-        const message = `Cancel order: ${orderId}`;
+        const message = `cancel:${orderId}`;
         const messageBytes = new TextEncoder().encode(message);
         const signatureBytes = await signMessage(messageBytes);
         const bs58 = await import('bs58');

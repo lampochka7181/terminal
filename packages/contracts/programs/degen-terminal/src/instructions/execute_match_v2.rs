@@ -248,13 +248,8 @@ pub fn execute_match_v2(
     let is_maker_yes_buyer = (maker_side == Side::Bid && outcome == Outcome::Yes) ||
                              (maker_side == Side::Ask && outcome == Outcome::No);
 
-    // Validate fee (minimum and maximum bounds)
+    // Validate minimum fee (covers relayer gas costs)
     require!(taker_fee >= MIN_TAKER_FEE, DegenError::FeeTooLow);
-    // Cap fee at 5% of the taker's cost to prevent fee extraction attacks
-    let max_fee = no_cost.max(yes_cost)
-        .checked_mul(5).ok_or(DegenError::MathOverflow)?
-        .checked_div(100).ok_or(DegenError::DivisionByZero)?;
-    require!(taker_fee <= max_fee.max(MIN_TAKER_FEE), DegenError::FeeTooHigh);
 
     // Validate match_size doesn't exceed order remaining size (prevent overfill)
     if let Some(ref order) = ctx.accounts.maker_order {

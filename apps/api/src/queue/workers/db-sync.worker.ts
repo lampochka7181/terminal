@@ -211,7 +211,9 @@ async function processJob(job: Job<DbSyncJobData>): Promise<void> {
     updateData.confirmedAt = new Date();
   } else if (status === 'FAILED') {
     updateData.txSignature = null;
-    // Note: errorCode available in job.data but no DB column for it yet
+    if (errorCode) {
+      updateData.errorCode = errorCode;
+    }
   }
 
   try {

@@ -507,6 +507,10 @@ export class MarketService {
         totalTrades: sql`${markets.totalTrades} + 1`,
       })
       .where(eq(markets.id, id));
+
+    // Invalidate cache so settlement doesn't see stale totalVolume=0
+    // (30s cache caused merkle settler to skip markets as "zero-trade")
+    this.getByIdCache.delete(id);
   }
 
   /**
