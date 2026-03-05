@@ -36,8 +36,8 @@ import { writeBehindService } from './services/write-behind.service.js';
 // Price Feed
 import { priceFeedService } from './services/price-feed.service.js';
 
-// Market Maker Bot V2
-import { mmBotV2 } from './bot/mm-bot-v2.js';
+// Market Maker Bot
+import { mmBotV2 } from './bot/mm-bot.js';
 
 // Anchor Client (for config endpoint)
 import { anchorClient } from './lib/anchor-client.js';

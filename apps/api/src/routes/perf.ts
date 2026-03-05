@@ -16,7 +16,7 @@ import { marketService } from '../services/market.service.js';
 import { userService } from '../services/user.service.js';
 import { positionService } from '../services/position.service.js';
 import { orderbookService } from '../services/orderbook.service.js';
-import { mmBotV2 } from '../bot/mm-bot-v2.js';
+import { mmBotV2 } from '../bot/mm-bot.js';
 import { stopKeeperJobs } from '../jobs/index.js';
 import { logger } from '../lib/logger.js';
 import { config } from '../config.js';

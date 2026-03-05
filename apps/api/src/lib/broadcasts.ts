@@ -1,6 +1,6 @@
 import { logger } from './logger.js';
 import { wsMetrics, startTimer } from '../metrics/index.js';
-import { mmBotV2 } from '../bot/mm-bot-v2.js';
+import { mmBotV2 } from '../bot/mm-bot.js';
 
 /**
  * Broadcast Manager (v2 — reverse-indexed, batched, with delta support)

@@ -12,7 +12,7 @@ import { logger, tradeLogger, orderLogger, logEvents } from '../lib/logger.js';
 import { broadcastOrderbookUpdate, broadcastTrade, broadcastGlobalTrade, broadcastUserFill } from '../lib/broadcasts.js';
 import { config } from '../config.js';
 import { onchainSubmitQueue } from '../queue/queues.js';
-import { mmBotV2 } from '../bot/mm-bot-v2.js';
+import { mmBotV2 } from '../bot/mm-bot.js';
 import { lendingService } from './lending.service.js';
 import { marginService } from './margin.service.js';
 import { writeBehindService } from './write-behind.service.js';
@@ -1159,10 +1159,13 @@ export class MatchingService {
       }
 
       // Update taker position for each outcome
-      // Use pure notional (no fees) so avgEntryPrice = fill price
+      // Include takerFee in cost basis so SIZE shows full spend and PnL accounts for fees
       for (const [outcome, shares] of outcomeShares) {
         const outcomeFills = result.fills.filter(f => f.outcome === outcome);
-        const cost = outcomeFills.reduce((sum, f) => sum + f.price * f.size, 0);
+        const cost = outcomeFills.reduce((sum, f) => {
+          const notional = f.price * f.size;
+          return sum + (takerIsBuy ? notional + f.takerFee : notional - f.takerFee);
+        }, 0);
 
         await positionService.updateAfterTrade(
           order.userId,
@@ -2707,9 +2710,9 @@ export class MatchingService {
       const current = takerOutcomes.get(fill.outcome) || { shares: 0, cost: 0 };
       const notional = fill.price * fill.size;
       current.shares += fill.size;
-      // Use pure notional (no takerFee) so avgEntryPrice = fill price.
-      // Fees are charged separately from position cost basis.
-      current.cost += notional;
+      // Include takerFee in cost basis so SIZE shows full spend and PnL accounts for fees.
+      // Buy: cost = notional + fee (total spent). Sell: cost = notional - fee (net proceeds).
+      current.cost += takerIsBuy ? notional + fill.takerFee : notional - fill.takerFee;
       takerOutcomes.set(fill.outcome, current);
     }
     

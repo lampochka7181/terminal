@@ -5,7 +5,7 @@ import { marketService } from '../services/market.service.js';
 import { transactionService } from '../services/transaction.service.js';
 import { userService } from '../services/user.service.js';
 import { lendingService } from '../services/lending.service.js';
-import { mmBotV2 } from '../bot/mm-bot-v2.js';
+import { mmBotV2 } from '../bot/mm-bot.js';
 import { logger, positionLogger, marketLogger, logEvents } from '../lib/logger.js';
 import { broadcastUserSettlement } from '../lib/broadcasts.js';
 import { anchorClient } from '../lib/anchor-client.js';
