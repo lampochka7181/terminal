@@ -7,7 +7,7 @@
  * 2. Session key signing - ephemeral key signs orders (no popup, instant)
  */
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { useWallet, useConnection } from '@solana/wallet-adapter-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useUserStore } from '@/stores/userStore';
@@ -70,19 +70,29 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
   const [isCancelling, setIsCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastOrder, setLastOrder] = useState<OrderResult | null>(null);
+  const placingRef = useRef(false); // Ref guard: prevents concurrent submissions even if React hasn't re-rendered
 
   /**
    * Place a new order
    * Uses session key if available (no popup), otherwise wallet signing (popup)
    */
   const placeOrder = useCallback(async (params: PlaceOrderParams): Promise<OrderResult | null> => {
+    // Ref guard: block concurrent submissions (React state may not have re-rendered yet)
+    if (placingRef.current) {
+      console.warn('[ORDER] Blocked concurrent order submission');
+      return null;
+    }
+    placingRef.current = true;
+
     if (!connected || !publicKey) {
       setError('Please connect your wallet');
+      placingRef.current = false;
       return null;
     }
 
     if (!signTransaction) {
       setError('Wallet does not support transaction signing');
+      placingRef.current = false;
       return null;
     }
 
@@ -90,18 +100,21 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
     const { isAuthenticated: authed, token: authToken } = useAuthStore.getState();
     if (!authed || !authToken) {
       setError('Please sign in to place orders');
+      placingRef.current = false;
       return null;
     }
 
     const priceValidation = validatePrice(params.price);
     if (!priceValidation.valid) {
       setError(priceValidation.error || 'Invalid price');
+      placingRef.current = false;
       return null;
     }
 
     const sizeValidation = validateSize(params.size);
     if (!sizeValidation.valid) {
       setError(sizeValidation.error || 'Invalid size');
+      placingRef.current = false;
       return null;
     }
     
@@ -377,6 +390,7 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         if (err.message.includes('User rejected') || err.message.includes('rejected')) {
           console.log('[Order] User rejected transaction');
           setIsPlacing(false);
+          placingRef.current = false;
           return null;
         } else if (err.message.includes('insufficient')) {
           errorMessage = 'Insufficient SOL for transaction fee';
@@ -410,6 +424,7 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
 
     } finally {
       setIsPlacing(false);
+      placingRef.current = false;
     }
   }, [connected, publicKey, signTransaction, signMessage, sessionSigner]);
 

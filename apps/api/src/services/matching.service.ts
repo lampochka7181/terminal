@@ -1958,6 +1958,15 @@ export class MatchingService {
     this.delegationCache.delete(userId);
   }
 
+  /** Deduct spent amount from cached delegation/balance (prevents double-spend on rapid orders) */
+  deductFromDelegationCache(userId: string, amount: number): void {
+    const cached = this.delegationCache.get(userId);
+    if (cached) {
+      cached.delegatedAmount = Math.max(0, cached.delegatedAmount - amount);
+      cached.walletBalance = Math.max(0, cached.walletBalance - amount);
+    }
+  }
+
   /**
    * Check if a user has approved the relayer to spend USDC
    * and if the delegated amount AND actual USDC balance are sufficient.

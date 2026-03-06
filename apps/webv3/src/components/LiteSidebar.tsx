@@ -254,7 +254,7 @@ export default function LiteSidebar() {
   return (
     <>
       <div style={{
-        width: 540, minWidth: 540, background: '#1e1e1e', borderRadius: 17,
+        width: 'var(--sidebar-width)', minWidth: 'var(--sidebar-width)', background: '#1e1e1e', borderRadius: 17,
         display: 'flex', flexDirection: 'column', overflow: 'hidden', height: '100%',
       }}>
         {/* Balance */}

@@ -238,13 +238,13 @@ export async function orderRoutes(app: FastifyInstance) {
     // 1. SELL order logic
     if (isMarketOrder && isSellOrder) {
       // Delegation check for sell orders (amount=0 since selling shares, not spending USDC)
-      if (!isSessionOrder && !isAgent) {
+      if (!isAgent) {
         const delCheck = await matchingService.checkDelegation(userId, 0);
         if (!delCheck.isApproved) {
           return reply.code(400).send({ error: { code: 'DELEGATION_REQUIRED', message: delCheck.error } });
         }
       } else {
-        logger.debug(`[Orders] ${isAgent ? 'Agent' : 'Session'} order — using cached delegation for sell`);
+        logger.debug(`[Orders] Agent order — using cached delegation for sell`);
       }
 
       // Check if this position has a margin account (leveraged position)
@@ -622,9 +622,13 @@ export async function orderRoutes(app: FastifyInstance) {
       // Agent orders: delegation managed by MCP server / agent setup flow
       logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Agent order — skipping delegation check`);
     } else {
-      // Session orders: skip full on-chain check for speed, but verify session is still valid
-      // The session service already validates expiry during signature verification above
-      logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Session order — using cached delegation status`);
+      // Session orders: use cached delegation check (fast) instead of skipping entirely.
+      // This prevents double-spend when user spam-clicks before on-chain settles.
+      const delCheck = await matchingService.checkDelegation(userId, requiredAmount);
+      logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Session order — delegation check (cached)`);
+      if (!delCheck.isApproved || delCheck.error) {
+        return reply.code(400).send({ error: { code: 'DELEGATION_INSUFFICIENT', message: delCheck.error } });
+      }
     }
 
     if (data.type.toUpperCase() === 'LIMIT') {
@@ -650,7 +654,12 @@ export async function orderRoutes(app: FastifyInstance) {
         userId, wallet, marketId: market.id, asset: market.asset, timeframe: market.timeframe,
         side: 'BID', outcome: outcomeUpper, price: data.price, size: data.size, orderType: 'LIMIT',
       });
-      
+
+      // Deduct spent amount from delegation cache to prevent double-spend on rapid orders
+      if (result.filledSize > 0) {
+        matchingService.deductFromDelegationCache(userId, requiredAmount);
+      }
+
       // Create margin account if leveraged and order filled
       let marginAccountId: string | null = null;
       if (isLeveraged && result.filledSize > 0) {
@@ -752,7 +761,12 @@ export async function orderRoutes(app: FastifyInstance) {
       });
 
       logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Matching complete (${Date.now()-matchStart}ms), ${result.fills.length} fills`);
-      
+
+      // Deduct spent amount from delegation cache to prevent double-spend on rapid orders
+      if (result.totalContracts > 0) {
+        matchingService.deductFromDelegationCache(userId, requiredAmount);
+      }
+
       logEvents.orderPlaced({
         orderId: result.orderId,
         userId, wallet, marketId: market.id, asset: market.asset, timeframe: market.timeframe,
