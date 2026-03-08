@@ -144,35 +144,32 @@ async function main() {
   });
 
   // Rate Limiting
-  // 300/minute for regular users, 600/minute for agents (configurable)
+  // Dev: 1000/minute, Prod: 300/minute for regular users, agents get configurable higher limits
+  const isDev = process.env.NODE_ENV !== 'production';
   await app.register(rateLimit, {
     global: true,
     max: (request, key) => {
       if (config.perfTestMode) return 10000;
-      // Agents get higher rate limits
       const user = request.user as { sub?: string; isAgent?: boolean } | undefined;
       if (user?.isAgent) return config.agent.rateLimitPerMinute;
-      return 300;
+      return isDev ? 1000 : 300;
     },
     timeWindow: '1 minute',
     keyGenerator: (request) => {
-      // Use user ID for authenticated requests, IP for anonymous
-      // Agents get their own bucket prefix for separate tracking
       const user = request.user as { sub?: string; isAgent?: boolean } | undefined;
       if (user?.isAgent) return `agent:${user.sub}`;
       return user?.sub || request.ip;
     },
-    errorResponseBuilder: (request, context) => ({
-      error: {
-        code: 'RATE_LIMITED',
-        message: `Too many requests. Please slow down.`,
-        details: {
-          limit: context.max,
-          remaining: context.remaining,
-          resetAt: context.after,
-        },
-      },
-    }),
+    errorResponseBuilder: (_request, context) => {
+      const err = new Error('Too many requests. Please slow down.') as Error & { statusCode: number };
+      err.statusCode = 429;
+      (err as any).rateLimitDetails = {
+        limit: context.max,
+        remaining: context.remaining,
+        resetAt: context.after,
+      };
+      return err;
+    },
   });
 
   // WebSocket
@@ -414,6 +411,22 @@ async function main() {
     };
   });
 
+  // Waitlist signup (public, no auth required)
+  app.post('/waitlist', async (request, reply) => {
+    const { email } = request.body as { email?: string };
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return reply.code(400).send({ error: { code: 'INVALID_EMAIL', message: 'Please provide a valid email address.' } });
+    }
+    try {
+      const { db, waitlist } = await import('./db/index.js');
+      await db.insert(waitlist).values({ email: email.toLowerCase().trim() }).onConflictDoNothing();
+      return { success: true };
+    } catch (err: any) {
+      logger.error({ err }, 'Waitlist signup failed');
+      return reply.code(500).send({ error: { code: 'INTERNAL', message: 'Failed to join waitlist.' } });
+    }
+  });
+
   // WebSocket endpoint
   app.register(async function (fastify) {
     fastify.get('/ws', { websocket: true }, wsHandler);
@@ -425,28 +438,15 @@ async function main() {
 
   // Global error handler
   app.setErrorHandler((error, request, reply) => {
-    // Handle rate limit errors - @fastify/rate-limit uses statusCode 429
-    // Check multiple ways since error structure can vary
-    const hasRateLimitStatus = error.statusCode === 429;
-    const hasRateLimitCode = (error as any)?.error?.code === 'RATE_LIMITED';
-    const hasRateLimitMessage = error.message?.includes('Rate limit') || 
-      error.message?.includes('Too many requests');
-    
-    const isRateLimitError = hasRateLimitStatus || hasRateLimitCode || hasRateLimitMessage;
-    
-    if (isRateLimitError) {
-      // Return proper 429 with the rate limit response body
-      // The errorResponseBuilder output is spread into the error object
-      const rateLimitBody = (error as any).error 
-        ? { error: (error as any).error }
-        : {
-            error: {
-              code: 'RATE_LIMITED',
-              message: 'Too many requests. Please slow down.',
-              details: { limit: 100, resetAt: '1 minute' }
-            }
-          };
-      return reply.code(429).send(rateLimitBody);
+    if (error.statusCode === 429) {
+      const details = (error as any).rateLimitDetails || { limit: 300, resetAt: '1 minute' };
+      return reply.code(429).send({
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests. Please slow down.',
+          details,
+        },
+      });
     }
 
     // Log detailed error to apiLogger (writes to file)

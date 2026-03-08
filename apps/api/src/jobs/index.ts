@@ -51,7 +51,7 @@ const jobs: JobConfig[] = [
   },
   {
     name: 'Market Activator',
-    intervalMs: isPerfMode ? 10 * 1000 : 5 * 1000, // Slower in perf mode
+    intervalMs: isPerfMode ? 10 * 1000 : 500, // 500ms for tighter strike accuracy on 1m markets
     job: marketActivatorJob,
     enabled: true,
     startupDelayMs: 5000,

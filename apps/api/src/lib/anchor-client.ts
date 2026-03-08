@@ -1142,7 +1142,7 @@ export class AnchorClient {
     // Size: 6 decimals for fractional contracts (1.5 contracts -> 1_500_000)
     // Fee: 6 decimals ($0.02 -> 20_000)
     const priceU64 = Math.floor(params.price * 1_000_000);
-    const sizeU64 = Math.floor(params.matchSize * 1_000_000);
+    const sizeU64 = Math.round(params.matchSize * 1_000_000);
     const feeU64 = Math.floor(params.takerFee * 1_000_000);
 
     const makerArgs: PlaceOrderArgs = {
@@ -1232,7 +1232,7 @@ export class AnchorClient {
 
     // Convert to instruction format (6 decimals)
     const priceU64 = Math.floor(params.price * 1_000_000);
-    const sizeU64 = Math.floor(params.matchSize * 1_000_000);
+    const sizeU64 = Math.round(params.matchSize * 1_000_000);
     const feeU64 = Math.floor(params.takerFee * 1_000_000);
 
     const makerArgs: PlaceOrderArgs = {
@@ -1389,7 +1389,7 @@ export class AnchorClient {
     // Size: 6 decimals for fractional contracts (1.5 contracts -> 1_500_000)
     // Fee: 6 decimals ($0.02 -> 20_000)
     const priceU64 = Math.floor(params.price * 1_000_000);
-    const sizeU64 = Math.floor(params.matchSize * 1_000_000);
+    const sizeU64 = Math.round(params.matchSize * 1_000_000);
     const feeU64 = Math.floor(params.takerFee * 1_000_000);
 
     const ix = await this.buildExecuteCloseInstruction({
@@ -2076,6 +2076,16 @@ export class AnchorClient {
           throw err;
         }
 
+        // InsufficientFundsForRent: relayer doesn't have enough SOL to cover
+        // rent for the new accounts (NO mint ~0.0035 SOL, vault ~0.002 SOL).
+        // Retrying won't help — the balance won't change between attempts.
+        // Throw immediately so the market creator can skip and retry next cycle
+        // after the auto-funding keeper has topped up the relayer.
+        if (msg.includes('InsufficientFundsForRent') || msg.includes('insufficient lamports')) {
+          logger.error(`MarketV2 phase 2 FAILED (insufficient SOL for rent) for ${market.toBase58()}. Relayer needs more SOL.`);
+          throw err;
+        }
+
         logger.warn(`MarketV2 phase 2 attempt ${attempt}/${PHASE2_MAX_RETRIES} failed: ${msg.split('\n')[0].slice(0, 150)}`);
         if (attempt === PHASE2_MAX_RETRIES) {
           logger.error(`MarketV2 phase 2 FAILED after ${PHASE2_MAX_RETRIES} attempts for ${market.toBase58()} — market has NO mint missing!`);
@@ -2265,7 +2275,7 @@ export class AnchorClient {
 
     // Convert to 6 decimals
     const priceU64 = Math.floor(params.price * 1_000_000);
-    const sizeU64 = Math.floor(params.matchSize * 1_000_000);
+    const sizeU64 = Math.round(params.matchSize * 1_000_000);
     const feeU64 = Math.floor(params.takerFee * 1_000_000);
 
     const makerArgs: PlaceOrderArgs = {
@@ -2410,7 +2420,10 @@ export class AnchorClient {
     }
 
     const instruction = await this.buildActivateMarketV2Instruction(params);
-    const signature = await this.submitTransaction([instruction], [], `Activate MarketV2 ${params.marketPubkey.slice(0, 8)}`);
+    const signature = await this.submitTransaction(
+      [instruction], [], `Activate MarketV2 ${params.marketPubkey.slice(0, 8)}`,
+      { skipSimulation: true },
+    );
 
     logger.info(`MarketV2 activated on-chain: ${params.marketPubkey} (strike=${params.strikePrice}, tx: ${signature})`);
 
@@ -2575,8 +2588,26 @@ export class AnchorClient {
 
     // Convert to 6 decimals
     const priceU64 = Math.floor(params.price * 1_000_000);
-    const sizeU64 = Math.floor(params.matchSize * 1_000_000);
+    let sizeU64 = Math.round(params.matchSize * 1_000_000);
     const feeU64 = Math.floor(params.takerFee * 1_000_000);
+
+    // Guard: cap close size to seller's actual on-chain token balance.
+    // DB can accumulate fractional lamport drift over many fills (each Math.floor
+    // loses up to 1 lamport). Over N fills the DB total may be N lamports higher
+    // than on-chain, causing InsufficientShares (error 6029).
+    try {
+      const sellerMint = params.outcome === 'YES' ? yesMint : noMint;
+      const sellerAta = await getAssociatedTokenAddress(sellerMint, sellerWallet, false, TOKEN_2022_PROGRAM_ID);
+      const sellerAccount = await getAccount(this.connection, sellerAta, 'confirmed', TOKEN_2022_PROGRAM_ID);
+      const onChainBalance = Number(sellerAccount.amount);
+      if (sizeU64 > onChainBalance) {
+        logger.warn(`[CloseV2] Capping size from ${sizeU64} to on-chain balance ${onChainBalance} (drift: ${sizeU64 - onChainBalance} lamports)`);
+        sizeU64 = onChainBalance;
+      }
+    } catch (err: any) {
+      // If ATA doesn't exist or fetch fails, proceed with original size
+      logger.warn(`[CloseV2] Could not fetch seller token balance: ${err.message}`);
+    }
 
     // ATA creation payer: use fee payer override if available (child pays rent too)
     const ataPayer = params.feePayerKeypair?.publicKey || this.relayerKeypair!.publicKey;
@@ -3044,6 +3075,14 @@ export class AnchorClient {
     // Authority's USDC ATA to receive vault dust
     const authorityAta = await getAssociatedTokenAddress(USDC_MINT, this.relayerKeypair!.publicKey);
 
+    // Derive settlement bitmap PDA (chunk 0) — closed during finalize to recover ~0.008 SOL
+    const chunkBuffer = Buffer.alloc(2);
+    chunkBuffer.writeUInt16LE(0, 0); // chunk_index = 0
+    const [settlementBitmap] = PublicKey.findProgramAddressSync(
+      [Buffer.from('settlement_bitmap'), market.toBuffer(), chunkBuffer],
+      PROGRAM_ID
+    );
+
     const instruction = new TransactionInstruction({
       programId: PROGRAM_ID,
       keys: [
@@ -3053,6 +3092,7 @@ export class AnchorClient {
         { pubkey: vault, isSigner: false, isWritable: true },
         { pubkey: this.relayerKeypair!.publicKey, isSigner: true, isWritable: true },
         { pubkey: authorityAta, isSigner: false, isWritable: true }, // authority_ata for dust
+        { pubkey: settlementBitmap, isSigner: false, isWritable: true }, // settlement_bitmap (closed to recover rent)
         { pubkey: this.relayerKeypair!.publicKey, isSigner: false, isWritable: true }, // rent_recipient
         { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },             // USDC vault operations
         { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },        // share_token_program (Token-2022 for mint close)

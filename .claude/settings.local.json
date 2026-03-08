@@ -122,7 +122,17 @@
       "Bash(npx --yes tsc --version)",
       "Bash(git add -A -- ':!repomix-output.xml')",
       "Bash(git add -A)",
-      "Bash(git reset HEAD repomix-output.xml)"
+      "Bash(git reset HEAD repomix-output.xml)",
+      "Bash(git push origin main)",
+      "Bash(node_modules.bintsc --noEmit --project apps/api/tsconfig.json)",
+      "Bash(./node_modules/.bin/tsc --noEmit --project apps/api/tsconfig.json)",
+      "Bash(git add apps/api/src/bot/math.ts apps/api/src/bot/mm-bot.ts apps/api/src/bot/mm-bot-v2.ts apps/api/src/index.ts apps/api/src/jobs/position-settler.ts apps/api/src/lib/broadcasts.ts apps/api/src/routes/perf.ts apps/api/src/services/matching.service.ts)",
+      "Bash(git add apps/api/src/routes/orders.ts apps/api/src/services/matching.service.ts apps/webv3/src/components/LiteSidebar.tsx apps/webv3/src/components/OnboardingOverlay.tsx apps/webv3/src/components/RightSidebar.tsx apps/webv3/src/hooks/useOrder.ts apps/webv3/src/index.css)",
+      "Bash(node_modules.bintsc --version)",
+      "Bash(C:/Users/alexd/degen_terminal/node_modules/.bin/tsc --noEmit --project C:/Users/alexd/degen_terminal/apps/api/tsconfig.json)",
+      "Bash(C:/Users/alexd/degen_terminal/apps/api/node_modules/.bin/tsc --noEmit --project C:/Users/alexd/degen_terminal/apps/api/tsconfig.json)",
+      "Bash(node_modules/typescript/bin/tsc --noEmit --project apps/api/tsconfig.json)",
+      "Bash(./node_modules/typescript/bin/tsc --noEmit --project apps/api/tsconfig.json)"
     ]
   }
 }

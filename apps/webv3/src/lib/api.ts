@@ -251,6 +251,16 @@ async function apiFetch<T>(
     return apiFetch<T>(endpoint, options, retryCount + 1);
   }
 
+  // Rate limited: single retry after short backoff
+  if (response.status === 429 && retryCount < 1) {
+    const retryAfter = response.headers.get('Retry-After');
+    const delay = retryAfter ? parseInt(retryAfter) * 1000 : 2000;
+    
+    console.warn(`[API] Rate limited, retrying in ${delay}ms`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+    return apiFetch<T>(endpoint, options, retryCount + 1);
+  }
+
   if (!response.ok) {
     let errorResponse: ApiErrorResponse;
     try {
@@ -258,8 +268,10 @@ async function apiFetch<T>(
     } catch {
       errorResponse = {
         error: {
-          code: 'INTERNAL_ERROR',
-          message: `HTTP ${response.status}: ${response.statusText}`,
+          code: response.status === 429 ? 'RATE_LIMITED' : 'INTERNAL_ERROR',
+          message: response.status === 429
+            ? 'Rate limited — please slow down.'
+            : `HTTP ${response.status}: ${response.statusText}`,
         },
       };
     }
@@ -754,6 +766,13 @@ export async function getMarginAccounts(): Promise<{ accounts: MarginAccount[]; 
   return apiFetch<{ accounts: MarginAccount[]; total: number }>('/margin/accounts');
 }
 
+export async function joinWaitlist(email: string): Promise<{ success: boolean }> {
+  return apiFetch<{ success: boolean }>('/waitlist', {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+  });
+}
+
 export const api = {
   // System
   getHealth,
@@ -798,6 +817,8 @@ export const api = {
   addMargin,
   getMarginConfig,
   getMarginAccounts,
+  // Waitlist
+  joinWaitlist,
 };
 
 export default api;

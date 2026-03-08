@@ -13,7 +13,7 @@ import { useEffect, useCallback, useRef, useMemo } from 'react';
 import { useMarketStore } from '@/stores/marketStore';
 import { api, type GetMarketsParams, ApiError } from '@/lib/api';
 import { getWebSocket } from '@/lib/websocket';
-import type { MarketSummary, Asset, Timeframe } from '@degen/types';
+import type { MarketSummary, MarketStatus, Asset, Timeframe } from '@degen/types';
 
 // Polling interval to keep data fresh (15 seconds - increased from 10s to reduce backend pressure)
 // Real-time updates come via WebSocket, so polling is just a fallback
@@ -73,14 +73,12 @@ export function useMarkets(params?: GetMarketsParams) {
     return () => clearInterval(interval);
   }, [fetchMarkets]);
   
-  // Listen for market_activated WebSocket events for instant strike price updates
-  // OPTIMIZED: Avoid aggressive refetch - rely on next poll cycle instead
+  // Listen for market_activated WebSocket events for instant strike price updates.
+  // The WS payload carries all fields needed for a MarketSummary, so we inject
+  // directly into the store — no API refetch, no debounce delay.
   useEffect(() => {
     const ws = getWebSocket();
     ws.connect().catch(() => {});
-    
-    // Debounce refetch to prevent thundering herd
-    let refetchTimeout: NodeJS.Timeout | null = null;
     
     const unsubscribe = ws.onMessage((message: any) => {
       if (message.type !== 'market_activated') return;
@@ -90,46 +88,44 @@ export function useMarkets(params?: GetMarketsParams) {
       
       console.log('[useMarkets] Market activated:', data.asset, data.timeframe, 'strike:', data.strikePrice);
       
-      // Update the markets list with the new strike price
       const { markets, setMarkets } = useMarketStore.getState();
       const address = data.address || message.market;
       
+      let found = false;
       const updatedMarkets = markets.map((m) => {
         if (m.address === address || m.id === data.marketId) {
-          return {
-            ...m,
-            strike: data.strikePrice,
-          };
+          found = true;
+          return { ...m, strike: data.strikePrice, status: 'OPEN' as MarketStatus };
         }
         return m;
       });
       
-      // If we found and updated a market, apply it
-      const wasUpdated = updatedMarkets.some((m, i) => m.strike !== markets[i]?.strike);
-      if (wasUpdated) {
+      if (found) {
         setMarkets(updatedMarkets);
-        console.log('[useMarkets] Updated market with strike price:', data.strikePrice);
       } else {
-        // Market not in list yet - debounce the refetch to avoid thundering herd
-        // when multiple clients receive the same WebSocket event
-        if (refetchTimeout) {
-          clearTimeout(refetchTimeout);
-        }
-        console.log('[useMarkets] Market not found in list, scheduling debounced fetch...');
-        refetchTimeout = setTimeout(() => {
-          fetchMarkets(false);
-          refetchTimeout = null;
-        }, 500 + Math.random() * 500); // 500-1000ms random delay to spread load
+        // Market wasn't in list (was PENDING). Build a MarketSummary from the WS
+        // payload and append it — avoids a full API round-trip.
+        const syntheticMarket: MarketSummary = {
+          id: data.marketId,
+          address,
+          asset: data.asset,
+          timeframe: data.timeframe,
+          strike: data.strikePrice,
+          expiry: data.expiryAt,
+          status: 'OPEN' as MarketStatus,
+          volume24h: 0,
+          yesPrice: 0.5,
+          noPrice: 0.5,
+        };
+        setMarkets([...markets, syntheticMarket]);
+        console.log('[useMarkets] Injected new market from WS:', data.strikePrice);
       }
     });
     
     return () => {
       unsubscribe();
-      if (refetchTimeout) {
-        clearTimeout(refetchTimeout);
-      }
     };
-  }, [fetchMarkets]);
+  }, []);
   
   // Refetch when a market expires (instant refresh to get the pre-created next market)
   const onMarketExpired = useCallback((timeframe: Timeframe, count: number) => {

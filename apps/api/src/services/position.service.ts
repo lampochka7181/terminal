@@ -105,10 +105,14 @@ export class PositionService {
   ): Promise<void> {
     const position = await this.getOrCreate(userId, marketId);
     
-    // Truncate shares to 6 decimal places to match on-chain precision
-    // On-chain stores shares as u64 with 6 decimals (e.g., 1.5 shares = 1_500_000)
-    // Using Math.floor ensures DB matches exactly what's credited on-chain
-    const truncateToOnChainPrecision = (n: number) => Math.floor(n * 1_000_000) / 1_000_000;
+    // Round shares to 6 decimal places to match on-chain precision.
+    // On-chain stores shares as u64 with 6 decimals (e.g., 1.5 shares = 1_500_000).
+    // Math.round is used instead of Math.floor because values going through
+    // float division→multiplication round-trips (e.g., lamports/1e6 then *1e6)
+    // can lose up to ~1e-10 precision. Math.floor would truncate 142856.9999999
+    // to 142856 instead of 142857. Since all share values are exact multiples
+    // of 1e-6, Math.round always gives the correct integer.
+    const truncateToOnChainPrecision = (n: number) => Math.round(n * 1_000_000) / 1_000_000;
     const sharesToAdd = truncateToOnChainPrecision(shares);
     
     const currentYes = parseFloat(position.yesShares || '0');

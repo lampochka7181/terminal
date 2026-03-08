@@ -211,15 +211,13 @@ export async function orderRoutes(app: FastifyInstance) {
       });
     }
 
-    // Reject orders too close to market expiry — on-chain has 2s TRADING_CLOSE_BUFFER,
-    // plus ~1-2s for TX submission + confirmation latency. Use 5s to be safe.
-    const EXPIRY_BUFFER_MS = 5_000; // 5 seconds (on-chain buffer is 2s)
+    const EXPIRY_BUFFER_MS = 3_000;
     if (market.expiryAt) {
       const expiryMs = new Date(market.expiryAt).getTime();
       const remainingMs = expiryMs - Date.now();
       if (remainingMs < EXPIRY_BUFFER_MS) {
         return reply.code(409).send({
-          error: { code: 'MARKET_EXPIRING', message: `Market closes in ${Math.round(remainingMs / 1000)}s — orders cannot be placed within ${EXPIRY_BUFFER_MS / 1000} seconds of expiry` },
+          error: { code: 'MARKET_EXPIRING', message: `Orders cannot be placed within 3 seconds of expiry` },
         });
       }
     }

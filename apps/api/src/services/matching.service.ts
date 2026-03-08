@@ -23,6 +23,14 @@ function getMMUserId(): string | null {
   return mmBotV2.getStatus().userId;
 }
 
+/** Truncate to 6 decimals to match on-chain SPL token precision.
+ *  Without this, DB accumulates raw floats (e.g. 63.94871794...) while
+ *  on-chain mints Math.floor(x*1e6) lamports. Over N fills the drift
+ *  can reach N lamports, causing InsufficientShares on close. */
+function truncate6(n: number): number {
+  return Math.floor(n * 1_000_000) / 1_000_000;
+}
+
 /**
  * Matching Engine Service
  * 
@@ -448,7 +456,7 @@ export class MatchingService {
             break;
           }
 
-          const fillSize = Math.min(remainingSize, bestOrder.remainingSize);
+          const fillSize = truncate6(Math.min(remainingSize, bestOrder.remainingSize));
           const fillPrice = userEffectivePrice;
           const notional = fillPrice * fillSize;
           const { makerFee, takerFee } = calculateFillFees(notional);
@@ -531,7 +539,7 @@ export class MatchingService {
           return { matched: fills.length > 0, fills, remainingSize, error: 'SELF_TRADE_PREVENTED' };
         }
 
-        const fillSize = Math.min(remainingSize, bestOrder.remainingSize);
+        const fillSize = truncate6(Math.min(remainingSize, bestOrder.remainingSize));
         const fillPrice = userEffectivePrice;
         const notional = fillPrice * fillSize;
         const { makerFee, takerFee } = calculateFillFees(notional);
@@ -693,7 +701,7 @@ export class MatchingService {
               const noPx = market?.noPrice ? parseFloat(market.noPrice) : 0.5;
               const basePrice = order.outcome === 'YES' ? yesPx : noPx;
               const price = Math.min(0.99, Math.max(0.01, basePrice || 0.5));
-              const fillSize = remainingDollars / price;
+              const fillSize = truncate6(remainingDollars / price);
               const fillCost = fillSize * price;
               const { makerFee } = calculateFillFees(fillCost);
 
@@ -739,7 +747,7 @@ export class MatchingService {
 
           if (maxContractsAtPrice < MIN_FILL_SIZE) { batchBudgetExhausted = true; break; }
 
-          const fillSize = Math.min(maxContractsAtPrice, bestOrder.remainingSize);
+          const fillSize = truncate6(Math.min(maxContractsAtPrice, bestOrder.remainingSize));
           const fillPrice = userEffectivePrice;
           const fillCost = fillSize * fillPrice;
           const { makerFee } = calculateFillFees(fillCost);
@@ -843,7 +851,7 @@ export class MatchingService {
               const noPx = market?.noPrice ? parseFloat(market.noPrice) : 0.5;
               const basePrice = order.outcome === 'YES' ? yesPx : noPx;
               const price = Math.min(0.99, Math.max(0.01, basePrice || 0.5));
-              const fillSize = remainingDollars / price;
+              const fillSize = truncate6(remainingDollars / price);
               const fillCost = fillSize * price;
               const { makerFee } = calculateFillFees(fillCost);
 
@@ -885,7 +893,7 @@ export class MatchingService {
           break;
         }
 
-        const fillSize = Math.min(maxContractsAtPrice, bestOrder.remainingSize);
+        const fillSize = truncate6(Math.min(maxContractsAtPrice, bestOrder.remainingSize));
         const fillPrice = userEffectivePrice;
         const fillCost = fillSize * fillPrice;
         const { makerFee } = calculateFillFees(fillCost);
@@ -1152,15 +1160,16 @@ export class MatchingService {
       const takerIsBuy = order.side === 'BID';
 
       // Aggregate all fills by outcome for taker position
-      const outcomeShares = new Map<'YES' | 'NO', number>();
+      // Use integer lamports to match on-chain precision exactly (floor(a+b) ≥ floor(a)+floor(b))
+      const outcomeSharesLamports = new Map<'YES' | 'NO', number>();
       for (const fill of result.fills) {
-        const current = outcomeShares.get(fill.outcome) || 0;
-        outcomeShares.set(fill.outcome, current + fill.size);
+        const current = outcomeSharesLamports.get(fill.outcome) || 0;
+        outcomeSharesLamports.set(fill.outcome, current + Math.floor(fill.size * 1_000_000));
       }
 
       // Update taker position for each outcome
       // Include takerFee in cost basis so SIZE shows full spend and PnL accounts for fees
-      for (const [outcome, shares] of outcomeShares) {
+      for (const [outcome, sharesLamports] of outcomeSharesLamports) {
         const outcomeFills = result.fills.filter(f => f.outcome === outcome);
         const cost = outcomeFills.reduce((sum, f) => {
           const notional = f.price * f.size;
@@ -1171,7 +1180,7 @@ export class MatchingService {
           order.userId,
           order.marketId,
           outcome,
-          shares,
+          sharesLamports / 1_000_000,
           cost,
           takerIsBuy
         );
@@ -1294,7 +1303,7 @@ export class MatchingService {
               const noPx = market?.noPrice ? parseFloat(market.noPrice) : 0.5;
               const basePrice = order.outcome === 'YES' ? yesPx : noPx;
               const price = Math.max(order.minPrice, Math.min(0.99, Math.max(0.01, basePrice || 0.5)));
-              const fillSize = remainingSize;
+              const fillSize = truncate6(remainingSize);
               const fillProceeds = fillSize * price;
               const { makerFee, takerFee } = calculateFillFees(fillProceeds);
 
@@ -1340,7 +1349,7 @@ export class MatchingService {
             break;
           }
 
-          const fillSize = Math.min(remainingSize, bestOrder.remainingSize);
+          const fillSize = truncate6(Math.min(remainingSize, bestOrder.remainingSize));
           const fillPrice = userEffectivePrice;
           const fillProceeds = fillSize * fillPrice;
           const { makerFee, takerFee } = calculateFillFees(fillProceeds);
@@ -1436,7 +1445,7 @@ export class MatchingService {
               const noPx = market?.noPrice ? parseFloat(market.noPrice) : 0.5;
               const basePrice = order.outcome === 'YES' ? yesPx : noPx;
               const price = Math.max(order.minPrice, Math.min(0.99, Math.max(0.01, basePrice || 0.5)));
-              const fillSize = remainingSize;
+              const fillSize = truncate6(remainingSize);
               const fillProceeds = fillSize * price;
               const { makerFee, takerFee } = calculateFillFees(fillProceeds);
 
@@ -1467,7 +1476,7 @@ export class MatchingService {
           if (config.devAlwaysFillMarketOrders) {
             const mmUserId = getMMUserId();
             if (mmUserId) {
-              const fillSize = remainingSize;
+              const fillSize = truncate6(remainingSize);
               const price = order.minPrice;
               const fillProceeds = fillSize * price;
               const { makerFee, takerFee } = calculateFillFees(fillProceeds);
@@ -1498,7 +1507,7 @@ export class MatchingService {
           break;
         }
 
-        const fillSize = Math.min(remainingSize, bestOrder.remainingSize);
+        const fillSize = truncate6(Math.min(remainingSize, bestOrder.remainingSize));
         const fillPrice = userEffectivePrice;
         const fillProceeds = fillSize * fillPrice;
         const { makerFee, takerFee } = calculateFillFees(fillProceeds);
@@ -2712,24 +2721,28 @@ export class MatchingService {
     }> = [];
     
     // Taker position update (all fills aggregate to one update)
+    // Aggregate shares in integer lamports to match on-chain precision exactly.
+    // On-chain does open_interest += Math.floor(fill.size * 1e6) per fill.
+    // Float aggregation (a+b then floor) can exceed integer aggregation (floor(a)+floor(b))
+    // by up to N-1 lamports for N fills, causing InvalidSettlementAmount at settlement.
     const takerIsBuy = order.side === 'BID';
-    const takerOutcomes = new Map<'YES' | 'NO', { shares: number; cost: number }>();
-    
+    const takerOutcomes = new Map<'YES' | 'NO', { sharesLamports: number; cost: number }>();
+
     for (const fill of fills) {
-      const current = takerOutcomes.get(fill.outcome) || { shares: 0, cost: 0 };
+      const current = takerOutcomes.get(fill.outcome) || { sharesLamports: 0, cost: 0 };
       const notional = fill.price * fill.size;
-      current.shares += fill.size;
+      current.sharesLamports += Math.floor(fill.size * 1_000_000);
       // Include takerFee in cost basis so SIZE shows full spend and PnL accounts for fees.
       // Buy: cost = notional + fee (total spent). Sell: cost = notional - fee (net proceeds).
       current.cost += takerIsBuy ? notional + fill.takerFee : notional - fill.takerFee;
       takerOutcomes.set(fill.outcome, current);
     }
-    
+
     for (const [outcome, data] of takerOutcomes) {
       updates.push({
         userId: order.userId,
         outcome,
-        totalShares: data.shares,
+        totalShares: data.sharesLamports / 1_000_000,
         totalCost: data.cost,
         isBuy: takerIsBuy,
       });
@@ -2739,8 +2752,8 @@ export class MatchingService {
     // When taker BIDs (buys), maker ACQUIRES the opposite outcome (e.g., taker buys YES → maker gets NO)
     // When taker ASKs (sells), maker ACQUIRES the same outcome (e.g., taker sells YES → maker buys YES)
     // In both cases the maker is always buying (isBuy=true), matching processFill behavior.
-    const makerUpdates = new Map<string, { shares: number; cost: number }>();
-    
+    const makerUpdates = new Map<string, { sharesLamports: number; cost: number }>();
+
     for (const fill of fills) {
       // Maker's outcome depends on taker direction:
       // BID: maker gets opposite (taker buys YES → maker buys NO)
@@ -2749,7 +2762,7 @@ export class MatchingService {
         ? (fill.outcome === 'YES' ? 'NO' : 'YES')
         : fill.outcome;
       const key = `${fill.makerUserId}:${makerOutcome}`;
-      const current = makerUpdates.get(key) || { shares: 0, cost: 0 };
+      const current = makerUpdates.get(key) || { sharesLamports: 0, cost: 0 };
       if (takerIsBuy) {
         // Maker pays complement price: (1 - fill.price) * size - makerFee
         const complementNotional = (1 - fill.price) * fill.size;
@@ -2759,7 +2772,7 @@ export class MatchingService {
         const notional = fill.price * fill.size;
         current.cost += notional + fill.makerFee;
       }
-      current.shares += fill.size;
+      current.sharesLamports += Math.floor(fill.size * 1_000_000);
       makerUpdates.set(key, current);
     }
     
@@ -2768,7 +2781,7 @@ export class MatchingService {
       updates.push({
         userId: makerId,
         outcome: outcome as 'YES' | 'NO',
-        totalShares: data.shares,
+        totalShares: data.sharesLamports / 1_000_000,
         totalCost: data.cost,
         isBuy: true, // Maker always acquires shares (buying)
       });

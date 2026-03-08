@@ -1,10 +1,9 @@
-import { PublicKey } from '@solana/web3.js';
 import { marketService } from '../services/market.service.js';
 import { priceFeedService } from '../services/price-feed.service.js';
-import { anchorClient, fetchMarketV2OnChainState } from '../lib/anchor-client.js';
-import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
+import { anchorClient } from '../lib/anchor-client.js';
 import { logger, logEvents } from '../lib/logger.js';
 import { broadcastMarketActivated } from '../lib/broadcasts.js';
+import { mmBotV2 } from '../bot/mm-bot.js';
 import { config } from '../config.js';
 
 /**
@@ -58,39 +57,21 @@ async function activateMarketEntry(market: Awaited<ReturnType<typeof marketServi
   const { id, pubkey, asset, timeframe, expiryAt } = market;
   
   // 1. Get current price from WebSocket feed
+  const priceStart = Date.now();
   const currentPrice = await getCurrentPrice(asset);
   if (!currentPrice) {
     logger.error(`Cannot activate market ${pubkey}: no price available for ${asset}`);
     return;
   }
-  
-  // 2. Pre-flight: check on-chain status before attempting activation
-  let alreadyActive = false;
-  if (anchorClient.isReady() && config.useV2) {
-    try {
-      const chainState = await fetchMarketV2OnChainState(
-        anchorClient.getConnection(),
-        new PublicKey(pubkey),
-      );
-      if (!chainState) {
-        logger.warn(`[MarketActivator] ${pubkey.slice(0, 8)} on-chain account gone, skipping`);
-        await marketService.markArchived(id);
-        return;
-      }
-      if (chainState.status !== 'OPEN' || chainState.statusRaw !== 0) {
-        // statusRaw 0 = Pending, 1 = Open; anything other than Pending means already activated
-        alreadyActive = chainState.statusRaw !== 0;
-        if (alreadyActive) {
-          logger.info(`[MarketActivator] ${pubkey.slice(0, 8)} already ${chainState.status} on-chain (raw=${chainState.statusRaw}), updating DB only`);
-        }
-      }
-    } catch (err: any) {
-      logger.debug(`[MarketActivator] Pre-flight check failed for ${pubkey.slice(0, 8)}: ${err.message}`);
-    }
-  }
 
-  // 3. Activate on-chain (only if not already active)
-  if (!alreadyActive && anchorClient.isReady()) {
+  // Log how far before round start we are activating
+  const roundDurations: Record<string, number> = { '1m': 60000, '5m': 300000, '15m': 900000, '1h': 3600000, '4h': 14400000, '24h': 86400000 };
+  const roundStart = expiryAt.getTime() - (roundDurations[timeframe] || 300000);
+  const leadMs = roundStart - priceStart;
+  logger.info(`[MarketActivator] ${asset}-${timeframe} strike=$${currentPrice.toLocaleString()} (${leadMs > 0 ? leadMs + 'ms before' : Math.abs(leadMs) + 'ms after'} round start)`);
+  
+  // 2. Activate on-chain (idempotent — MarketNotPending error handled below)
+  if (anchorClient.isReady()) {
     try {
       if (config.useV2) {
         await anchorClient.activateMarketV2({
@@ -121,13 +102,7 @@ async function activateMarketEntry(market: Awaited<ReturnType<typeof marketServi
     logger.warn(`Anchor client not ready, activating market ${pubkey} in DB only`);
   }
   
-  // 4. Sync chain status and update DB
-  if (anchorClient.isReady() && config.useV2) {
-    const chainState = await syncMarketStatusFromChain(id, pubkey, 'OPEN');
-    if (chainState && chainState.status !== 'OPEN') {
-      logger.warn(`[MarketActivator] On-chain status after activation is ${chainState.status}, expected OPEN`);
-    }
-  }
+  // 3. Update DB (skip chain sync — TX just confirmed, we know the state)
   await marketService.activateMarket(id, currentPrice.toString());
   
   // 4. Broadcast activation to all connected clients for instant UI update
@@ -138,7 +113,19 @@ async function activateMarketEntry(market: Awaited<ReturnType<typeof marketServi
     strikePrice: currentPrice,
     expiryAt: expiryAt.getTime(),
   });
-  
+
+  // 5. Notify MM bot directly — bypasses 5s sync cache for instant liquidity
+  mmBotV2.notifyMarketActivated({
+    id,
+    pubkey,
+    asset,
+    timeframe,
+    strikePrice: currentPrice,
+    expiryAt: expiryAt.getTime(),
+  }).catch(err => {
+    logger.warn(`[MarketActivator] MM bot notification failed: ${err.message}`);
+  });
+
   logger.info(`🚀 Activated market ${asset}-${timeframe} | Strike: $${currentPrice.toLocaleString()} | Expires: ${expiryAt.toISOString()}`);
   
   logEvents.marketCreated({
@@ -157,10 +144,14 @@ async function activateMarketEntry(market: Awaited<ReturnType<typeof marketServi
 async function getCurrentPrice(asset: string): Promise<number | null> {
   try {
     const priceData = await priceFeedService.getPrice(asset);
-    
-    // Only use fresh prices (within 15 seconds)
-    if (priceData && Date.now() - priceData.timestamp < 15_000) {
+
+    // Only use fresh prices (within 3 seconds for accurate strike pricing)
+    if (priceData && Date.now() - priceData.timestamp < 3_000) {
       return priceData.price;
+    }
+
+    if (priceData) {
+      logger.warn(`[MarketActivator] Price for ${asset} is ${((Date.now() - priceData.timestamp) / 1000).toFixed(1)}s stale, using REST fallback`);
     }
     
     // Fallback: Coinbase REST API

@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, CloseAccount, Transfer};
 use anchor_spl::token_interface::{self, TokenInterface, CloseAccount as CloseAccountInterface};
-use crate::state_v2::{MarketV2, MarketStatusV2};
+use crate::state_v2::{MarketV2, MarketStatusV2, SettlementBitmap};
 use crate::errors::DegenError;
 
 /// Read the supply field from a Token/Token-2022 mint account.
@@ -21,9 +21,10 @@ fn read_mint_supply(mint_data: &[u8]) -> Result<u64> {
 /// 3. Closes the vault to recover rent (regular Token program)
 /// 4. Closes YES mint via Token-2022 MintCloseAuthority
 /// 5. Closes NO mint via Token-2022 MintCloseAuthority
-/// 6. Closes the MarketV2 PDA to recover rent (via Anchor `close` constraint)
+/// 6. Closes SettlementBitmap to recover rent (via Anchor `close` constraint)
+/// 7. Closes the MarketV2 PDA to recover rent (via Anchor `close` constraint)
 ///
-/// Total rent recovered: ~0.009 SOL (market PDA + vault + YES mint + NO mint)
+/// Total rent recovered: ~0.017 SOL (market PDA + vault + YES/NO mints + bitmap)
 #[derive(Accounts)]
 pub struct FinalizeMarketV2<'info> {
     #[account(
@@ -67,6 +68,20 @@ pub struct FinalizeMarketV2<'info> {
     /// Authority's USDC ATA to receive vault dust
     #[account(mut)]
     pub authority_ata: Box<Account<'info, TokenAccount>>,
+
+    /// Settlement bitmap (chunk 0) — closed to recover rent (~0.008 SOL)
+    #[account(
+        mut,
+        close = rent_recipient,
+        seeds = [
+            SettlementBitmap::SEED,
+            market.key().as_ref(),
+            &0u16.to_le_bytes()  // chunk_index = 0
+        ],
+        bump = settlement_bitmap.bump,
+        constraint = settlement_bitmap.market == market.key() @ DegenError::InvalidMarketParams
+    )]
+    pub settlement_bitmap: Box<Account<'info, SettlementBitmap>>,
 
     /// Rent recipient for recovered lamports
     /// CHECK: Any account can receive rent
@@ -211,13 +226,15 @@ pub fn finalize_market_v2(ctx: Context<FinalizeMarketV2>) -> Result<()> {
         settled_at: clock.unix_timestamp,
     });
 
-    // Note: MarketV2 PDA is closed automatically by Anchor's `close = rent_recipient`
-    // constraint after this handler returns. Total rent recovered:
+    // Note: MarketV2 PDA and SettlementBitmap are closed automatically by Anchor's
+    // `close = rent_recipient` constraint after this handler returns.
+    // Total rent recovered:
     // - MarketV2 PDA: ~0.003 SOL
     // - USDC vault: ~0.002 SOL
     // - YES mint: ~0.002 SOL
     // - NO mint: ~0.002 SOL
-    // Total: ~0.009 SOL per market
+    // - SettlementBitmap: ~0.008 SOL
+    // Total: ~0.017 SOL per market
 
     Ok(())
 }

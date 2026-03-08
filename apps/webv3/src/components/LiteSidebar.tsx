@@ -68,12 +68,15 @@ export default function LiteSidebar() {
   const noPrices = useBestPrices('NO');
 
   const { setVisible: setWalletModalVisible } = useWalletModal();
+  const { selectedAsset, selectedTimeframe, setTimeframe: setStoreTimeframe } = useMarketStore();
+  const assetPrice = usePriceStore(s => s.prices[selectedAsset as keyof typeof s.prices]);
   const [amount, setAmount] = useState(25);
-  const [timeframe, setTimeframe] = useState('5m');
+  const [timeframe, setTimeframe] = useState(selectedTimeframe);
   const [chatOpen, setChatOpen] = useState(false);
   const [delegationModalOpen, setDelegationModalOpen] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
   const [closingPosition, setClosingPosition] = useState<string | null>(null);
+  const [pnlToasts, setPnlToasts] = useState<{ id: number; pnl: number }[]>([]);
   const [promptMsg, setPromptMsg] = useState({ title: '', message: '', type: 'info' as 'info' | 'error' | 'success' | 'warning' });
   const amountPresets = [25, 50, 100, 250];
 
@@ -116,7 +119,13 @@ export default function LiteSidebar() {
     }
   }, [wallet.connected, isAuthenticated, market, amount, yesPrices, noPrices, placeOrder, showPrompt, delegation, signIn, setWalletModalVisible]);
 
-  const handleClosePosition = useCallback(async (entry: { pos: { marketAddress: string }; isYes: boolean; shares: number }) => {
+  const showPnlToast = useCallback((pnl: number) => {
+    const id = Date.now();
+    setPnlToasts(prev => [...prev, { id, pnl }]);
+    setTimeout(() => setPnlToasts(prev => prev.filter(t => t.id !== id)), 2000);
+  }, []);
+
+  const handleClosePosition = useCallback(async (entry: { pos: { marketAddress: string }; isYes: boolean; shares: number; entryPrice: number }) => {
     const outcome = entry.isYes ? 'yes' : 'no';
     const key = `${entry.pos.marketAddress}-${outcome}`;
     setClosingPosition(key);
@@ -131,13 +140,16 @@ export default function LiteSidebar() {
       });
       if (result?.error) {
         showPrompt('Close Failed', result.error, 'error');
+      } else if (result && result.filledSize > 0) {
+        const sellPrice = result.avgPrice ?? 0;
+        showPnlToast((sellPrice - entry.entryPrice) * result.filledSize);
       } else if (result && result.filledSize === 0) {
         showPrompt('No Liquidity', 'No liquidity available to close your position. It will settle automatically at market expiry.', 'warning');
       }
     } finally {
       setClosingPosition(null);
     }
-  }, [placeOrder, showPrompt]);
+  }, [placeOrder, showPrompt, showPnlToast]);
 
   const balanceDisplay = balance ? `$${balance.available.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}` : '$0';
   const delegatedDisplay = delegation.delegatedAmount > 0 ? `$${(delegation.delegatedAmount / 1_000_000).toLocaleString()}` : '$0';
@@ -153,8 +165,6 @@ export default function LiteSidebar() {
   const yesPayout = yesPrices.bestAsk > 0 ? `+$${Math.round(amount * (1 / yesPrices.bestAsk - 1))}` : '--';
   const noPayout = noPrices.bestAsk > 0 ? `+$${Math.round(amount * (1 / noPrices.bestAsk - 1))}` : '--';
 
-  const { selectedAsset } = useMarketStore();
-  const assetPrice = usePriceStore(s => s.prices[selectedAsset as keyof typeof s.prices]);
 
   // Listen for sell events from TradeBubbles overlay
   const handleBubbleSell = useCallback(async (outcome: 'yes' | 'no', mktAddr: string) => {
@@ -164,18 +174,24 @@ export default function LiteSidebar() {
     if (!pos) return;
     const shares = outcome === 'yes' ? pos.yesShares : pos.noShares;
     if (shares <= 0) return;
+    const entryPrice = outcome === 'yes'
+      ? (pos.avgEntryYes ?? pos.avgEntryPrice)
+      : (pos.avgEntryNo ?? pos.avgEntryPrice);
     const result = await placeOrder({
       marketAddress: pos.marketAddress,
       side: 'ask',
       outcome,
       orderType: 'market',
-      price: 0.01, // Market sell floor — accept any price (NO effective price = 1 - yesAskPrice, so 0.01 allows yesAsk ≤ 0.99)
+      price: 0.01,
       size: shares,
     });
-    if (result && result.filledSize === 0) {
+    if (result && result.filledSize > 0) {
+      const sellPrice = result.avgPrice ?? 0;
+      showPnlToast((sellPrice - entryPrice) * result.filledSize);
+    } else if (result && result.filledSize === 0) {
       showPrompt('No Liquidity', 'No liquidity available to close your position. It will settle automatically at market expiry.', 'warning');
     }
-  }, [positions, placeOrder, showPrompt]);
+  }, [positions, placeOrder, showPrompt, showPnlToast]);
 
   useEffect(() => {
     const handler = (e: Event) => {
@@ -289,14 +305,14 @@ export default function LiteSidebar() {
             <div style={{ padding: '6px 27px 6px' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
                 <span style={{ fontSize: 17, color: '#eee', fontWeight: 500 }}>1. SELECT ROUND TIMEFRAME</span>
-                <InfoDot text="Choose how long your prediction window lasts. Currently only 5-minute rounds are active." />
+                <InfoDot text="Choose how long your prediction window lasts." />
               </div>
               <div style={{ display: 'flex', borderRadius: 9, background: 'rgba(238,238,238,0.05)', padding: 5, overflow: 'hidden' }}>
                 {['1m', '5m', '15m', '1h'].map((tf) => {
-                  const isActive = tf === '5m';
-                  const isDisabled = !isActive;
+                  const isActive = tf === timeframe;
+                  const isDisabled = tf === '15m' || tf === '1h';
                   return (
-                    <button key={tf} disabled={isDisabled} onClick={() => !isDisabled && setTimeframe(tf)} style={{
+                    <button key={tf} disabled={isDisabled} onClick={() => { if (!isDisabled) { setTimeframe(tf); setStoreTimeframe(tf as any); } }} style={{
                       flex: 1, padding: '9px 0', borderRadius: 9, border: 'none',
                       fontSize: 20, fontWeight: 600,
                       cursor: isDisabled ? 'not-allowed' : 'pointer',
@@ -408,7 +424,19 @@ export default function LiteSidebar() {
               </button>
             </div>
 
-            <div style={{ padding: '9px 27px' }}>
+            <div style={{ padding: '9px 27px', position: 'relative' }}>
+              {pnlToasts.map(t => (
+                <div key={t.id} style={{
+                  position: 'absolute', top: 0, left: '50%', transform: 'translateX(-50%)',
+                  fontSize: 28, fontWeight: 800, letterSpacing: '-0.5px',
+                  color: t.pnl >= 0 ? '#95ff94' : '#f55252',
+                  textShadow: `0 0 24px ${t.pnl >= 0 ? 'rgba(149,255,148,0.6)' : 'rgba(245,82,82,0.6)'}`,
+                  animation: 'pnl-float 1.8s ease-out forwards',
+                  pointerEvents: 'none', zIndex: 20,
+                }}>
+                  {t.pnl >= 0 ? '+' : ''}{t.pnl < 0 ? '-' : ''}${Math.abs(t.pnl).toFixed(2)}
+                </div>
+              ))}
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
                 <span style={{ fontSize: 17, color: '#eee', fontWeight: 500 }}>POSITIONS</span>
                 <InfoDot text="Your active positions for the current round. PnL updates live." />

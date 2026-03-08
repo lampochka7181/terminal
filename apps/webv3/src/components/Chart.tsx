@@ -7,13 +7,12 @@ import { api, type Candle } from '@/lib/api';
 import { getWebSocket } from '@/lib/websocket';
 import { useChartToolbarStore } from './ChartToolbar';
 import { chartCoordsRef } from '@/lib/chartCoords';
+import { timeframeSec, visibleWindowSec } from '@/lib/timeframe';
 
 const PRICE_SCALE_WIDTH = 120;
 const TIME_SCALE_HEIGHT = 40;
 const TOOLBAR_CLEARANCE = 0;
 const CANDLE_SEC = 5;
-const VISIBLE_WINDOW = 500; // seconds — matches Lite chart's WINDOW_SEC
-const ROUND_SEC = 5 * 60;
 const RIGHT_PAD_BARS = 8; // bars of padding past latest candle
 const STALE_THRESHOLD_MS = 15_000; // re-fetch if no WS price for 15s
 
@@ -50,12 +49,19 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
   const strikePrice = market?.strike ?? 0;
   const marketExpiry = market?.expiry ?? 0;
 
+  const ROUND_SEC = timeframeSec(market?.timeframe);
+  const VISIBLE_WINDOW = visibleWindowSec(market?.timeframe);
+
   const strikePriceRef = useRef(strikePrice);
   const marketExpiryRef = useRef(marketExpiry);
   const selectedAssetRef = useRef(selectedAsset);
+  const roundSecRef = useRef(ROUND_SEC);
+  const visibleWindowRef = useRef(VISIBLE_WINDOW);
   strikePriceRef.current = strikePrice;
   marketExpiryRef.current = marketExpiry;
   selectedAssetRef.current = selectedAsset;
+  roundSecRef.current = ROUND_SEC;
+  visibleWindowRef.current = VISIBLE_WINDOW;
 
   const roundTimesRef = useRef({ roundStart: 0, roundEnd: 0 });
   const tickSizeRef = useRef(useChartToolbarStore.getState().tickSize);
@@ -251,8 +257,10 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
     function extendTimeAxis(price: number) {
       const { roundStart, roundEnd } = roundTimesRef.current;
       if (!roundStart || !roundEnd || price <= 0) return;
-      const padAfter = Math.round((VISIBLE_WINDOW - ROUND_SEC) * 0.25);
-      const padBefore = VISIBLE_WINDOW - ROUND_SEC - padAfter;
+      const vw = visibleWindowRef.current;
+      const rs = roundSecRef.current;
+      const padAfter = Math.round((vw - rs) * 0.25);
+      const padBefore = vw - rs - padAfter;
       const from = roundStart - padBefore;
       const to = roundEnd + padAfter;
       const timeSet = new Set<number>();
@@ -277,13 +285,14 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
 
     function computeRoundTimes() {
       const exp = marketExpiryRef.current;
+      const rSec = roundSecRef.current;
       if (exp > 0) {
         const expSec = Math.floor(exp / 1000);
-        roundTimesRef.current = { roundStart: expSec - ROUND_SEC, roundEnd: expSec };
+        roundTimesRef.current = { roundStart: expSec - rSec, roundEnd: expSec };
       } else {
         const now = Math.floor(Date.now() / 1000);
-        const rs = now - (now % ROUND_SEC);
-        roundTimesRef.current = { roundStart: rs, roundEnd: rs + ROUND_SEC };
+        const rs = now - (now % rSec);
+        roundTimesRef.current = { roundStart: rs, roundEnd: rs + rSec };
       }
     }
 
@@ -361,11 +370,13 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
         lastCandleRef.current = { time: candles[candles.length - 1].time, close: lastClose };
       }
 
-      // 5) Set visible range matching Lite chart's VISIBLE_WINDOW (500s)
+      // 5) Set visible range based on current timeframe
       const { roundStart: rs0, roundEnd: re0 } = roundTimesRef.current;
       if (rs0 && re0) {
-        const padAfter = Math.round((VISIBLE_WINDOW - ROUND_SEC) * 0.25);
-        const padBefore = VISIBLE_WINDOW - ROUND_SEC - padAfter;
+        const vw = visibleWindowRef.current;
+        const rSec = roundSecRef.current;
+        const padAfter = Math.round((vw - rSec) * 0.25);
+        const padBefore = vw - rSec - padAfter;
         anchoredRange = { from: rs0 - padBefore, to: re0 + padAfter };
         chart.timeScale().setVisibleRange({
           from: anchoredRange.from as any,
@@ -504,17 +515,17 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
           series.update(updatedCandle as any);
         }
 
-        // Auto-scroll: keep the latest candle visible using a constant-duration
-        // window (VISIBLE_WINDOW) that matches the Lite chart's zoom level.
-        // During the initial phase the range equals the init framing exactly;
-        // once candles pass roundEnd the view starts scrolling left smoothly.
+        // Auto-scroll: keep the latest candle visible using a duration-based
+        // window that matches the Lite chart's zoom level.
         if (isNewBar && !userInteracted && candles.length > 0) {
           const latestTime = candles[candles.length - 1].time;
           const { roundStart: rs, roundEnd: re } = roundTimesRef.current;
           const rightPad = CANDLE_SEC * RIGHT_PAD_BARS;
-          const padAfter = Math.round((VISIBLE_WINDOW - ROUND_SEC) * 0.25);
+          const vw = visibleWindowRef.current;
+          const rSec = roundSecRef.current;
+          const padAfter = Math.round((vw - rSec) * 0.25);
           const rightEdge = Math.max(re + padAfter, latestTime + rightPad);
-          const leftEdge = rightEdge - VISIBLE_WINDOW;
+          const leftEdge = rightEdge - vw;
 
           // Extend helper series so overlays (roundStart / roundEnd) stay anchored
           const lastP = candles[candles.length - 1].close;
@@ -550,14 +561,21 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
           }
         }
         if (marketTransitionTimer) clearTimeout(marketTransitionTimer);
+
+        // Activation carries fresh data — apply immediately.
+        // Resolution needs a short settle to let the store update.
+        const delay = m.type === 'market_activated' ? 0 : 500;
+
         marketTransitionTimer = setTimeout(() => {
           if (cancelled) return;
           computeRoundTimes();
           userInteracted = false;
           const { roundStart: rs, roundEnd: re } = roundTimesRef.current;
           if (rs && re) {
-            const padA = Math.round((VISIBLE_WINDOW - ROUND_SEC) * 0.25);
-            const padB = VISIBLE_WINDOW - ROUND_SEC - padA;
+            const vw = visibleWindowRef.current;
+            const rSec = roundSecRef.current;
+            const padA = Math.round((vw - rSec) * 0.25);
+            const padB = vw - rSec - padA;
             anchoredRange = { from: rs - padB, to: re + padA };
             const lastP = candles.length > 0 ? candles[candles.length - 1].close : 0;
             if (lastP > 0) extendTimeAxis(lastP);
@@ -569,7 +587,7 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
             } catch { /* chart not ready */ }
           }
           updateOverlays();
-        }, 500);
+        }, delay);
       }
     });
 
@@ -619,18 +637,17 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
     }
   }, [strikePrice]);
 
-  // When market expiry changes (new round), recalculate round times, re-fetch candles,
-  // extend the helper series, and re-anchor the visible range.
-  // Skip the initial load — init() already handles the first framing.
+  // When market expiry or timeframe changes (new round or timeframe switch),
+  // recalculate round times, re-anchor the visible range, and re-fetch candles.
+  // Skip the very first load — init() already handles the first framing.
   useEffect(() => {
     if (!marketExpiry || !chartRef.current || !seriesRef.current) return;
 
-    // If init() already framed this exact expiry (or hasn't framed yet), skip.
-    // This prevents the effect from overriding init()'s framing when the
-    // market store loads 1-2s after mount.
-    if (initExpiryRef.current === 0 || marketExpiry === initExpiryRef.current) {
+    // On the very first load, init() handles framing. Only skip if it's the
+    // same expiry AND same timeframe (i.e. the store just echoed what init saw).
+    if (initExpiryRef.current === 0) {
       roundTimesRef.current = {
-        roundStart: Math.floor(marketExpiry / 1000) - 5 * 60,
+        roundStart: Math.floor(marketExpiry / 1000) - ROUND_SEC,
         roundEnd: Math.floor(marketExpiry / 1000),
       };
       return;
@@ -690,7 +707,9 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
     }).catch(() => { /* ignore */ });
 
     return () => { stale = true; };
-  }, [marketExpiry]);
+  // Re-anchor when expiry changes (new round) OR when timeframe changes (1m↔5m)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [marketExpiry, ROUND_SEC, VISIBLE_WINDOW]);
 
   // Watchdog: detect stale WS data and re-fetch candles + re-anchor chart.
   // Also handles tab visibility changes — when user returns to the tab after
@@ -732,8 +751,10 @@ export default function Chart({ mode = 'pro' }: ChartProps) {
         if (rs && re && chartRef.current) {
           const lastP = candles.length > 0 ? candles[candles.length - 1].close : 0;
           if (lastP > 0 && extendFnRef.current) extendFnRef.current(lastP);
-          const padA = Math.round((VISIBLE_WINDOW - ROUND_SEC) * 0.25);
-          const padB = VISIBLE_WINDOW - ROUND_SEC - padA;
+          const vw = visibleWindowRef.current;
+          const rSec = roundSecRef.current;
+          const padA = Math.round((vw - rSec) * 0.25);
+          const padB = vw - rSec - padA;
           try {
             chartRef.current.timeScale().setVisibleRange({
               from: (rs - padB) as any,

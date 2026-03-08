@@ -26,24 +26,26 @@ import { config } from '../config.js';
 
 interface MarketConfig {
   asset: 'BTC' | 'ETH' | 'SOL';
-  timeframe: '5m' | '15m' | '1h' | '4h' | '24h';
+  timeframe: '1m' | '5m' | '15m' | '1h' | '4h' | '24h';
   intervalMs: number;
   durationMs: number;
 }
 
 const MARKET_CONFIGS: MarketConfig[] = [
-  // BTC markets: 5m, 1h, 24h
+  // BTC markets: 1m, 5m
+  { asset: 'BTC', timeframe: '1m', intervalMs: 60 * 1000, durationMs: 60 * 1000 },
   { asset: 'BTC', timeframe: '5m', intervalMs: 5 * 60 * 1000, durationMs: 5 * 60 * 1000 },
-  { asset: 'BTC', timeframe: '1h', intervalMs: 60 * 60 * 1000, durationMs: 60 * 60 * 1000 },
-  { asset: 'BTC', timeframe: '24h', intervalMs: 24 * 60 * 60 * 1000, durationMs: 24 * 60 * 60 * 1000 },
+  // 1h and 24h disabled for now
+  // { asset: 'BTC', timeframe: '1h', intervalMs: 60 * 60 * 1000, durationMs: 60 * 60 * 1000 },
+  // { asset: 'BTC', timeframe: '24h', intervalMs: 24 * 60 * 60 * 1000, durationMs: 24 * 60 * 60 * 1000 },
   // ETH and SOL disabled for now
   // { asset: 'ETH', timeframe: '5m', intervalMs: 5 * 60 * 1000, durationMs: 5 * 60 * 1000 },
   // { asset: 'ETH', timeframe: '1h', intervalMs: 60 * 60 * 1000, durationMs: 60 * 60 * 1000 },
   // { asset: 'SOL', timeframe: '5m', intervalMs: 5 * 60 * 1000, durationMs: 5 * 60 * 1000 },
 ];
 
-// How many markets ahead to pre-create (2 = current + next for zero gap)
-const MARKETS_LOOK_AHEAD = 2;
+// How many markets ahead to pre-create (3 needed for 1m markets due to 90s on-chain buffer)
+const MARKETS_LOOK_AHEAD = 3;
 
 /**
  * Main market creator job
@@ -183,6 +185,11 @@ async function createPendingMarkets(
               status: 'EXPIRED',
             });
           } catch { /* ignore if already exists */ }
+          continue;
+        } else if (errorMsg.includes('InsufficientFundsForRent') || errorMsg.includes('insufficient lamports')) {
+          // Relayer out of SOL — skip this cycle. The auto-funding keeper will
+          // top up the relayer balance, and next cycle will retry successfully.
+          logger.error(`❌ Relayer out of SOL for market creation — skipping this cycle. Fund the relayer wallet.`);
           continue;
         } else {
           // Log a concise single-line error (detailed simulation logs already logged by submitTransaction)

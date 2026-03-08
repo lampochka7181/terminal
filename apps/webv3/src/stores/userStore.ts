@@ -21,6 +21,12 @@ const MIN_FETCH_INTERVAL = 2000; // At least 2 seconds between fetchAll batches
 // Delayed refetch tracking - cancel previous if new event comes in
 let delayedRefetchTimer: NodeJS.Timeout | null = null;
 
+// Protect recently-updated positions from being overwritten by stale DB fetches.
+// After an optimistic update (upsertPosition), the write-behind queue needs ~1-2s to flush.
+// During that window, fetchPositions() would return stale data and cause a flicker.
+const positionProtectedUntil = new Map<string, number>();
+const POSITION_PROTECT_MS = 4000; // 4s — comfortably covers write-behind flush
+
 // Track orderIds that were already handled by the API response (useOrder.ts upsertPosition).
 // handleFill should skip these to prevent double-counting shares.
 const recentlyHandledOrderIds = new Set<string>();
@@ -122,17 +128,48 @@ export const useUserStore = create<UserState>((set, get) => ({
   fetchPositions: async (status = 'open') => {
     set({ positionsLoading: true, error: null });
     try {
-      const positions = await api.getUserPositions({ status });
-      set({ positions, positionsLoading: false, lastUpdate: Date.now() });
+      const fetched = await api.getUserPositions({ status });
+      set((state) => {
+        const now = Date.now();
+        // Smart merge: don't let stale DB data overwrite recent optimistic updates
+        const merged = fetched.map(fp => {
+          const protectedUntil = positionProtectedUntil.get(fp.marketAddress);
+          if (protectedUntil && now < protectedUntil) {
+            const existing = state.positions.find(p => p.marketAddress === fp.marketAddress);
+            if (existing) {
+              // DB caught up if fetched shares >= local — safe to use fetched data
+              const existingTotal = (existing.yesShares || 0) + (existing.noShares || 0);
+              const fetchedTotal = (fp.yesShares || 0) + (fp.noShares || 0);
+              if (fetchedTotal >= existingTotal) {
+                positionProtectedUntil.delete(fp.marketAddress);
+                return fp;
+              }
+              // Still stale — keep local optimistic version
+              return existing;
+            }
+          }
+          return fp;
+        });
+        // Keep any local-only positions still within protection window (not yet in DB)
+        for (const existing of state.positions) {
+          if (!merged.find(p => p.marketAddress === existing.marketAddress)) {
+            const protectedUntil = positionProtectedUntil.get(existing.marketAddress);
+            if (protectedUntil && now < protectedUntil && ((existing.yesShares || 0) + (existing.noShares || 0)) > 0) {
+              merged.push(existing);
+            }
+          }
+        }
+        return { positions: merged, positionsLoading: false, lastUpdate: Date.now() };
+      });
     } catch (error) {
       const message = error instanceof ApiError ? error.message : 'Failed to fetch positions';
       set({ positionsLoading: false, error: message });
-      
+
       // Auto-logout if unauthorized
       if (error instanceof ApiError && error.status === 401) {
         import('./authStore').then(m => m.useAuthStore.getState().signOut());
       }
-      
+
       throw error;
     }
   },
@@ -399,6 +436,8 @@ export const useUserStore = create<UserState>((set, get) => ({
 
   upsertPosition: (position) => {
     console.log(`[⏱️ STORE] upsertPosition called for ${position.marketAddress.slice(0,8)}...`);
+    // Protect this position from being overwritten by stale DB fetches
+    positionProtectedUntil.set(position.marketAddress, Date.now() + POSITION_PROTECT_MS);
     set((state) => {
       const existingIndex = state.positions.findIndex(
         (p) => p.marketAddress === position.marketAddress

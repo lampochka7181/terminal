@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useMemo } from 'react';
+import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { Liveline } from '../lib/liveline';
 import type { LivelinePoint } from '../lib/liveline';
 import { useMarketStore } from '@/stores/marketStore';
@@ -7,11 +7,10 @@ import { useSelectedMarket } from '@/stores/marketStore';
 import { getWebSocket } from '@/lib/websocket';
 import { api } from '@/lib/api';
 import { chartCoordsRef } from '@/lib/chartCoords';
+import { timeframeSec, visibleWindowSec } from '@/lib/timeframe';
 
 const LOOKBACK_SEC = 600;
-const ROUND_SEC = 5 * 60;
 const CANDLE_SEC = 5;
-const WINDOW_SEC = 500;
 const LL_BUFFER = 0.05;
 
 // Large right padding pushes liveline's live dot to ~57% of visible width,
@@ -36,6 +35,14 @@ export default function LiteChart() {
   const market = useSelectedMarket();
   const strikePrice = market?.strike ?? 0;
 
+  const ROUND_SEC = timeframeSec(market?.timeframe);
+  // For 1m, use a tighter visible window so old price extremes scroll out faster
+  // and the chart stays centered on the current price area.
+  // Pro chart keeps the wider window via visibleWindowSec().
+  const WINDOW_SEC = market?.timeframe === '1m' ? 80 : visibleWindowSec(market?.timeframe);
+  // Faster lerp for 1m so the Y-range re-centers quickly after big moves
+  const LERP_SPEED = market?.timeframe === '1m' ? 0.25 : 0.08;
+
   const [data, setData] = useState<LivelinePoint[]>([]);
   const dataRef = useRef<LivelinePoint[]>([]);
   const lastTimeRef = useRef(0);
@@ -59,6 +66,14 @@ export default function LiteChart() {
 
   const value = currentPrice ?? data[data.length - 1]?.value ?? 0;
 
+  // ── Refs for values needed in rAF/callback closures ──
+  const dimsRef = useRef(dims);
+  dimsRef.current = dims;
+  const effectiveStrikeRef = useRef(effectiveStrike);
+  effectiveStrikeRef.current = effectiveStrike;
+  const valueRef = useRef(value);
+  valueRef.current = value;
+
   // Track container dimensions
   useEffect(() => {
     const el = outerRef.current;
@@ -71,42 +86,79 @@ export default function LiteChart() {
     return () => ro.disconnect();
   }, []);
 
-  // Compute Y-axis range (mirrors liveline's computeRange target for convergence)
-  const yRange = useMemo(() => {
-    const now = Math.floor(Date.now() / 1000);
-    const rightEdge = now + WINDOW_SEC * LL_BUFFER;
-    const leftEdge = rightEdge - WINDOW_SEC;
-    let min = Infinity, max = -Infinity;
-    for (const p of data) {
-      if (p.time >= leftEdge - 2 && p.time <= rightEdge) {
-        if (p.value < min) min = p.value;
-        if (p.value > max) max = p.value;
+  // ── Live range from Liveline (frame-synced via callback) ──
+  const liveRangeRef = useRef<{ min: number; max: number } | null>(null);
+  const [liveRange, setLiveRange] = useState<{ min: number; max: number } | null>(null);
+  const lastRangeStateUpdate = useRef(0);
+
+  // DOM refs for frame-synced overlay elements
+  const strikeLineRef = useRef<HTMLDivElement>(null);
+  const strikeBadgeRef = useRef<HTMLDivElement>(null);
+  const priceBadgeRef = useRef<HTMLDivElement>(null);
+
+  const handleRangeUpdate = useCallback((range: { min: number; max: number }) => {
+    liveRangeRef.current = range;
+
+    // Position strike line + price badge in the SAME frame as Liveline's render
+    const d = dimsRef.current;
+    const chartH = d.h - LL_PAD.top - LL_PAD.bottom;
+    const r = range.max - range.min;
+    if (chartH > 0 && r > 0) {
+      const toY = (val: number) => LL_PAD.top + (1 - (val - range.min) / r) * chartH;
+
+      // Strike line
+      const es = effectiveStrikeRef.current;
+      const sl = strikeLineRef.current;
+      const sb = strikeBadgeRef.current;
+      if (sl && sb) {
+        if (es > 0) {
+          const sy = toY(es);
+          sl.style.display = '';
+          sl.style.top = `${sy}px`;
+          sb.style.display = '';
+          sb.style.top = `${sy}px`;
+        } else {
+          sl.style.display = 'none';
+          sb.style.display = 'none';
+        }
+      }
+
+      // Price badge
+      const v = valueRef.current;
+      const pb = priceBadgeRef.current;
+      if (pb) {
+        if (v > 0) {
+          pb.style.display = '';
+          pb.style.top = `${toY(v)}px`;
+          pb.textContent = v.toLocaleString('en-US', { minimumFractionDigits: 2 });
+        } else {
+          pb.style.display = 'none';
+        }
       }
     }
-    if (value > 0) { min = Math.min(min, value); max = Math.max(max, value); }
-    if (strikePrice > 0) { min = Math.min(min, strikePrice); max = Math.max(max, strikePrice); }
-    if (!isFinite(min) || !isFinite(max)) return null;
-    const raw = max - min;
-    const minR = raw * 0.1 || 0.4;
-    if (raw < minR) { const mid = (min + max) / 2; return { min: mid - minR / 2, max: mid + minR / 2 }; }
-    const margin = raw * 0.12;
-    return { min: min - margin, max: max + margin };
-  }, [data, value, strikePrice]);
 
-  // Grid lines
+    // Throttle React state updates (~10fps) for grid lines
+    const now = Date.now();
+    if (now - lastRangeStateUpdate.current > 100) {
+      lastRangeStateUpdate.current = now;
+      setLiveRange({ min: range.min, max: range.max });
+    }
+  }, []);
+
+  // Grid lines (uses throttled liveRange state — acceptable for grid labels)
   const gridLines = useMemo(() => {
-    if (!yRange) return [];
-    const range = yRange.max - yRange.min;
+    if (!liveRange) return [];
+    const range = liveRange.max - liveRange.min;
     const chartH = dims.h - LL_PAD.top - LL_PAD.bottom;
     if (range <= 0 || chartH <= 0) return [];
     const interval = niceInterval(range);
     const result: { val: number; y: number }[] = [];
-    const start = Math.ceil(yRange.min / interval) * interval;
-    for (let v = start; v <= yRange.max; v += interval) {
-      result.push({ val: v, y: LL_PAD.top + (1 - (v - yRange.min) / range) * chartH });
+    const start = Math.ceil(liveRange.min / interval) * interval;
+    for (let v = start; v <= liveRange.max; v += interval) {
+      result.push({ val: v, y: LL_PAD.top + (1 - (v - liveRange.min) / range) * chartH });
     }
     return result;
-  }, [yRange, dims.h]);
+  }, [liveRange, dims.h]);
 
   // Sliding overlay: matches liveline's time mapping in the data area,
   // then projects linearly into the future zone for times beyond the live dot.
@@ -119,22 +171,18 @@ export default function LiteChart() {
   }
   const [overlay, setOverlay] = useState<OverlayState>({ startPx: null, endPx: null, liveDotX: 0, timeLabels: [] });
 
-  // Ref for yRange so rAF callback always has current value
-  const yRangeRef = useRef(yRange);
-  yRangeRef.current = yRange;
-
   // Direct DOM refs for overlay elements — positioned in rAF, no React render lag
   const activeAreaRef = useRef<HTMLDivElement>(null);
-  const startLineRef = useRef<HTMLDivElement>(null);
-  const endLineRef = useRef<HTMLDivElement>(null);
+  const startVertLineRef = useRef<HTMLDivElement>(null);
+  const endVertLineRef = useRef<HTMLDivElement>(null);
   const lastLabelUpdate = useRef(0);
 
   useEffect(() => {
     if (roundStartSec <= 0 || roundEndSec <= 0 || dims.w <= 0) {
       setOverlay(prev => prev.timeLabels.length === 0 ? prev : { ...prev, timeLabels: [] });
       if (activeAreaRef.current) activeAreaRef.current.style.display = 'none';
-      if (startLineRef.current) startLineRef.current.style.display = 'none';
-      if (endLineRef.current) endLineRef.current.style.display = 'none';
+      if (startVertLineRef.current) startVertLineRef.current.style.display = 'none';
+      if (endVertLineRef.current) endVertLineRef.current.style.display = 'none';
       chartCoordsRef.current = null;
       return;
     }
@@ -178,12 +226,12 @@ export default function LiteChart() {
           aa.style.display = 'none';
         }
       }
-      const sl = startLineRef.current;
+      const sl = startVertLineRef.current;
       if (sl) {
         sl.style.display = startOk ? '' : 'none';
         if (startOk) sl.style.transform = `translateX(${sx}px)`;
       }
-      const elEnd = endLineRef.current;
+      const elEnd = endVertLineRef.current;
       if (elEnd) {
         elEnd.style.display = endOk ? '' : 'none';
         if (endOk) elEnd.style.transform = `translateX(${ex}px)`;
@@ -222,7 +270,7 @@ export default function LiteChart() {
       }
 
       // ── Expose coordinate mapper for TradeBubbles ──
-      const yr = yRangeRef.current;
+      const lr = liveRangeRef.current;
       const chartH = H - LL_PAD.top - LL_PAD.bottom;
       const contentW = futureZoneRight - LL_PAD.left;
       chartCoordsRef.current = {
@@ -233,10 +281,10 @@ export default function LiteChart() {
           return x;
         },
         priceToY: (price: number) => {
-          if (!yr || chartH <= 0) return null;
-          const range = yr.max - yr.min;
+          if (!lr || chartH <= 0) return null;
+          const range = lr.max - lr.min;
           if (range <= 0) return null;
-          const y = LL_PAD.top + (1 - (price - yr.min) / range) * chartH;
+          const y = LL_PAD.top + (1 - (price - lr.min) / range) * chartH;
           // Bounds check: hide if price scrolled out of view
           if (y < LL_PAD.top - 20 || y > LL_PAD.top + chartH + 20) return null;
           return y;
@@ -346,6 +394,9 @@ export default function LiteChart() {
         timeAxis={false}
         dashLineColor={priceBadgeColor}
         window={WINDOW_SEC}
+        lerpSpeed={LERP_SPEED}
+        referenceLine={effectiveStrike > 0 ? { value: effectiveStrike } : undefined}
+        onRangeUpdate={handleRangeUpdate}
         formatValue={(v: number) => `$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
         padding={LL_PAD}
       />
@@ -369,56 +420,37 @@ export default function LiteChart() {
         </div>
       ))}
 
-      {/* Strike price — blue horizontal line + Y-axis label (matching pro style) */}
-      {effectiveStrike > 0 && yRange && (() => {
-        const range = yRange.max - yRange.min;
-        const chartH = dims.h - LL_PAD.top - LL_PAD.bottom;
-        if (range <= 0 || chartH <= 0) return null;
-        const strikeY = LL_PAD.top + (1 - (effectiveStrike - yRange.min) / range) * chartH;
-        return (
-          <>
-            {/* Dashed blue horizontal strike line */}
-            <div style={{
-              position: 'absolute', left: LL_PAD.left, right: YAXIS_W,
-              top: strikeY, height: 0,
-              borderTop: '2px dashed #001eff', zIndex: 3, pointerEvents: 'none',
-            }} />
-            {/* Blue Y-axis label for strike price */}
-            <div style={{
-              position: 'absolute', right: 4, top: strikeY, transform: 'translateY(-50%)',
-              padding: '3px 9px', borderRadius: 5, background: '#001eff',
-              fontSize: 16, fontWeight: 600, color: '#fff', zIndex: 8,
-              fontFamily: "'IBM Plex Mono', monospace",
-              whiteSpace: 'nowrap', pointerEvents: 'none',
-            }}>
-              {effectiveStrike.toLocaleString('en-US', { minimumFractionDigits: 2 })}
-            </div>
-          </>
-        );
-      })()}
+      {/* Strike line — positioned by ref from Liveline's onRangeUpdate (frame-synced) */}
+      <div ref={strikeLineRef} style={{
+        position: 'absolute', left: LL_PAD.left, right: YAXIS_W,
+        height: 0, borderTop: '2px dashed #001eff',
+        zIndex: 3, pointerEvents: 'none', display: 'none',
+      }} />
+      {/* Strike price Y-axis badge — positioned by ref (frame-synced) */}
+      <div ref={strikeBadgeRef} style={{
+        position: 'absolute', right: 4, transform: 'translateY(-50%)',
+        padding: '3px 9px', borderRadius: 5, background: '#001eff',
+        fontSize: 16, fontWeight: 600, color: '#fff', zIndex: 8,
+        fontFamily: "'IBM Plex Mono', monospace",
+        whiteSpace: 'nowrap', pointerEvents: 'none', display: 'none',
+      }}>
+        {effectiveStrike > 0 ? effectiveStrike.toLocaleString('en-US', { minimumFractionDigits: 2 }) : ''}
+      </div>
 
-      {/* Current price Y-axis label — green when up, red when down */}
-      {value > 0 && yRange && (() => {
-        const range = yRange.max - yRange.min;
-        const chartH = dims.h - LL_PAD.top - LL_PAD.bottom;
-        if (range <= 0 || chartH <= 0) return null;
-        const priceY = LL_PAD.top + (1 - (value - yRange.min) / range) * chartH;
-        return (
-          <div style={{
-            position: 'absolute', right: 4, top: priceY, transform: 'translateY(-50%)',
-            padding: '3px 9px', borderRadius: 5, background: priceBadgeColor,
-            fontSize: 16, fontWeight: 600, color: '#fff', zIndex: 8,
-            fontFamily: "'IBM Plex Mono', monospace",
-            whiteSpace: 'nowrap', pointerEvents: 'none',
-            transition: 'background 0.3s ease',
-          }}>
-            {value.toLocaleString('en-US', { minimumFractionDigits: 2 })}
-          </div>
-        );
-      })()}
+      {/* Current price Y-axis badge — positioned by ref (frame-synced) */}
+      <div ref={priceBadgeRef} style={{
+        position: 'absolute', right: 4, transform: 'translateY(-50%)',
+        padding: '3px 9px', borderRadius: 5, background: priceBadgeColor,
+        fontSize: 16, fontWeight: 600, color: '#fff', zIndex: 8,
+        fontFamily: "'IBM Plex Mono', monospace",
+        whiteSpace: 'nowrap', pointerEvents: 'none',
+        transition: 'background 0.3s ease',
+      }}>
+        {value > 0 ? value.toLocaleString('en-US', { minimumFractionDigits: 2 }) : ''}
+      </div>
 
       {/* Round START vertical line — positioned by ref */}
-      <div ref={startLineRef} style={{
+      <div ref={startVertLineRef} style={{
         position: 'absolute', left: 0, top: LL_PAD.top, bottom: LL_PAD.bottom,
         width: 0, borderLeft: '1px solid rgba(238,238,238,0.22)',
         zIndex: 6, pointerEvents: 'none',
@@ -426,7 +458,7 @@ export default function LiteChart() {
       }} />
 
       {/* Round END vertical line — positioned by ref */}
-      <div ref={endLineRef} style={{
+      <div ref={endVertLineRef} style={{
         position: 'absolute', left: 0, top: LL_PAD.top, bottom: LL_PAD.bottom,
         width: 0, borderLeft: '1px solid rgba(238,238,238,0.22)',
         zIndex: 6, pointerEvents: 'none',

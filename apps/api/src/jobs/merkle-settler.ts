@@ -4,7 +4,7 @@ import { TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddress } from '@solana/spl-to
 import { db, markets, positions, settlements, users } from '../db/index.js';
 import { positionService } from '../services/position.service.js';
 import { marketService } from '../services/market.service.js';
-import { anchorClient, getYesMintPda, getNoMintPda } from '../lib/anchor-client.js';
+import { anchorClient, getYesMintPda, getNoMintPda, fetchMarketV2OnChainState } from '../lib/anchor-client.js';
 import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
 import { buildMerkleTree, createSettlementLeaf, verifyMerkleProof, verifyCompactBridgeProof, type SettlementLeaf, type MerkleTree } from '../lib/merkle-tree.js';
 import { broadcastUserSettlement } from '../lib/broadcasts.js';
@@ -198,6 +198,15 @@ export function markRootPosted(marketId: string): void {
 }
 
 /**
+ * Invalidate pre-seeded settling state for a market.
+ * Called when the combined resolve+postMerkleRoot fails (e.g., settlement
+ * amount exceeds open_interest due to pending match TXs).
+ */
+export function invalidateSettlingState(marketId: string): void {
+  settlingState.delete(marketId);
+}
+
+/**
  * Direct trigger for merkle settlement — called from market-resolver and
  * onchain-submit worker to eliminate polling gaps.
  * Safe to call multiple times: idempotent pipeline + processingMarkets guard.
@@ -281,7 +290,80 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
     settlingState.set(marketId, state);
   }
 
-  // Step 2: Post merkle root on-chain (skip if combined resolve+post already did it)
+  // Step 2: Validate settlement amount against on-chain open_interest, then post merkle root
+  //
+  // The matching engine updates DB positions IMMEDIATELY when orders match, but
+  // on-chain match TXs go through BullMQ and may still be pending. Once the market
+  // resolves on-chain, pending match TXs will FAIL (market no longer Open), and the
+  // db-sync worker reverses those positions. We must wait for this to happen.
+  if (!state.rootPosted) {
+    try {
+      const chainState = await fetchMarketV2OnChainState(
+        anchorClient.getConnection(),
+        new PublicKey(marketPubkey),
+      );
+      if (chainState) {
+        const onChainOI = chainState.openInterest;
+        if (state.totalAmount > onChainOI) {
+          const drift = state.totalAmount - onChainOI;
+          const count = (marketFailureCount.get(marketId) || 0) + 1;
+          marketFailureCount.set(marketId, count);
+
+          // Small drift (<1000 lamports / $0.001) is precision rounding from
+          // float→integer aggregation and will NEVER self-resolve. Cap immediately.
+          // Larger drift may be from pending match TXs that haven't been reversed
+          // yet — give them 2 cycles to propagate before capping.
+          const PRECISION_DRIFT_THRESHOLD = 1000n; // 1000 lamports = $0.001
+          const isSmallDrift = drift <= PRECISION_DRIFT_THRESHOLD;
+          const shouldCap = isSmallDrift || count >= 3;
+
+          if (!shouldCap) {
+            logger.warn(
+              `[MerkleSettler] totalAmount=${state.totalAmount} > on-chain open_interest=${onChainOI} ` +
+              `(drift=${drift}, attempt ${count}/3). Waiting for pending TX reversals.`
+            );
+            // Invalidate pre-seeded state so next cycle rebuilds from fresh DB
+            settlingState.delete(marketId);
+            return;
+          }
+
+          // Cap to on-chain open_interest (the authoritative USDC vault balance)
+          logger.warn(
+            `[MerkleSettler] Capping settlement to on-chain open_interest: ` +
+            `drift=${drift} lamports${isSmallDrift ? ' (precision rounding)' : ` (persisted after ${count} attempts)`}`
+          );
+
+          // Invalidate and rebuild from fresh DB state
+          settlingState.delete(marketId);
+          const rebuilt = await buildSettlementState(market, outcome);
+          if (!rebuilt) {
+            await marketService.markSettled(marketId);
+            marketFailureCount.delete(marketId);
+            return;
+          }
+          // Scale each leaf proportionally to fit on-chain open_interest
+          if (rebuilt.totalAmount > onChainOI) {
+            const scale = Number(onChainOI) / Number(rebuilt.totalAmount);
+            for (const leaf of rebuilt.leaves) {
+              leaf.amount = BigInt(Math.floor(Number(leaf.amount) * scale));
+            }
+            rebuilt.totalAmount = rebuilt.leaves.reduce((s, l) => s + l.amount, 0n);
+            // Rebuild merkle tree with adjusted amounts
+            const treeLeaves: SettlementLeaf[] = rebuilt.leaves.map(l => ({ recipient: l.recipient, amount: l.amount }));
+            rebuilt.tree = buildMerkleTree(treeLeaves);
+            logger.info(`[MerkleSettler] Capped totalAmount to ${rebuilt.totalAmount} (scale=${scale.toFixed(8)}, drift was ${drift} lamports)`);
+          }
+          state = rebuilt;
+          settlingState.set(marketId, state);
+          marketFailureCount.delete(marketId);
+        }
+      }
+    } catch (err: any) {
+      logger.warn(`[MerkleSettler] Could not fetch on-chain market state: ${err.message}`);
+      // Continue anyway — the postMerkleRoot call will fail with a clearer error if needed
+    }
+  }
+
   if (state.rootPosted) {
     logger.info(`[MerkleSettler] Merkle root already posted via combined instruction for ${market.asset}-${market.timeframe}, skipping to batch creation`);
     marketFailureCount.delete(marketId);
@@ -303,7 +385,6 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
       marketFailureCount.delete(marketId);
     } else if (msg.includes('MarketNotResolved') || msg.includes('0x177a')) {
       // Market is NOT resolved on-chain yet — can't post merkle root.
-      // This is NOT the same as "already posted". Track failures and give up after max retries.
       const count = (marketFailureCount.get(marketId) || 0) + 1;
       marketFailureCount.set(marketId, count);
       if (count >= MAX_SETTLEMENT_FAILURES) {
@@ -314,13 +395,14 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
       } else {
         logger.warn(`[MerkleSettler] Market ${marketId} not resolved on-chain (attempt ${count}/${MAX_SETTLEMENT_FAILURES}), will retry next cycle`);
       }
-      return; // Don't continue to batch settlement — market isn't ready
+      return;
     } else if (msg.includes('InvalidSettlementAmount') || msg.includes('0x17a9')) {
-      // Vault has insufficient funds — on-chain match likely never executed.
-      logger.error(`[MerkleSettler] SETTLEMENT FAILED for market ${marketId} (${market.asset}-${market.timeframe}): settlement amount exceeds on-chain open interest. Vault likely unfunded — on-chain match may have failed. Marking as SETTLEMENT_FAILED.`);
-      await marketService.markSettlementFailed(marketId);
+      // Hit despite pre-check — race between fetch and TX, or chain state changed.
+      // Invalidate and retry; the pre-check logic on next cycle will cap immediately
+      // for small drifts or after 3 cycles for larger ones.
+      logger.warn(`[MerkleSettler] InvalidSettlementAmount despite pre-check. Invalidating state for rebuild with cap.`);
       settlingState.delete(marketId);
-      marketFailureCount.delete(marketId);
+      // Don't reset failure count — let the pre-check cap logic use it
       return;
     } else {
       throw err;
@@ -551,11 +633,13 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
   // Step 5: Sync settlements to DB immediately (user-facing — don't wait for cleanup)
   await syncSettlementToDb(market, state, outcome);
 
-  // Step 6: Burn remaining share tokens (cleanup — non-blocking for UX)
+  // Step 6: Burn remaining share tokens — BLOCKING to ensure mint supply = 0
+  // If mints have supply > 0, finalize_market_v2 can't close them, leaking ~0.003 SOL each.
   const marketPk = new PublicKey(marketPubkey);
   const yesMint = getYesMintPda(marketPk);
   const noMint = getNoMintPda(marketPk);
 
+  let burnSuccess = true;
   try {
     const allPositions = await positionService.getPositionsForSettlement(marketId);
     const userIds = [...new Set(allPositions.map(p => p.userId).filter(Boolean) as string[])];
@@ -575,23 +659,47 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
 
     if (shareAtas.length > 0) {
       const BURN_BATCH_SIZE = 20;
+      const MAX_BURN_RETRIES = 2;
       for (let i = 0; i < shareAtas.length; i += BURN_BATCH_SIZE) {
         const batch = shareAtas.slice(i, i + BURN_BATCH_SIZE);
-        try {
-          const sig = await anchorClient.burnRemainingSharesV2({
-            marketPubkey,
-            yesMint: yesMint.toBase58(),
-            noMint: noMint.toBase58(),
-            userShareAtas: batch,
-          });
-          logger.info(`[MerkleSettler] Burned shares batch ${Math.floor(i / BURN_BATCH_SIZE) + 1}: ${sig}`);
-        } catch (burnErr: any) {
-          logger.warn(`[MerkleSettler] Burn batch warning: ${burnErr.message}`);
+        let burned = false;
+        for (let attempt = 0; attempt <= MAX_BURN_RETRIES; attempt++) {
+          try {
+            const sig = await anchorClient.burnRemainingSharesV2({
+              marketPubkey,
+              yesMint: yesMint.toBase58(),
+              noMint: noMint.toBase58(),
+              userShareAtas: batch,
+            });
+            logger.info(`[MerkleSettler] Burned shares batch ${Math.floor(i / BURN_BATCH_SIZE) + 1}: ${sig}`);
+            burned = true;
+            break;
+          } catch (burnErr: any) {
+            const msg = burnErr.message || '';
+            // AccountNotFound = ATA doesn't exist (user never received shares or already burned) — safe to skip
+            if (msg.includes('AccountNotFound') || msg.includes('could not find account')) {
+              logger.debug(`[MerkleSettler] Burn batch ${Math.floor(i / BURN_BATCH_SIZE) + 1}: some ATAs not found (already burned), continuing`);
+              burned = true;
+              break;
+            }
+            if (attempt < MAX_BURN_RETRIES) {
+              logger.warn(`[MerkleSettler] Burn batch ${Math.floor(i / BURN_BATCH_SIZE) + 1} attempt ${attempt + 1} failed: ${msg}, retrying...`);
+              await new Promise(r => setTimeout(r, 1000)); // 1s backoff
+            } else {
+              logger.error(`[MerkleSettler] Burn batch ${Math.floor(i / BURN_BATCH_SIZE) + 1} failed after ${MAX_BURN_RETRIES + 1} attempts: ${msg}`);
+              burnSuccess = false;
+            }
+          }
         }
       }
     }
   } catch (err: any) {
-    logger.warn(`[MerkleSettler] Share burn step failed (non-fatal): ${err.message}`);
+    logger.error(`[MerkleSettler] Share burn step failed: ${err.message}`);
+    burnSuccess = false;
+  }
+
+  if (!burnSuccess) {
+    logger.warn(`[MerkleSettler] Some burn batches failed for ${marketId} — finalize will skip mint closure for affected mints (rent leak ~0.003 SOL per unclosed mint)`);
   }
 
   // Step 8: Finalize market on-chain

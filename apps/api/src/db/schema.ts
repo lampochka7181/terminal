@@ -353,6 +353,13 @@ export const mmMarketMetrics = pgTable('mm_market_metrics', {
   settledAt: timestamp('settled_at').defaultNow(),
 });
 
+// Waitlist table
+export const waitlist = pgTable('waitlist', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  email: varchar('email', { length: 255 }).unique().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
 // Relations
 export const usersRelations = relations(users, ({ many }) => ({
   orders: many(orders),

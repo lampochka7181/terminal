@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { ChevronDown } from 'lucide-react';
 import Header from './components/Header';
 import ChartToolbar from './components/ChartToolbar';
@@ -71,6 +71,81 @@ export default function App() {
 
   const isPro = viewMode === 'pro';
 
+  // --- Panel resize (pro mode) ---
+  const DEFAULT_BOTTOM_H = 280;
+  const defaultSidebarW = () => (window.innerWidth <= 1600 ? 405 : 540);
+
+  const [bottomHeight, setBottomHeight] = useState<number>(() => {
+    try { return parseInt(localStorage.getItem('degen-panel-bottom') || '') || DEFAULT_BOTTOM_H; }
+    catch { return DEFAULT_BOTTOM_H; }
+  });
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try { return parseInt(localStorage.getItem('degen-panel-sidebar') || '') || defaultSidebarW(); }
+    catch { return defaultSidebarW(); }
+  });
+
+  const resizingRef = useRef<'bottom' | 'sidebar' | null>(null);
+  const startPosRef = useRef(0);
+  const startSizeRef = useRef(0);
+  const bottomHRef = useRef(bottomHeight);
+  bottomHRef.current = bottomHeight;
+  const sidebarWRef = useRef(sidebarWidth);
+  sidebarWRef.current = sidebarWidth;
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!resizingRef.current) return;
+      e.preventDefault();
+      if (resizingRef.current === 'bottom') {
+        const delta = startPosRef.current - e.clientY;
+        setBottomHeight(Math.max(150, Math.min(600, startSizeRef.current + delta)));
+      } else {
+        const delta = startPosRef.current - e.clientX;
+        setSidebarWidth(Math.max(320, Math.min(750, startSizeRef.current + delta)));
+      }
+    };
+    const onUp = () => {
+      if (!resizingRef.current) return;
+      if (resizingRef.current === 'bottom') {
+        localStorage.setItem('degen-panel-bottom', bottomHRef.current.toString());
+      } else {
+        localStorage.setItem('degen-panel-sidebar', sidebarWRef.current.toString());
+      }
+      resizingRef.current = null;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    return () => { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); };
+  }, []);
+
+  const startBottomResize = useCallback((e: React.MouseEvent) => {
+    resizingRef.current = 'bottom';
+    startPosRef.current = e.clientY;
+    startSizeRef.current = bottomHeight;
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+  }, [bottomHeight]);
+
+  const startSidebarResize = useCallback((e: React.MouseEvent) => {
+    resizingRef.current = 'sidebar';
+    startPosRef.current = e.clientX;
+    startSizeRef.current = sidebarWidth;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }, [sidebarWidth]);
+
+  const resetBottomHeight = useCallback(() => {
+    setBottomHeight(DEFAULT_BOTTOM_H);
+    localStorage.removeItem('degen-panel-bottom');
+  }, []);
+
+  const resetSidebarWidth = useCallback(() => {
+    setSidebarWidth(defaultSidebarW());
+    localStorage.removeItem('degen-panel-sidebar');
+  }, []);
+
   // Wire up real market + price data
   useMarkets({ asset: 'BTC', status: 'OPEN' });
   usePrices();
@@ -94,8 +169,8 @@ export default function App() {
     <div className="app-root">
       <Header onHowItWorks={() => setShowHowItWorks(true)} />
 
-      <div className="app-body">
-        <div className="left-column">
+      <div className="app-body" style={isPro ? { gap: 0 } : undefined}>
+        <div className="left-column" style={isPro ? { gap: 0 } : undefined}>
           <div className="chart-row">
             <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, minHeight: 0, overflow: 'hidden' }}>
               {/* Asset info bar — identical layout in both modes */}
@@ -180,10 +255,20 @@ export default function App() {
             </div>
           </div>
 
-          {isPro && <BottomPanel />}
+          {isPro && (
+            <>
+              <div className="resize-handle-h" onMouseDown={startBottomResize} onDoubleClick={resetBottomHeight} />
+              <BottomPanel height={bottomHeight} />
+            </>
+          )}
         </div>
 
-        {isPro ? <RightSidebar /> : <LiteSidebar />}
+        {isPro ? (
+          <>
+            <div className="resize-handle-v" onMouseDown={startSidebarResize} onDoubleClick={resetSidebarWidth} />
+            <RightSidebar width={sidebarWidth} />
+          </>
+        ) : <LiteSidebar />}
       </div>
 
       {showOnboarding && (

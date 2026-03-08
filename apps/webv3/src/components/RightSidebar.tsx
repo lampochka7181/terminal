@@ -19,7 +19,7 @@ const dim = 'rgba(238,238,238,0.33)';
 
 
 
-export default function RightSidebar() {
+export default function RightSidebar({ width }: { width?: number }) {
   const { isAuthenticated, wallet, signIn } = useAuth();
   const { balance } = useUser();
   const sessionKey = useSessionKey();
@@ -240,7 +240,7 @@ export default function RightSidebar() {
   return (
     <>
       <div style={{
-        width: 'var(--sidebar-width)', minWidth: 'var(--sidebar-width)', background: '#1e1e1e', borderRadius: 17,
+        width: width ?? 'var(--sidebar-width)', minWidth: width ?? 'var(--sidebar-width)', background: '#1e1e1e', borderRadius: 17,
         display: 'flex', flexDirection: 'column', overflow: 'hidden',
       }}>
         {/* Balance */}

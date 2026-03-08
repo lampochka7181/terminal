@@ -5,7 +5,7 @@ import { redis, RedisKeys } from '../db/redis.js';
 
 export type MarketStatus = 'PENDING' | 'OPEN' | 'CLOSED' | 'RESOLVED' | 'SETTLED';
 export type Asset = 'BTC' | 'ETH' | 'SOL';
-export type Timeframe = '5m' | '15m' | '1h' | '4h';
+export type Timeframe = '1m' | '5m' | '15m' | '1h' | '4h';
 
 export interface MarketFilter {
   asset?: Asset;
@@ -59,7 +59,7 @@ export class MarketService {
         
         // Also clear any asset+timeframe combos
         for (const asset of ['BTC', 'ETH', 'SOL']) {
-          for (const timeframe of ['5m', '15m', '1h', '4h', '24h']) {
+          for (const timeframe of ['1m', '5m', '15m', '1h', '4h', '24h']) {
             keysToDelete.push(RedisKeys.markets(JSON.stringify({ asset, timeframe })));
             keysToDelete.push(RedisKeys.markets(JSON.stringify({ asset, timeframe, status: 'OPEN' })));
           }
@@ -426,6 +426,7 @@ export class MarketService {
     // Filter to markets whose start time has arrived
     // Start time = expiry - duration (e.g., for 5m market expiring at 12:05, start is 12:00)
     const timeframeDurations: Record<string, number> = {
+      '1m': 60 * 1000,
       '5m': 5 * 60 * 1000,
       '15m': 15 * 60 * 1000,
       '1h': 60 * 60 * 1000,
@@ -433,10 +434,19 @@ export class MarketService {
       '24h': 24 * 60 * 60 * 1000,
     };
     
+    // For 5m+ markets: activate 1.5s EARLY so the TX confirms before the
+    // old market expires, giving near-zero downtime between rounds.
+    //
+    // For 1m markets: activate at or just AFTER round start (lead=0).
+    // This gives the freshest possible strike price — the price snapshot
+    // is taken within ~0-1s of the round boundary instead of 1-2s before.
+    // Trade-off: there's a brief ~0.5s window at round start where the
+    // market is still PENDING, but for 1m that's only 0.8% of the round.
+    const activationLeadMs = (tf: string) => tf === '1m' ? 0 : 1500;
     return result.filter(m => {
       const duration = timeframeDurations[m.timeframe] || 5 * 60 * 1000;
       const startTime = new Date(m.expiryAt.getTime() - duration);
-      return startTime <= now;
+      return startTime.getTime() <= now.getTime() + activationLeadMs(m.timeframe);
     });
   }
 

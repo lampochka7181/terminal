@@ -58,6 +58,10 @@ interface MMConfig {
   tickMs: number;
   closeBeforeExpiryMs: number;
   assets: string[];
+
+  // Certainty gate — suppress winning-side quotes when outcome is near-certain
+  certaintyThreshold: number;
+  certaintyTimeScaling: boolean;
 }
 
 function loadConfig(): MMConfig {
@@ -80,8 +84,11 @@ function loadConfig(): MMConfig {
     volCeiling:        parseFloat(process.env.MM_VOL_CEILING || '1.50'),
 
     tickMs:            parseInt(process.env.MM_TICK_MS || '500', 10),
-    closeBeforeExpiryMs: parseInt(process.env.MM_CLOSE_BEFORE_EXPIRY_MS || '2000', 10),
+    closeBeforeExpiryMs: parseInt(process.env.MM_CLOSE_BEFORE_EXPIRY_MS || '5000', 10),
     assets:            (process.env.MM_ASSETS || 'BTC').split(',').map(s => s.trim()).filter(Boolean),
+
+    certaintyThreshold:   parseFloat(process.env.MM_CERTAINTY_THRESHOLD || '0.95'),
+    certaintyTimeScaling: (process.env.MM_CERTAINTY_TIME_SCALING || 'true') === 'true',
   };
 }
 
@@ -254,7 +261,7 @@ class MarketMakerBot {
     state.lastSkew = skew;
 
     // Generate and place quotes
-    const quotes = this.generateQuotes(fv, spread, skew, state);
+    const quotes = this.generateQuotes(fv, spread, skew, state, timeRemainingPct);
     await this.updateOrders(marketId, quotes);
     await this.broadcastBook(state);
 
@@ -327,9 +334,19 @@ class MarketMakerBot {
     spread: number,
     skew: number,
     state: MarketState,
+    timeRemainingPct: number,
   ): { bids: Quote[]; asks: Quote[] } {
     const bids: Quote[] = [];
     const asks: Quote[] = [];
+
+    // Certainty gate: suppress the winning side when outcome is near-certain.
+    // Threshold tightens as expiry approaches (second half of round only).
+    const threshold = this.cfg.certaintyTimeScaling && timeRemainingPct < 0.5
+      ? this.cfg.certaintyThreshold - 0.05 * (1 - timeRemainingPct * 2)
+      : this.cfg.certaintyThreshold;
+
+    const suppressAsks = fv >= threshold;      // YES near-certain → don't sell YES
+    const suppressBids = fv <= 1 - threshold;  // NO near-certain  → don't buy YES
 
     for (let lvl = 0; lvl < this.cfg.levels; lvl++) {
       const offset = lvl * this.cfg.levelSpacing;
@@ -355,12 +372,11 @@ class MarketMakerBot {
       const bidSize = Math.max(rawSize, Math.ceil(this.cfg.minNotional / bidPrice));
       const askSize = Math.max(rawSize, Math.ceil(this.cfg.minNotional / askPrice));
 
-      // Respect position limits
-      if (state.yesShares + bidSize <= this.cfg.maxPosition) {
+      // Respect position limits; skip side if suppressed by certainty gate
+      if (!suppressBids && state.yesShares + bidSize <= this.cfg.maxPosition) {
         bids.push({ price: bidPrice, size: bidSize });
       }
-      // Selling YES = gaining NO exposure
-      if (state.noShares + askSize <= this.cfg.maxPosition) {
+      if (!suppressAsks && state.noShares + askSize <= this.cfg.maxPosition) {
         asks.push({ price: askPrice, size: askSize });
       }
     }
@@ -602,6 +618,60 @@ class MarketMakerBot {
     await this.syncMarkets();
     await this.tick();
     mmLogger.info(`[MM] Forced sync complete. Active markets: ${this.markets.size}`);
+  }
+
+  /**
+   * Instantly notify the MM bot that a market was just activated.
+   * Called directly from the market activator — bypasses the 5s sync cache entirely.
+   * The bot adds the market and places initial quotes within the same call (~50ms).
+   */
+  async notifyMarketActivated(data: {
+    id: string;
+    pubkey: string;
+    asset: string;
+    timeframe: string;
+    strikePrice: number;
+    expiryAt: number;
+  }): Promise<void> {
+    if (!this.running || !this.initialized) return;
+
+    // Check asset filter
+    if (this.cfg.assets.length > 0 && !this.cfg.assets.includes(data.asset)) return;
+
+    // Already tracking this market
+    if (this.markets.has(data.id)) return;
+
+    // Add the market instantly — no DB query needed (activator has all the data)
+    this.markets.set(data.id, {
+      id: data.id,
+      pubkey: data.pubkey,
+      asset: data.asset,
+      timeframe: data.timeframe,
+      strike: data.strikePrice,
+      expiryAt: data.expiryAt,
+      createdAt: Date.now(),
+      orders: new Map(),
+      yesShares: 0,
+      noShares: 0,
+      lastFairValue: 0.50,
+      lastSpread: this.cfg.baseSpread,
+      lastSkew: 0,
+      lastPrice: 0,
+    });
+
+    mmLogger.info(
+      `[MM] Instant activation: ${data.asset}-${data.timeframe} strike=$${data.strikePrice.toFixed(2)}`,
+    );
+
+    // Immediately place initial quotes for this market
+    const state = this.markets.get(data.id);
+    if (state) {
+      try {
+        await this.updateMarket(data.id, state);
+      } catch (err) {
+        mmLogger.error(`[MM] Initial quote failed for ${data.asset}-${data.timeframe}: ${err}`);
+      }
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────

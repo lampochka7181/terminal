@@ -1736,6 +1736,9 @@ function useLivelineEngine(canvasRef, containerRef, config) {
     targetMaxRef.current = rangeResult.targetMax;
     displayMinRef.current = rangeResult.displayMin;
     displayMaxRef.current = rangeResult.displayMax;
+    if (cfg.onRangeUpdate) {
+      cfg.onRangeUpdate({ min: rangeResult.displayMin, max: rangeResult.displayMax });
+    }
     const { minVal, maxVal, valRange } = rangeResult;
     const momentum = cfg.momentumOverride ?? detectMomentum(visible);
     const layout = {
@@ -1898,6 +1901,7 @@ function Liveline({
   lerpSpeed = 0.08,
   padding: paddingOverride,
   onHover,
+  onRangeUpdate,
   cursor = "crosshair",
   pulse = true,
   timeAxis = true,
@@ -1972,7 +1976,8 @@ function Liveline({
     paused,
     emptyText,
     showTimeAxis: timeAxis,
-    dashLineColor
+    dashLineColor,
+    onRangeUpdate
   });
   const cursorStyle = scrub ? cursor : "default";
   return /* @__PURE__ */ jsxs(Fragment, { children: [

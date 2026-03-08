@@ -311,18 +311,53 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
 
       // IMMEDIATE POSITION UPDATE: Use position data from response for instant UI update
       // This avoids the extra API round-trip that was causing 1-2 second delays
+      // NOTE: response.position contains only THIS order's shares/cost (not aggregate).
+      // We must accumulate onto any existing position to avoid flickering on repeat buys.
       if (response.position) {
         console.log(`[⏱️ ORDER TIMING] T+${(performance.now()-t0).toFixed(0)}ms: Updating position in store...`);
-        // Use the order's avgPrice as the entry price if available (more accurate than position.avgEntryPrice)
-        const positionWithCorrectEntry = {
-          ...response.position,
-          avgEntryPrice: response.avgPrice || response.position.avgEntryPrice,
-          totalCost: response.position.totalCost ?? (response.avgPrice && response.filledSize
-            ? response.avgPrice * response.filledSize
-            : undefined),
-        };
-        useUserStore.getState().upsertPosition(positionWithCorrectEntry);
-        console.log(`[⏱️ ORDER TIMING] T+${(performance.now()-t0).toFixed(0)}ms: Position store updated! Entry: $${positionWithCorrectEntry.avgEntryPrice}`);
+        const store = useUserStore.getState();
+        const existing = store.positions.find(p => p.marketAddress === response.position.marketAddress);
+        const fillPrice = response.avgPrice || response.position.avgEntryPrice;
+        const isYes = response.position.yesShares > 0;
+        const fillShares = isYes ? response.position.yesShares : response.position.noShares;
+        const fillCost = response.position.totalCost ?? (fillPrice && fillShares ? fillPrice * fillShares : 0);
+
+        if (existing && params.side === 'bid') {
+          // Accumulate shares onto existing position (same logic as handleFill)
+          const updated = { ...existing };
+          if (isYes) {
+            const curShares = existing.yesShares || 0;
+            const curAvg = existing.avgEntryYes ?? existing.avgEntryPrice ?? 0;
+            updated.avgEntryYes = curShares > 0
+              ? (curShares * curAvg + fillShares * fillPrice) / (curShares + fillShares)
+              : fillPrice;
+            updated.yesShares = curShares + fillShares;
+            updated.avgEntryPrice = updated.avgEntryYes;
+          } else {
+            const curShares = existing.noShares || 0;
+            const curAvg = existing.avgEntryNo ?? existing.avgEntryPrice ?? 0;
+            updated.avgEntryNo = curShares > 0
+              ? (curShares * curAvg + fillShares * fillPrice) / (curShares + fillShares)
+              : fillPrice;
+            updated.noShares = curShares + fillShares;
+            updated.avgEntryPrice = updated.avgEntryNo;
+          }
+          updated.totalCost = (existing.totalCost ?? 0) + fillCost;
+          updated.status = 'open';
+          store.upsertPosition(updated);
+        } else if (!existing || params.side === 'bid') {
+          // New position — use API data directly
+          const positionWithCorrectEntry = {
+            ...response.position,
+            avgEntryPrice: fillPrice,
+            totalCost: fillCost || undefined,
+          };
+          store.upsertPosition(positionWithCorrectEntry);
+        } else {
+          // Sell — use API data as-is (reduces shares)
+          store.upsertPosition(response.position);
+        }
+        console.log(`[⏱️ ORDER TIMING] T+${(performance.now()-t0).toFixed(0)}ms: Position store updated! Entry: $${fillPrice}`);
       } else if (response.position === null && params.side === 'ask' && response.status === 'filled') {
         // Position was fully closed (sell order that was filled, not cancelled)
         console.log('[Order] Position fully closed, removing from state');
@@ -366,8 +401,9 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
       let shouldRefreshPositions = false;
       
       if (err instanceof ApiError) {
-        // Handle specific leverage-related errors
-        if (err.code === 'POSITION_BEING_LIQUIDATED') {
+        if (err.code === 'RATE_LIMITED') {
+          errorMessage = 'Slow down — you are sending too many requests. Wait a moment and try again.';
+        } else if (err.code === 'POSITION_BEING_LIQUIDATED') {
           errorMessage = '⚠️ This position is being liquidated. Please wait for the liquidation to complete.';
           shouldRefreshPositions = true;
         } else if (err.code === 'POSITION_ALREADY_CLOSED') {

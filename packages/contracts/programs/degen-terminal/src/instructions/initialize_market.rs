@@ -68,7 +68,7 @@ pub fn initialize_market(
     require!(valid_assets.contains(&asset.as_str()), DegenError::InvalidAsset);
     
     // Validate timeframe
-    let valid_timeframes = ["5m", "15m", "1h", "4h", "24h"];
+    let valid_timeframes = ["1m", "5m", "15m", "1h", "4h", "24h"];
     require!(valid_timeframes.contains(&timeframe.as_str()), DegenError::InvalidTimeframe);
     
     // Update global state

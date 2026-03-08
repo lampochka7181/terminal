@@ -7,7 +7,7 @@ import { broadcastMarketResolved } from '../lib/broadcasts.js';
 import { anchorClient, getMarketPda } from '../lib/anchor-client.js';
 import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
 import { prepareSettlementData, settleMarketWithData, type SettlementPrepData } from './position-settler.js';
-import { triggerMerkleSettlement, preSeedSettlingState, getPreSeededMerkleData, markRootPosted } from './merkle-settler.js';
+import { triggerMerkleSettlement, preSeedSettlingState, getPreSeededMerkleData, markRootPosted, invalidateSettlingState } from './merkle-settler.js';
 import { tryAdvisoryLock, releaseAdvisoryLock } from '../lib/advisory-lock.js';
 import { config } from '../config.js';
 
@@ -306,6 +306,12 @@ async function resolveMarket(
             logger.warn(`Market ${marketId} (${market.pubkey}) not found on-chain (attempt ${count}/3), will retry.`);
           }
           return;
+        } else if (errorMsg.includes('InvalidSettlementAmount') || errorMsg.includes('0x17a9')) {
+          // Settlement amount exceeds on-chain open_interest — pending match TXs haven't
+          // confirmed yet. Fall back to separate resolve; merkle settler will wait for
+          // on-chain state to converge before posting the root.
+          logger.warn(`Combined TX failed (settlement exceeds open_interest — pending matches), falling back to separate resolve`);
+          invalidateSettlingState(marketId);
         } else {
           logger.warn(`Combined TX failed, falling back to separate resolve: ${errorMsg}`);
         }

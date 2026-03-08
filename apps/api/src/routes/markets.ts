@@ -11,7 +11,7 @@ import { circuitBreaker } from '../lib/circuit-breaker.js';
 const listMarketsSchema = z.object({
   asset: z.enum(['BTC', 'ETH', 'SOL']).optional(),
   status: z.enum(['OPEN', 'CLOSED', 'RESOLVED', 'SETTLED']).optional(),
-  timeframe: z.enum(['5m', '15m', '1h', '4h', '24h']).optional(),
+  timeframe: z.enum(['1m', '5m', '15m', '1h', '4h', '24h']).optional(),
 });
 
 const marketParamsSchema = z.object({

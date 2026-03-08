@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { getCurrentRound, formatTime, ROUND_DURATION } from '../mockData';
+import { getCurrentRound, formatTime, timeframeSec } from '@/lib/timeframe';
 import { Eye } from 'lucide-react';
-import { useSelectedMarket } from '@/stores/marketStore';
+import { useSelectedMarket, useMarketStore } from '@/stores/marketStore';
 import { useBestPrices } from '@/hooks/useOrderbook';
 import { getWebSocket } from '@/lib/websocket';
 import { useAuth } from '@/hooks/useAuth';
@@ -225,6 +225,7 @@ export default function ChartOverlay({ mode = 'pro' }: ChartOverlayProps) {
   const [greeksVisible, setGreeksVisible] = useState(true);
 
   const market = useSelectedMarket();
+  const { setTimeframe: setStoreTimeframe } = useMarketStore();
   const yesPrices = useBestPrices('YES');
 
   const isActivating = !market || (market.strike ?? 0) <= 0;
@@ -235,10 +236,11 @@ export default function ChartOverlay({ mode = 'pro' }: ChartOverlayProps) {
   const iv = yesPrices.spread > 0 ? (yesPrices.spread * 100 * 4).toFixed(0) : '45';
 
   useEffect(() => {
+    const roundDuration = timeframeSec(market?.timeframe);
     const update = () => {
       if (market?.expiry) {
         const expiryS = Math.floor(market.expiry / 1000);
-        const startS = expiryS - 5 * 60;
+        const startS = expiryS - roundDuration;
         const now = Math.floor(Date.now() / 1000);
         const remaining = Math.max(0, expiryS - now);
         const total = expiryS - startS;
@@ -248,20 +250,20 @@ export default function ChartOverlay({ mode = 'pro' }: ChartOverlayProps) {
         setRoundLabel(`${formatTime(startS)} - ${formatTime(expiryS)}`);
         setProgress(total > 0 ? 1 - remaining / total : 0);
       } else {
-        const { roundStart, roundEnd, now } = getCurrentRound();
+        const { roundStart, roundEnd, now } = getCurrentRound(market?.timeframe);
         const remaining = Math.max(0, roundEnd - now);
         const total = roundEnd - roundStart;
         const mins = Math.floor(remaining / 60);
         const secs = remaining % 60;
         setCountdown(`${mins}:${secs.toString().padStart(2, '0')}`);
-        setRoundLabel(`${formatTime(roundStart)} - ${formatTime(roundStart + ROUND_DURATION)}`);
+        setRoundLabel(`${formatTime(roundStart)} - ${formatTime(roundStart + roundDuration)}`);
         setProgress(total > 0 ? 1 - remaining / total : 0);
       }
     };
     update();
     const id = setInterval(update, 1000);
     return () => clearInterval(id);
-  }, [market?.expiry]);
+  }, [market?.expiry, market?.timeframe]);
 
   const sep = (
     <div style={{ width: 1, height: 42, background: 'rgba(255,255,255,0.11)', flexShrink: 0 }} />
@@ -340,11 +342,11 @@ export default function ChartOverlay({ mode = 'pro' }: ChartOverlayProps) {
             display: 'flex', alignItems: 'center', borderRadius: 8,
             background: 'transparent', padding: 3,
           }}>
-            {['1m', '5m', '15m', '1hr'].map((tf) => {
-              const isActive = tf === '5m';
-              const isDisabled = !isActive;
+            {['1m', '5m', '15m', '1h'].map((tf) => {
+              const isActive = tf === (market?.timeframe || '5m');
+              const isDisabled = tf === '15m' || tf === '1h';
               return (
-                <button key={tf} disabled={isDisabled} style={{
+                <button key={tf} disabled={isDisabled} onClick={() => { if (!isDisabled) setStoreTimeframe(tf as any); }} style={{
                   padding: '6px 15px', borderRadius: 6, fontSize: 20, fontWeight: 700,
                   border: 'none',
                   cursor: isDisabled ? 'not-allowed' : 'pointer',

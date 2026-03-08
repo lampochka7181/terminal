@@ -71,6 +71,7 @@ interface LivelineProps {
     lerpSpeed?: number;
     padding?: Padding;
     onHover?: (point: HoverPoint | null) => void;
+    onRangeUpdate?: (range: { min: number; max: number }) => void;
     cursor?: string;
     pulse?: boolean;
     timeAxis?: boolean;

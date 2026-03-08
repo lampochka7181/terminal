@@ -445,6 +445,14 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS fee_discount_pct SMALLINT DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS agent_metadata JSONB;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_agent_order BOOLEAN DEFAULT FALSE NOT NULL;
 
+-- Waitlist table
+CREATE TABLE waitlist (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email VARCHAR(255) NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_waitlist_created_at ON waitlist (created_at DESC);
+
 -- Grant permissions (for local dev)
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO postgres;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO postgres;

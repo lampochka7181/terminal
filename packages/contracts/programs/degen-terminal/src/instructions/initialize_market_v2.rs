@@ -74,7 +74,7 @@ pub fn initialize_market_v2(
     require!(valid_assets.contains(&asset.as_str()), DegenError::InvalidAsset);
 
     // Validate timeframe
-    let valid_timeframes = ["5m", "15m", "1h", "4h", "24h"];
+    let valid_timeframes = ["1m", "5m", "15m", "1h", "4h", "24h"];
     require!(valid_timeframes.contains(&timeframe.as_str()), DegenError::InvalidTimeframe);
 
     // L-02: Generate sequential market ID (Note: V2 init doesn't have GlobalState

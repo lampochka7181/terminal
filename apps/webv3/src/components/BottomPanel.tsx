@@ -223,7 +223,7 @@ function PnLShareModal({ tx, onClose }: { tx: UserTransaction; onClose: () => vo
   );
 }
 
-export default function BottomPanel() {
+export default function BottomPanel({ height }: { height?: number }) {
   const [tab, setTab] = useState<'positions' | 'history'>('positions');
   const [shareTx, setShareTx] = useState<UserTransaction | null>(null);
   const { isAuthenticated } = useAuth();
@@ -241,6 +241,7 @@ export default function BottomPanel() {
   const noBook = useOrderbookStore(s => s.no);
   const markets = useMarketStore(s => s.markets);
   const [closingMarket, setClosingMarket] = useState<string | null>(null);
+  const [pnlToasts, setPnlToasts] = useState<{ id: number; pnl: number }[]>([]);
   const [promptOpen, setPromptOpen] = useState(false);
   const [promptMsg, setPromptMsg] = useState({ title: '', message: '', type: 'info' as 'info' | 'error' | 'success' | 'warning' });
 
@@ -249,9 +250,18 @@ export default function BottomPanel() {
     setPromptOpen(true);
   }, []);
 
+  const showPnlToast = useCallback((pnl: number) => {
+    const id = Date.now();
+    setPnlToasts(prev => [...prev, { id, pnl }]);
+    setTimeout(() => setPnlToasts(prev => prev.filter(t => t.id !== id)), 2000);
+  }, []);
+
   const handleClosePosition = useCallback(async (pos: Position, closeOutcome?: 'yes' | 'no') => {
     const outcome = closeOutcome ?? (pos.yesShares > 0 ? 'yes' : 'no');
     const shares = outcome === 'yes' ? pos.yesShares : pos.noShares;
+    const entryPrice = outcome === 'yes'
+      ? (pos.avgEntryYes ?? pos.avgEntryPrice)
+      : (pos.avgEntryNo ?? pos.avgEntryPrice);
     setClosingMarket(pos.marketAddress + '-' + outcome);
     try {
       const result = await placeOrder({
@@ -259,16 +269,19 @@ export default function BottomPanel() {
         side: 'ask',
         outcome,
         orderType: 'market',
-        price: 0.01, // Market sell floor — accept any price (NO effective price = 1 - yesAskPrice, so 0.01 allows yesAsk ≤ 0.99)
+        price: 0.01,
         size: shares,
       });
-      if (result && result.filledSize === 0) {
+      if (result && result.filledSize > 0) {
+        const sellPrice = result.avgPrice ?? 0;
+        showPnlToast((sellPrice - entryPrice) * result.filledSize);
+      } else if (result && result.filledSize === 0) {
         showPrompt('No Liquidity', 'No liquidity available to close your position. It will settle automatically at market expiry.', 'warning');
       }
     } finally {
       setClosingMarket(null);
     }
-  }, [placeOrder, showPrompt]);
+  }, [placeOrder, showPrompt, showPnlToast]);
 
   // Listen for sell events from TradeBubbles overlay
   useEffect(() => {
@@ -288,6 +301,21 @@ export default function BottomPanel() {
     const id = setInterval(() => setTick(t => t + 1), 1000);
     return () => clearInterval(id);
   }, []);
+
+  // Schedule a precise re-render at the instant the earliest position expires
+  // so it drops off the list immediately instead of waiting for the next 1s tick.
+  useEffect(() => {
+    const now = Date.now();
+    let nearest = Infinity;
+    for (const p of positions) {
+      if (p.status !== 'open' || (p.yesShares + p.noShares) <= 0 || p.expiryAt <= 0) continue;
+      const ms = p.expiryAt < 1e12 ? p.expiryAt * 1000 : p.expiryAt;
+      if (ms > now && ms < nearest) nearest = ms;
+    }
+    if (nearest === Infinity) return;
+    const id = setTimeout(() => setTick(t => t + 1), nearest - now + 50);
+    return () => clearTimeout(id);
+  }, [positions]);
 
   // When positions drop to 0 (market settled), poll for settlement data.
   // First attempt 3s after, then every 5s until we see a new settlement entry.
@@ -340,6 +368,10 @@ export default function BottomPanel() {
   });
   const openOrders = orders.filter(o => {
     if (o.status !== 'open' && o.status !== 'partial') return false;
+    // Hide resting sell orders — the position row already shows remaining tokens.
+    // When a close is partially filled, the unfilled portion sits on the orderbook
+    // but we don't need a separate row for it (position row updates to show remaining qty).
+    if (o.side === 'ask') return false;
     // Don't show orders for expired markets (defense-in-depth)
     if (o.expiryAt > 0) {
       const ms = o.expiryAt < 1e12 ? o.expiryAt * 1000 : o.expiryAt;
@@ -385,7 +417,19 @@ export default function BottomPanel() {
   const columns = ['OUTCOME', 'ASSET', 'SIZE', 'TOKENS', 'ENTRY', 'MARK', 'UNREAL.PNL', 'ACTION'];
 
   return (
-    <div style={{ background: '#1e1e1e', borderRadius: 17, display: 'flex', flexDirection: 'column', minHeight: 240 }}>
+    <div style={{ position: 'relative', background: '#1e1e1e', borderRadius: 17, display: 'flex', flexDirection: 'column', ...(height ? { height, overflow: 'hidden' } : { minHeight: 240 }) }}>
+      {pnlToasts.map(t => (
+        <div key={t.id} style={{
+          position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+          fontSize: 32, fontWeight: 800, letterSpacing: '-0.5px',
+          color: t.pnl >= 0 ? '#95ff94' : '#f55252',
+          textShadow: `0 0 24px ${t.pnl >= 0 ? 'rgba(149,255,148,0.6)' : 'rgba(245,82,82,0.6)'}`,
+          animation: 'pnl-float 1.8s ease-out forwards',
+          pointerEvents: 'none', zIndex: 20,
+        }}>
+          {t.pnl >= 0 ? '+' : ''}{t.pnl < 0 ? '-' : ''}${Math.abs(t.pnl).toFixed(2)}
+        </div>
+      ))}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 24px', height: 60 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 27 }}>
           <button onClick={() => setTab('positions')} style={{
@@ -426,7 +470,7 @@ export default function BottomPanel() {
               {positionsLoading ? 'Loading...' : 'No open positions'}
             </div>
           ) : (
-            <div style={{ maxHeight: 360, overflowY: 'auto' }}>
+            <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
               {posEntries.map((entry) => {
                 const { pos, isYes, shares, costBasis, entryPrice } = entry;
                 const outcomeLabel = isYes ? 'Above' : 'Below';
@@ -522,7 +566,7 @@ export default function BottomPanel() {
       ) : (
         <>
           <div style={{ display: 'flex', alignItems: 'center', padding: '0 24px', height: 42 }}>
-            {['TYPE', 'ASSET', 'OUTCOME', 'SIDE', 'PRICE', 'SIZE', 'PNL', 'TIME', 'TX', 'SHARE'].map((col) => (
+            {['TYPE', 'ASSET', 'OUTCOME', 'SIDE', 'PRICE', 'SIZE', 'TOKENS', 'PNL', 'TIME', 'TX', 'SHARE'].map((col) => (
               <div key={col} style={{ flex: 1, fontSize: 18, color: dim, fontWeight: 400 }}>{col}</div>
             ))}
           </div>
@@ -536,7 +580,7 @@ export default function BottomPanel() {
               {transactionsLoading ? 'Loading...' : 'No trade history'}
             </div>
           ) : (
-            <div style={{ maxHeight: 158, overflowY: 'auto' }}>
+            <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
               {transactions.slice(0, 20).map((tx) => {
                 const pnlColor = (tx.pnl ?? 0) >= 0 ? '#95ff94' : '#f55252';
                 return (
@@ -548,6 +592,7 @@ export default function BottomPanel() {
                     </div>
                     <div style={{ flex: 1, color: tx.side === 'buy' ? '#95ff94' : '#f55252' }}>{tx.side.toUpperCase()}</div>
                     <div style={{ flex: 1, color: '#eee' }}>${tx.price.toFixed(4)}</div>
+                    <div style={{ flex: 1, color: '#eee' }}>${(tx.notional || tx.price * tx.size).toFixed(2)}</div>
                     <div style={{ flex: 1, color: '#eee' }}>{tx.size.toFixed(1)}</div>
                     <div style={{ flex: 1, color: pnlColor }}>{tx.pnl != null ? `${tx.pnl >= 0 ? '+' : ''}$${tx.pnl.toFixed(2)}` : '--'}</div>
                     <div style={{ flex: 1, color: dim }}>{new Date(tx.timestamp).toLocaleTimeString()}</div>
