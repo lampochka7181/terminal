@@ -315,12 +315,13 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
       // We must accumulate onto any existing position to avoid flickering on repeat buys.
       if (response.position) {
         console.log(`[⏱️ ORDER TIMING] T+${(performance.now()-t0).toFixed(0)}ms: Updating position in store...`);
+        const pos = response.position;
         const store = useUserStore.getState();
-        const existing = store.positions.find(p => p.marketAddress === response.position.marketAddress);
-        const fillPrice = response.avgPrice || response.position.avgEntryPrice;
-        const isYes = response.position.yesShares > 0;
-        const fillShares = isYes ? response.position.yesShares : response.position.noShares;
-        const fillCost = response.position.totalCost ?? (fillPrice && fillShares ? fillPrice * fillShares : 0);
+        const existing = store.positions.find(p => p.marketAddress === pos.marketAddress);
+        const fillPrice = response.avgPrice || pos.avgEntryPrice;
+        const isYes = pos.yesShares > 0;
+        const fillShares = isYes ? pos.yesShares : pos.noShares;
+        const fillCost = pos.totalCost ?? (fillPrice && fillShares ? fillPrice * fillShares : 0);
 
         if (existing && params.side === 'bid') {
           // Accumulate shares onto existing position (same logic as handleFill)
@@ -348,14 +349,14 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         } else if (!existing || params.side === 'bid') {
           // New position — use API data directly
           const positionWithCorrectEntry = {
-            ...response.position,
+            ...pos,
             avgEntryPrice: fillPrice,
             totalCost: fillCost || undefined,
           };
           store.upsertPosition(positionWithCorrectEntry);
         } else {
           // Sell — use API data as-is (reduces shares)
-          store.upsertPosition(response.position);
+          store.upsertPosition(pos);
         }
         console.log(`[⏱️ ORDER TIMING] T+${(performance.now()-t0).toFixed(0)}ms: Position store updated! Entry: $${fillPrice}`);
       } else if (response.position === null && params.side === 'ask' && response.status === 'filled') {

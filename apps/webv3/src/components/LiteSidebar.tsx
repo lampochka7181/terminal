@@ -9,6 +9,7 @@ import { useOrder } from '@/hooks/useOrder';
 import { useSessionKey } from '@/hooks/useSessionKey';
 import { useDelegation } from '@/hooks/useDelegation';
 import { useSelectedMarket, useMarketStore } from '@/stores/marketStore';
+import type { Timeframe } from '@degen/types';
 import { usePriceStore } from '@/stores/priceStore';
 import { useOrderbook, useBestPrices } from '@/hooks/useOrderbook';
 import { useWalletModal } from '@solana/wallet-adapter-react-ui';
@@ -312,7 +313,7 @@ export default function LiteSidebar() {
                   const isActive = tf === timeframe;
                   const isDisabled = tf === '15m' || tf === '1h';
                   return (
-                    <button key={tf} disabled={isDisabled} onClick={() => { if (!isDisabled) { setTimeframe(tf); setStoreTimeframe(tf as any); } }} style={{
+                    <button key={tf} disabled={isDisabled} onClick={() => { if (!isDisabled) { setTimeframe(tf as Timeframe); setStoreTimeframe(tf as Timeframe); } }} style={{
                       flex: 1, padding: '9px 0', borderRadius: 9, border: 'none',
                       fontSize: 20, fontWeight: 600,
                       cursor: isDisabled ? 'not-allowed' : 'pointer',
