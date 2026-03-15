@@ -4,6 +4,7 @@ use anchor_spl::token_interface::{self, TokenInterface, CloseAccount as CloseAcc
 use crate::state_v2::MarketV2;
 use crate::state_v2::MarketStatusV2;
 use crate::errors::DegenError;
+use crate::security::require_market_v2_vault;
 
 /// Read the supply field from a Token/Token-2022 mint account.
 /// Supply is a little-endian u64 at byte offset 36 in the base mint layout.
@@ -59,7 +60,9 @@ pub struct CloseMarketV2<'info> {
     /// Market's USDC vault (should be empty, regular Token program)
     #[account(
         mut,
-        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams
+        constraint = market.vault == vault.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub vault: Box<Account<'info, TokenAccount>>,
 
@@ -85,6 +88,7 @@ pub struct CloseMarketV2<'info> {
 pub fn close_market_v2(ctx: Context<CloseMarketV2>) -> Result<()> {
     let market = &ctx.accounts.market;
     let clock = Clock::get()?;
+    require_market_v2_vault(market, &market.key(), &ctx.accounts.vault.key(), &ctx.accounts.vault)?;
 
     // Verify vault is empty
     let vault_balance = ctx.accounts.vault.amount;

@@ -82,6 +82,8 @@ pub fn initialize_market(
     let market = &mut ctx.accounts.market;
     market.id = market_id;
     market.authority = ctx.accounts.authority.key();
+    market.usdc_mint = ctx.accounts.usdc_mint.key();
+    market.vault = ctx.accounts.vault.key();
     market.asset = str_to_bytes::<MAX_ASSET_LEN>(&asset);
     market.timeframe = str_to_bytes::<MAX_TIMEFRAME_LEN>(&timeframe);
     market.strike_price = strike_price;

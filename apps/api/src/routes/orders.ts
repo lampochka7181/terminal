@@ -1,8 +1,10 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
-import { eq } from 'drizzle-orm';
+import { PublicKey } from '@solana/web3.js';
+import { getAccount, getAssociatedTokenAddress, TOKEN_2022_PROGRAM_ID } from '@solana/spl-token';
 import nacl from 'tweetnacl';
 import bs58 from 'bs58';
+import { canonicalOrderMessageToBase64 } from '../lib/order-auth.js';
 import { requireAuth, getCurrentUserId, getCurrentWallet, isAgentRequest } from '../lib/auth.js';
 import { orderService } from '../services/order.service.js';
 import { marketService } from '../services/market.service.js';
@@ -11,12 +13,10 @@ import { positionService } from '../services/position.service.js';
 import { matchingService } from '../services/matching.service.js';
 import { feeService, calculateTakerFee, calculateAgentTakerFee } from '../services/fee.service.js';
 import { sessionService } from '../services/session.service.js';
-import { marginService, leverageCalc } from '../services/margin.service.js';
-import { lendingService } from '../services/lending.service.js';
-import { db, trades } from '../db/index.js';
 import { redis } from '../db/redis.js';
 import { logger, orderLogger, logEvents } from '../lib/logger.js';
 import { config } from '../config.js';
+import { anchorClient, getYesMintPda, getNoMintPda } from '../lib/anchor-client.js';
 
 // M-14: Per-user rate limiter for order cancellations (prevents cancel-spam abuse)
 const CANCEL_RATE_LIMIT = 30;          // max cancels per window
@@ -34,6 +34,43 @@ async function checkCancelRateLimit(userId: string): Promise<{ allowed: boolean;
   } catch {
     return { allowed: true, remaining: CANCEL_RATE_LIMIT }; // fail open
   }
+}
+
+function decodeSignature(signature: string): Uint8Array {
+  try {
+    return bs58.decode(signature);
+  } catch {
+    return Buffer.from(signature, 'base64');
+  }
+}
+
+function buildExpectedOrderMessage(data: {
+  marketAddress: string;
+  side: 'bid' | 'ask';
+  outcome: 'yes' | 'no';
+  type: 'limit' | 'market' | 'ioc' | 'fok';
+  price: number;
+  size: number;
+  expiry: number;
+  clientOrderId: number;
+  dollarAmount?: number;
+  sessionPublicKey?: string;
+}, wallet: string): string {
+  const canonicalSize = data.type === 'market' && data.side === 'bid' && data.dollarAmount
+    ? data.dollarAmount
+    : data.size;
+  return canonicalOrderMessageToBase64({
+    marketAddress: data.marketAddress,
+    walletAddress: wallet,
+    signerPublicKey: data.sessionPublicKey || wallet,
+    side: data.side.toUpperCase() as 'BID' | 'ASK',
+    outcome: data.outcome.toUpperCase() as 'YES' | 'NO',
+    orderType: data.type.toUpperCase() as 'LIMIT' | 'MARKET' | 'IOC' | 'FOK',
+    price: data.price,
+    size: canonicalSize,
+    expiryTs: data.expiry,
+    clientOrderId: data.clientOrderId,
+  });
 }
 
 // Validation schemas
@@ -86,9 +123,6 @@ export async function orderRoutes(app: FastifyInstance) {
     binaryMessage: z.string().optional(),                  // Optional for agents
     encodedInstruction: z.string().optional(),             // Optional for agents
     sessionPublicKey: z.string().min(32).max(64).optional(), // For session-signed orders
-    // Leverage parameters
-    leverage: z.number().min(1).max(config.leverage.maxLeverage).optional().default(1), // 1x = no leverage
-    marginAmount: z.number().min(0).optional(), // User's margin (required if leverage > 1)
   });
 
   app.post('/notify', async (request: FastifyRequest, reply: FastifyReply) => {
@@ -119,58 +153,67 @@ export async function orderRoutes(app: FastifyInstance) {
     // AGENT ORDER DEFAULTS
     // ========================================
     if (isAgent) {
-      // Agents don't need signatures — JWT auth is sufficient
-      if (!data.clientOrderId) data.clientOrderId = Date.now();
-      if (!data.expiry) data.expiry = Math.floor(Date.now() / 1000) + 3600; // 1 hour default
-    } else if (!data.signature) {
+      return reply.code(403).send({
+        error: { code: 'AGENT_ORDERS_DISABLED', message: 'Agent/API-key trading is disabled until secure on-chain authorization is implemented.' },
+      });
+    }
+    if (!data.signature) {
       // Non-agent requests MUST have signature
       return reply.code(400).send({
         error: { code: 'SIGNATURE_REQUIRED', message: 'Signature is required for non-agent orders' },
       });
     }
+    if (!data.binaryMessage) {
+      return reply.code(400).send({
+        error: { code: 'MESSAGE_REQUIRED', message: 'binaryMessage is required for signed orders' },
+      });
+    }
+    if (!data.clientOrderId) data.clientOrderId = Date.now();
+    if (!data.expiry) data.expiry = Math.floor(Date.now() / 1000) + 3600;
 
-    // ========================================
-    // SIGNATURE VERIFICATION (skip for agents)
-    // ========================================
-    // If sessionPublicKey is provided, verify against session service
-    // Otherwise, the signature was from the wallet directly (verified by JWT auth)
-    if (!isAgent && data.sessionPublicKey) {
-      // Decode the order data from binaryMessage
-      let orderData: Record<string, unknown>;
+    const expectedBinaryMessage = (() => {
       try {
-        const messageJson = Buffer.from(data.binaryMessage!, 'base64').toString('utf-8');
-        orderData = JSON.parse(messageJson);
-      } catch {
-        return reply.code(400).send({
-          error: { code: 'INVALID_MESSAGE', message: 'Invalid order message format' },
-        });
+        return buildExpectedOrderMessage({
+          marketAddress: data.marketAddress,
+          side: data.side,
+          outcome: data.outcome,
+          type: data.type,
+          price: data.price,
+          size: data.size,
+          expiry: data.expiry,
+          clientOrderId: data.clientOrderId,
+          dollarAmount: data.dollarAmount,
+          sessionPublicKey: data.sessionPublicKey,
+        }, wallet);
+      } catch (messageErr: any) {
+        logger.warn(`Order canonical message error: ${messageErr.message}`);
+        return null;
       }
+    })();
 
-      // Verify session signature
-      const sessionVerify = sessionService.verifySessionSignature(
-        data.sessionPublicKey,
-        orderData,
-        data.signature!
-      );
-
-      if (!sessionVerify.valid) {
-        return reply.code(401).send({
-          error: { code: 'INVALID_SESSION', message: sessionVerify.error || 'Session signature verification failed' },
-        });
-      }
-
-      // Verify session belongs to the authenticated user
-      if (sessionVerify.walletAddress !== wallet) {
-        return reply.code(403).send({
-          error: { code: 'SESSION_MISMATCH', message: 'Session does not belong to authenticated user' },
-        });
-      }
-
-      logger.debug(`[Orders] Session-signed order from ${wallet.slice(0, 8)}... (session: ${data.sessionPublicKey.slice(0, 8)}...)`);
+    if (!expectedBinaryMessage || data.binaryMessage !== expectedBinaryMessage) {
+      return reply.code(400).send({
+        error: { code: 'INVALID_MESSAGE', message: 'binaryMessage does not match the canonical order payload' },
+      });
     }
 
-    // Track if this is a session-signed or agent order (used to skip delegation check later)
-    const isSessionOrder = !!data.sessionPublicKey;
+    // Verify the authenticated wallet or its approved session signed the exact canonical payload.
+    try {
+      const messageBytes = Buffer.from(data.binaryMessage, 'base64');
+      const signatureBytes = decodeSignature(data.signature);
+      const signerPubkey = new PublicKey(data.sessionPublicKey || wallet);
+      const isValid = nacl.sign.detached.verify(messageBytes, signatureBytes, signerPubkey.toBytes());
+      if (!isValid) {
+        return reply.code(401).send({
+          error: { code: 'INVALID_SIGNATURE', message: 'Order signature verification failed' },
+        });
+      }
+    } catch (sigErr: any) {
+      logger.warn(`Order signature verification error: ${sigErr.message}`);
+      return reply.code(400).send({
+        error: { code: 'INVALID_SIGNATURE', message: 'Could not verify order signature' },
+      });
+    }
     
     const market = await marketService.getByPubkey(data.marketAddress);
     if (!market) {
@@ -245,53 +288,60 @@ export async function orderRoutes(app: FastifyInstance) {
         logger.debug(`[Orders] Agent order — using cached delegation for sell`);
       }
 
-      // Check if this position has a margin account (leveraged position)
       const position = await positionService.getPosition(userId, market.id);
-      let marginAccount = null;
-      if (position) {
-        marginAccount = await marginService.getByPositionId(position.id);
-      }
-      
-      // Check if margin account exists but is already closed/liquidated
-      if (marginAccount && (marginAccount.status === 'CLOSED' || marginAccount.status === 'LIQUIDATED')) {
-        logger.warn(`[Orders] Sell rejected - leveraged position already ${marginAccount.status}`, {
-          marginAccountId: marginAccount.id,
-          status: marginAccount.status,
-        });
-        return reply.code(410).send({ 
-          error: { 
-            code: 'POSITION_ALREADY_CLOSED', 
-            message: marginAccount.status === 'LIQUIDATED' 
-              ? 'This leveraged position has been liquidated. Please refresh to see your updated positions.'
-              : 'This leveraged position has already been closed.',
-          } 
+      const availableShares = outcomeUpper === 'YES'
+        ? parseFloat(position?.yesShares || '0')
+        : parseFloat(position?.noShares || '0');
+
+      if (availableShares < 0.001) {
+        return reply.code(400).send({
+          error: {
+            code: 'INSUFFICIENT_SHARES',
+            message: `No ${outcomeUpper} shares available to sell`,
+          },
         });
       }
-      
-      const isLeveragedPosition = marginAccount && marginAccount.status === 'OPEN';
-      
-      if (isLeveragedPosition) {
-        // CHECK LIQUIDATION LOCK - reject if position is being liquidated
-        const liquidatingAt = await marginService.isBeingLiquidated(marginAccount.id);
-        if (liquidatingAt) {
-          logger.warn(`[Orders] Sell rejected - position is being liquidated`, {
-            marginAccountId: marginAccount.id,
-            liquidatingAt,
-          });
-          return reply.code(409).send({ 
-            error: { 
-              code: 'POSITION_BEING_LIQUIDATED', 
-              message: 'This position is currently being liquidated. Please wait for the liquidation to complete.',
-              liquidatingAt: liquidatingAt.toISOString(),
-            } 
+
+      if (data.size > availableShares + 0.000001) {
+        return reply.code(400).send({
+          error: {
+            code: 'INSUFFICIENT_SHARES',
+            message: `Cannot sell ${data.size} ${outcomeUpper} shares; only ${availableShares.toFixed(6)} available`,
+          },
+        });
+      }
+
+      try {
+        const marketPubkey = new PublicKey(market.pubkey);
+        const mint = outcomeUpper === 'YES'
+          ? getYesMintPda(marketPubkey)
+          : getNoMintPda(marketPubkey);
+        const walletPk = new PublicKey(wallet);
+        const ata = await getAssociatedTokenAddress(mint, walletPk, false, TOKEN_2022_PROGRAM_ID);
+        const account = await getAccount(anchorClient.getConnection(), ata, 'confirmed', TOKEN_2022_PROGRAM_ID);
+        const confirmedShares = Number(account.amount) / 1_000_000;
+
+        if (confirmedShares < 0.001) {
+          return reply.code(409).send({
+            error: {
+              code: 'PENDING_POSITION_SYNC',
+              message: `Your ${outcomeUpper} buys are not yet confirmed on-chain. Wait for confirmation before selling.`,
+            },
           });
         }
-        
-        logger.info(`[Orders] Closing leveraged position: ${data.size} ${outcomeUpper} shares, margin account ${marginAccount.id}`);
+
+        if (data.size > confirmedShares + 0.000001) {
+          return reply.code(409).send({
+            error: {
+              code: 'PENDING_POSITION_SYNC',
+              message: `Cannot sell ${data.size} ${outcomeUpper} shares yet; only ${confirmedShares.toFixed(6)} are confirmed on-chain.`,
+            },
+          });
+        }
+      } catch (err: any) {
+        logger.debug(`[Orders] Could not confirm on-chain share balance before sell: ${err.message}`);
       }
-      
-      // Execute the sell order
-      // For leveraged positions, the on-chain shares are owned by Lending Pool
+
       logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Starting SELL order matching...`);
       const sellStart = Date.now();
       
@@ -305,8 +355,7 @@ export async function orderRoutes(app: FastifyInstance) {
         expiresAt: data.expiry! * 1000,
         signature: data.signature || '',
         binaryMessage: data.binaryMessage || '',
-        // LEVERAGED CLOSE: On-chain shares are owned by Lending Pool
-        isLeveragedClose: isLeveragedPosition || false,
+        sessionPublicKey: data.sessionPublicKey,
       });
       
       logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Sell matching complete (${Date.now()-sellStart}ms), ${result.fills.length} fills`);
@@ -317,173 +366,13 @@ export async function orderRoutes(app: FastifyInstance) {
         side: 'ASK', outcome: outcomeUpper, price: result.avgPrice, size: result.totalSold, orderType: 'MARKET',
       });
       
-      // Handle leveraged position closure
-      let marginClosed = false;
-      let loanRepaid = 0;
-      let userEquityReturned = 0;
-      
-      if (isLeveragedPosition && result.totalSold > 0 && marginAccount) {
-        try {
-          const marginShares = parseFloat(marginAccount.shares);
-          const soldShares = result.totalSold;
-          
-          // Check if this is a full close (sold all or nearly all shares)
-          const isFullClose = soldShares >= marginShares - 0.001;
-          
-          if (isFullClose) {
-            // Full close: close the margin account
-            const loanAmount = parseFloat(marginAccount.loanAmount);
-            const proceeds = result.totalProceeds;
-            
-            // Calculate user equity: proceeds - loan
-            const userEquity = Math.max(0, proceeds - loanAmount);
-            
-            // Record loan repayment
-            if (loanAmount > 0) {
-              await lendingService.recordRepayment(Math.min(loanAmount, proceeds));
-              loanRepaid = Math.min(loanAmount, proceeds);
-            }
-            
-            // Close the margin account
-            await marginService.closeAccount(marginAccount.id);
-            marginClosed = true;
-            userEquityReturned = userEquity;
-            
-            logger.info(`[Orders] Closed leveraged position: proceeds=$${proceeds.toFixed(2)}, loan=$${loanAmount.toFixed(2)}, equity=$${userEquity.toFixed(2)}`);
-            
-            // ASYNC OPTIMIZATION: Fire off on-chain operations in background
-            // We return response immediately - GUI updates before on-chain completes
-            // On-chain close and equity transfer still happen IN ORDER (close first, then transfer)
-            // This is safe because lending pool has ample funds
-            const positionIdToSettle = position.id;
-            const orderId = result.orderId;
-            
-            // Fire-and-forget the on-chain operations (they still run in sequence internally)
-            (async () => {
-              try {
-                // Wait a bit for the on-chain close to complete (fired by matching service)
-                // The matching service fires execute_close asynchronously
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                
-                // Now transfer equity to user
-                if (userEquity > 0) {
-                  const transferSig = await lendingService.transferToUser(wallet, userEquity);
-                  if (transferSig) {
-                    logger.info(`[Orders] Transferred $${userEquity.toFixed(2)} equity to user ${wallet.slice(0,8)}: ${transferSig}`);
-                    
-                    // Update trade records with equity transfer signature
-                    try {
-                      await db
-                        .update(trades)
-                        .set({
-                          txSignature: transferSig,
-                          txStatus: 'CONFIRMED',
-                          confirmedAt: new Date(),
-                        })
-                        .where(eq(trades.takerOrderId, orderId));
-                      logger.info(`[Orders] Updated trade txSignature to equity transfer: ${transferSig.slice(0, 16)}...`);
-                    } catch (updateErr: any) {
-                      logger.warn(`[Orders] Failed to update trade txSignature: ${updateErr.message}`);
-                    }
-                  } else {
-                    logger.error(`[Orders] Failed to transfer equity to user ${wallet.slice(0,8)} - no signature returned`);
-                  }
-                }
-                
-                // Mark position as settled after transfer succeeds
-                try {
-                  await positionService.markAsSettled(positionIdToSettle, userEquity);
-                  logger.info(`[Orders] Marked position ${positionIdToSettle} as SETTLED after leveraged close`);
-                } catch (settleErr: any) {
-                  logger.error(`[Orders] Failed to mark position as settled: ${settleErr.message}`);
-                }
-              } catch (bgErr: any) {
-                logger.error(`[Orders] Background leveraged close failed: ${bgErr.message}`);
-              }
-            })();
-            
-          } else {
-            // Partial close: update margin account proportionally
-            const closeRatio = soldShares / marginShares;
-            const partialLoanRepay = parseFloat(marginAccount.loanAmount) * closeRatio;
-            const partialProceeds = result.totalProceeds;
-            
-            // Calculate user equity from this partial close: proceeds - loan portion
-            const partialUserEquity = Math.max(0, partialProceeds - partialLoanRepay);
-            
-            // Record partial loan repayment
-            if (partialLoanRepay > 0) {
-              await lendingService.recordRepayment(partialLoanRepay);
-              loanRepaid = partialLoanRepay;
-            }
-            
-            // Update margin account with new shares, loan, and liquidation price
-            const { newShares, newLoan, newLiqPrice } = await marginService.updateAfterPartialClose(
-              marginAccount.id,
-              soldShares,
-              partialLoanRepay
-            );
-            
-            logger.info(`[Orders] Partial close of leveraged position: sold ${soldShares.toFixed(2)}/${marginShares.toFixed(2)}, remaining ${newShares.toFixed(2)} shares, loan $${newLoan.toFixed(2)}, liq $${newLiqPrice.toFixed(4)}`);
-            
-            // Transfer user equity from partial close (proceeds minus loan repayment)
-            if (partialUserEquity > 0) {
-              // Fire-and-forget: transfer equity in background (similar to full close)
-              const orderId = result.orderId;
-              (async () => {
-                try {
-                  // Wait for on-chain close to complete first
-                  await new Promise(resolve => setTimeout(resolve, 2000));
-                  
-                  const transferSig = await lendingService.transferToUser(wallet, partialUserEquity);
-                  if (transferSig) {
-                    logger.info(`[Orders] Transferred $${partialUserEquity.toFixed(2)} partial close equity to user ${wallet.slice(0,8)}: ${transferSig}`);
-                    
-                    // Update trade txSignature to the equity transfer (this is what user cares about)
-                    try {
-                      await db
-                        .update(trades)
-                        .set({
-                          txSignature: transferSig,
-                          txStatus: 'CONFIRMED',
-                          confirmedAt: new Date(),
-                        })
-                        .where(eq(trades.takerOrderId, orderId));
-                      logger.info(`[Orders] Updated partial close trade txSignature to equity transfer: ${transferSig.slice(0, 16)}...`);
-                    } catch (updateErr: any) {
-                      logger.warn(`[Orders] Failed to update partial close trade txSignature: ${updateErr.message}`);
-                    }
-                  } else {
-                    logger.error(`[Orders] Failed to transfer partial equity to user ${wallet.slice(0,8)}`);
-                  }
-                } catch (err: any) {
-                  logger.error(`[Orders] Background partial equity transfer failed: ${err.message}`);
-                }
-              })();
-              
-              userEquityReturned = partialUserEquity;
-            }
-          }
-        } catch (err: any) {
-          logger.error(`[Orders] Failed to handle leveraged position close: ${err.message}`);
-          // Don't fail the sell order - the shares are already sold
-        }
-      }
-      
       // Build position data for immediate frontend update
-      // For sells, calculate remaining shares from the sell result
       let positionData = null;
       
-      // For leveraged full closes, we already know position is being closed
-      if (marginClosed) {
-        // Position fully closed - return null so frontend removes it
-        positionData = null;
-      } else if (result.totalSold > 0 && position) {
-        // For partial sells or non-leveraged sells, calculate remaining shares
+      if (result.totalSold > 0 && position) {
         const originalYesShares = parseFloat(position.yesShares || '0');
         const originalNoShares = parseFloat(position.noShares || '0');
         
-        // Calculate remaining shares after this sale
         const soldShares = result.totalSold;
         const remainingYes = outcomeUpper === 'YES' 
           ? Math.max(0, originalYesShares - soldShares)
@@ -492,7 +381,6 @@ export async function orderRoutes(app: FastifyInstance) {
           ? Math.max(0, originalNoShares - soldShares)
           : originalNoShares;
         
-        // Only include position if shares remain
         if (remainingYes > 0.001 || remainingNo > 0.001) {
           positionData = {
             marketAddress: market.pubkey,
@@ -505,7 +393,7 @@ export async function orderRoutes(app: FastifyInstance) {
             currentPrice: outcomeUpper === 'YES' 
               ? parseFloat(market.yesPrice || '0.50')
               : parseFloat(market.noPrice || '0.50'),
-            unrealizedPnL: 0, // Will be calculated by frontend
+            unrealizedPnL: 0,
             status: 'open' as const,
             createdAt: position.createdAt ? new Date(position.createdAt).getTime() : Date.now(),
           };
@@ -518,15 +406,9 @@ export async function orderRoutes(app: FastifyInstance) {
         fills: result.fills.length,
         filledSize: result.totalSold,
         avgPrice: result.avgPrice,
+        totalFee: result.totalTakerFees,
         createdAt: Date.now(),
-        // Position data for immediate frontend update (null if position fully closed)
         position: positionData,
-        // Leverage close details
-        ...(isLeveragedPosition && {
-          leverageClosed: marginClosed,
-          loanRepaid,
-          userEquityReturned,
-        }),
       };
     }
     
@@ -542,88 +424,15 @@ export async function orderRoutes(app: FastifyInstance) {
       ? calculateAgentTakerFee(orderNotional, agentFeeDiscountPct)
       : calculateTakerFee(orderNotional);
     
-    // ========================================
-    // LEVERAGE VALIDATION
-    // ========================================
-    const leverage = data.leverage || 1;
-    const isLeveraged = leverage > 1;
-    
-    // DEBUG: Log leverage info for all orders
-    logger.info(`[Orders] Leverage check: received=${data.leverage}, using=${leverage}, isLeveraged=${isLeveraged}, marginAmount=${data.marginAmount}`);
-    let loanAmount = 0;
-    let marginRequired = 0;
-    
-    if (isLeveraged) {
-      // Check if leverage is enabled
-      if (!lendingService.isEnabled()) {
-        return reply.code(503).send({
-          error: { code: 'LEVERAGE_DISABLED', message: 'Leverage trading is not enabled' },
-        });
-      }
-      
-      // Calculate margin and loan amounts
-      marginRequired = leverageCalc.initialMarginRequired(orderNotional, leverage);
-      loanAmount = leverageCalc.loanAmount(orderNotional, leverage);
-      
-      // Validate minimum margin
-      if (marginRequired < config.leverage.minMarginUsd) {
-        return reply.code(400).send({
-          error: { 
-            code: 'MARGIN_TOO_SMALL', 
-            message: `Minimum margin is $${config.leverage.minMarginUsd}. Your margin ($${marginRequired.toFixed(2)}) is too small for ${leverage}x leverage.`,
-          },
-        });
-      }
-      
-      // Validate margin amount provided matches required
-      if (data.marginAmount !== undefined && Math.abs(data.marginAmount - marginRequired) > 0.01) {
-        return reply.code(400).send({
-          error: { 
-            code: 'MARGIN_MISMATCH', 
-            message: `Provided margin ($${data.marginAmount.toFixed(2)}) doesn't match required margin ($${marginRequired.toFixed(2)}) for ${leverage}x leverage.`,
-          },
-        });
-      }
-      
-      // Check if lending pool can provide the loan
-      const loanCheckStart = Date.now();
-      const loanCheck = await lendingService.canMakeLoan(loanAmount, userId);
-      logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Loan check done (${Date.now()-loanCheckStart}ms)`);
-      if (!loanCheck.canLoan) {
-        return reply.code(400).send({
-          error: { 
-            code: 'LOAN_UNAVAILABLE', 
-            message: loanCheck.reason || `Cannot borrow $${loanAmount.toFixed(2)} - max available: $${loanCheck.maxLoan.toFixed(2)}`,
-          },
-        });
-      }
-      
-      logger.info(`[Orders] Leveraged order: ${leverage}x, margin=$${marginRequired.toFixed(2)}, loan=$${loanAmount.toFixed(2)}`);
-    }
-    
-    // For leveraged orders, user only needs to have margin + fees (loan covers the rest)
-    const requiredAmount = isLeveraged 
-      ? marginRequired + feeCalc.fee 
-      : orderNotional + feeCalc.fee;
+    const requiredAmount = orderNotional + feeCalc.fee;
     
     // Delegation check — verify user has approved relayer to spend their USDC
     // For session/agent orders: skip full on-chain check for speed
-    if (!isSessionOrder && !isAgent) {
+    if (!isAgent) {
       const delCheckStart = Date.now();
       const delCheck = await matchingService.checkDelegation(userId, requiredAmount);
       logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Delegation check done (${Date.now()-delCheckStart}ms)`);
 
-      if (!delCheck.isApproved || delCheck.error) {
-        return reply.code(400).send({ error: { code: 'DELEGATION_INSUFFICIENT', message: delCheck.error } });
-      }
-    } else if (isAgent) {
-      // Agent orders: delegation managed by MCP server / agent setup flow
-      logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Agent order — skipping delegation check`);
-    } else {
-      // Session orders: use cached delegation check (fast) instead of skipping entirely.
-      // This prevents double-spend when user spam-clicks before on-chain settles.
-      const delCheck = await matchingService.checkDelegation(userId, requiredAmount);
-      logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Session order — delegation check (cached)`);
       if (!delCheck.isApproved || delCheck.error) {
         return reply.code(400).send({ error: { code: 'DELEGATION_INSUFFICIENT', message: delCheck.error } });
       }
@@ -641,10 +450,7 @@ export async function orderRoutes(app: FastifyInstance) {
         expiresAt: data.expiry! * 1000,
         signature: data.signature || '',
         binaryMessage: data.binaryMessage || '',
-        // Leverage fields (for on-chain execution through Lending Pool)
-        leverage: isLeveraged ? leverage : undefined,
-        marginAmount: isLeveraged ? marginRequired : undefined,
-        loanAmount: isLeveraged ? loanAmount : undefined,
+        sessionPublicKey: data.sessionPublicKey,
       });
 
       logEvents.orderPlaced({
@@ -657,44 +463,12 @@ export async function orderRoutes(app: FastifyInstance) {
       if (result.filledSize > 0) {
         matchingService.deductFromDelegationCache(userId, requiredAmount);
       }
-
-      // Create margin account if leveraged and order filled
-      let marginAccountId: string | null = null;
-      if (isLeveraged && result.filledSize > 0) {
-        try {
-          // Get the position that was created/updated
-          const position = await positionService.getPosition(userId, market.id);
-          if (position) {
-            const filledNotional = result.filledSize * data.price;
-            const actualMargin = leverageCalc.initialMarginRequired(filledNotional, leverage);
-            const actualLoan = leverageCalc.loanAmount(filledNotional, leverage);
-            
-            const marginAccount = await marginService.createMarginAccount({
-              userId,
-              positionId: position.id,
-              marketId: market.id,
-              side: outcomeUpper,
-              shares: result.filledSize,
-              entryPrice: data.price,
-              leverage,
-              marginDeposited: actualMargin,
-              loanAmount: actualLoan,
-            });
-            marginAccountId = marginAccount.id;
-            logger.info(`[Orders] Created margin account ${marginAccountId} for ${leverage}x leveraged position`);
-          }
-        } catch (err: any) {
-          logger.error(`[Orders] Failed to create margin account for leveraged order: ${err.message}`);
-          // Don't fail the order - margin account can be created manually
-        }
-      }
       
       // Build position data for immediate frontend update
       let positionData = null;
       if (result.filledSize > 0) {
         const yesShares = outcomeUpper === 'YES' ? result.filledSize : 0;
         const noShares = outcomeUpper === 'NO' ? result.filledSize : 0;
-        const totalCost = result.filledSize * data.price;
         const currentPrice = outcomeUpper === 'YES' 
           ? parseFloat(market.yesPrice || '0.50')
           : parseFloat(market.noPrice || '0.50');
@@ -713,16 +487,6 @@ export async function orderRoutes(app: FastifyInstance) {
           unrealizedPnL: (currentPrice - data.price) * result.filledSize,
           status: 'open' as const,
           createdAt: Date.now(),
-          // Leverage fields if applicable
-          ...(isLeveraged && {
-            leverage,
-            marginDeposited: leverageCalc.initialMarginRequired(totalCost, leverage),
-            loanAmount: leverageCalc.loanAmount(totalCost, leverage),
-            liquidationPrice: outcomeUpper === 'YES'
-              ? leverageCalc.liquidationPriceYes(result.filledSize, data.price, leverageCalc.loanAmount(totalCost, leverage))
-              : leverageCalc.liquidationPriceNo(result.filledSize, data.price, leverageCalc.loanAmount(totalCost, leverage)),
-            marginAccountId: marginAccountId || undefined,
-          }),
         };
       }
       
@@ -732,9 +496,6 @@ export async function orderRoutes(app: FastifyInstance) {
         fills: result.fills.length,
         filledSize: result.filledSize,
         createdAt: Date.now(),
-        leverage: isLeveraged ? leverage : undefined,
-        marginAccountId: marginAccountId || undefined,
-        // Position data for immediate frontend update
         position: positionData,
       };
     } else if (isMarketOrder && data.dollarAmount) {
@@ -752,10 +513,7 @@ export async function orderRoutes(app: FastifyInstance) {
         expiresAt: data.expiry! * 1000,
         signature: data.signature || '',
         binaryMessage: data.binaryMessage || '',
-        // Leverage fields (for on-chain execution through Lending Pool)
-        leverage: isLeveraged ? leverage : undefined,
-        marginAmount: isLeveraged ? marginRequired : undefined,
-        loanAmount: isLeveraged ? loanAmount : undefined,
+        sessionPublicKey: data.sessionPublicKey,
       });
 
       logger.info(`[⏱️ ORDER API] T+${Date.now()-t0}ms: Matching complete (${Date.now()-matchStart}ms), ${result.fills.length} fills`);
@@ -770,35 +528,6 @@ export async function orderRoutes(app: FastifyInstance) {
         userId, wallet, marketId: market.id, asset: market.asset, timeframe: market.timeframe,
         side: 'BID', outcome: outcomeUpper, price: result.avgPrice, size: result.totalContracts, orderType: 'MARKET',
       });
-      
-      // Create margin account if leveraged and order filled
-      let marginAccountId: string | null = null;
-      if (isLeveraged && result.totalContracts > 0) {
-        try {
-          const position = await positionService.getPosition(userId, market.id);
-          if (position) {
-            const filledNotional = result.totalSpent; // Total spent (not including fee)
-            const actualMargin = leverageCalc.initialMarginRequired(filledNotional, leverage);
-            const actualLoan = leverageCalc.loanAmount(filledNotional, leverage);
-            
-            const marginAccount = await marginService.createMarginAccount({
-              userId,
-              positionId: position.id,
-              marketId: market.id,
-              side: outcomeUpper,
-              shares: result.totalContracts,
-              entryPrice: result.avgPrice,
-              leverage,
-              marginDeposited: actualMargin,
-              loanAmount: actualLoan,
-            });
-            marginAccountId = marginAccount.id;
-            logger.info(`[Orders] Created margin account ${marginAccountId} for ${leverage}x leveraged market order`);
-          }
-        } catch (err: any) {
-          logger.error(`[Orders] Failed to create margin account for leveraged market order: ${err.message}`);
-        }
-      }
       
       // Build position data for immediate frontend update
       // totalCost = pure collateral (notional) spent — fees are separate.
@@ -827,16 +556,6 @@ export async function orderRoutes(app: FastifyInstance) {
           unrealizedPnL: (currentPrice - result.avgPrice) * result.totalContracts,
           status: 'open' as const,
           createdAt: Date.now(),
-          // Leverage fields if applicable
-          ...(isLeveraged && {
-            leverage,
-            marginDeposited: leverageCalc.initialMarginRequired(totalCost, leverage),
-            loanAmount: leverageCalc.loanAmount(totalCost, leverage),
-            liquidationPrice: outcomeUpper === 'YES'
-              ? leverageCalc.liquidationPriceYes(result.totalContracts, result.avgPrice, leverageCalc.loanAmount(totalCost, leverage))
-              : leverageCalc.liquidationPriceNo(result.totalContracts, result.avgPrice, leverageCalc.loanAmount(totalCost, leverage)),
-            marginAccountId: marginAccountId || undefined,
-          }),
         };
       }
       
@@ -853,9 +572,6 @@ export async function orderRoutes(app: FastifyInstance) {
         dollarAmount: result.dollarAmount,
         unfilledDollars: result.unfilledDollars,
         createdAt: Date.now(),
-        leverage: isLeveraged ? leverage : undefined,
-        marginAccountId: marginAccountId || undefined,
-        // Position data for immediate frontend update
         position: positionData,
       };
     }

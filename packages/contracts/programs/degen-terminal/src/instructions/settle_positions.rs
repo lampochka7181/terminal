@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use crate::state::{Market, UserPosition, MarketStatus, MarketOutcome};
 use crate::errors::DegenError;
+use crate::security::require_market_vault;
 
 #[derive(Accounts)]
 pub struct SettlePositions<'info> {
@@ -12,7 +13,9 @@ pub struct SettlePositions<'info> {
     /// Market's USDC vault - validated to be the market's ATA
     #[account(
         mut,
-        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams
+        constraint = market.vault == vault.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub vault: Account<'info, TokenAccount>,
     
@@ -29,7 +32,8 @@ pub struct SettlePositions<'info> {
     /// User's USDC token account (receives payout) - validated to belong to position owner
     #[account(
         mut,
-        constraint = user_usdc.owner == position.owner @ DegenError::Unauthorized
+        constraint = user_usdc.owner == position.owner @ DegenError::Unauthorized,
+        constraint = user_usdc.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub user_usdc: Account<'info, TokenAccount>,
     
@@ -49,6 +53,7 @@ pub struct SettlePositions<'info> {
 pub fn settle_positions(ctx: Context<SettlePositions>) -> Result<()> {
     let market = &mut ctx.accounts.market;
     let position = &mut ctx.accounts.position;
+    require_market_vault(market, &market.key(), &ctx.accounts.vault.key(), &ctx.accounts.vault)?;
     
     // Ensure market is resolved
     require!(market.status == MarketStatus::Resolved, DegenError::MarketNotResolved);

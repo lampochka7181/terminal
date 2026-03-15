@@ -182,6 +182,10 @@ pub struct Market {
     pub id: u64,
     /// Authority (the relayer that can resolve/settle)
     pub authority: Pubkey,
+    /// Canonical USDC mint for this market
+    pub usdc_mint: Pubkey,
+    /// Canonical collateral vault for this market
+    pub vault: Pubkey,
     /// Asset symbol (BTC, ETH, SOL)
     pub asset: [u8; MAX_ASSET_LEN],
     /// Timeframe (5m, 15m, 1h, 4h, 24h)
@@ -222,6 +226,8 @@ impl Market {
     pub const SIZE: usize = 8 +     // discriminator
         8 +                         // id
         32 +                        // authority
+        32 +                        // usdc_mint
+        32 +                        // vault
         MAX_ASSET_LEN +             // asset
         MAX_TIMEFRAME_LEN +         // timeframe
         8 +                         // strike_price
@@ -269,6 +275,11 @@ impl Market {
     pub fn timeframe_bytes(&self) -> &[u8] {
         let len = self.timeframe.iter().position(|&x| x == 0).unwrap_or(self.timeframe.len());
         &self.timeframe[..len]
+    }
+
+    /// Validate the canonical collateral vault for this market.
+    pub fn matches_vault(&self, market_key: &Pubkey, vault_key: &Pubkey, vault_owner: &Pubkey, vault_mint: &Pubkey) -> bool {
+        self.vault == *vault_key && self.usdc_mint == *vault_mint && *vault_owner == *market_key
     }
 }
 

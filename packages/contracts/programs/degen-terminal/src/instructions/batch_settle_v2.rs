@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use crate::state_v2::{MarketV2, MarketStatusV2, SettlementBitmap, verify_merkle_proof, create_settlement_leaf, MAX_SETTLEMENTS_PER_BATCH, MAX_MERKLE_PROOF_DEPTH};
 use crate::errors::DegenError;
+use crate::security::require_market_v2_vault;
 
 /// A single settlement entry with proof
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -34,7 +35,9 @@ pub struct BatchSettleV2<'info> {
     /// The market's USDC vault (source of payouts)
     #[account(
         mut,
-        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams
+        constraint = market.vault == vault.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub vault: Box<Account<'info, TokenAccount>>,
 
@@ -71,6 +74,7 @@ pub fn batch_settle_v2<'info>(
 ) -> Result<()> {
     let market = &ctx.accounts.market;
     let bitmap = &mut ctx.accounts.settlement_bitmap;
+    require_market_v2_vault(market, &market.key(), &ctx.accounts.vault.key(), &ctx.accounts.vault)?;
 
     // Validate batch size
     require!(
@@ -150,6 +154,10 @@ pub fn batch_settle_v2<'info>(
             recipient_token.owner == settlement.recipient,
             DegenError::InvalidRecipient
         );
+        require!(
+            recipient_token.mint == market.usdc_mint,
+            DegenError::InvalidRecipient
+        );
 
         // Transfer USDC from vault to recipient
         if settlement.amount > 0 {
@@ -185,6 +193,13 @@ pub fn batch_settle_v2<'info>(
     market.settlements_processed = market.settlements_processed
         .checked_add(settlements_count)
         .ok_or(DegenError::MathOverflow)?;
+    market.settlement_amount_paid = market.settlement_amount_paid
+        .checked_add(total_paid)
+        .ok_or(DegenError::MathOverflow)?;
+    require!(
+        market.settlement_amount_paid <= market.total_settlement_amount,
+        DegenError::InvalidSettlementAmount
+    );
 
     msg!(
         "Batch settlement complete: {} settlements, {} USDC paid, {}/{} total processed",

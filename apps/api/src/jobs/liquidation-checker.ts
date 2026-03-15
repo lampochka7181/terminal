@@ -434,8 +434,7 @@ export async function lendingPoolSyncJob(): Promise<void> {
   
   try {
     const status = await lendingService.syncPoolBalance();
-    keeperLogger.info(`Lending pool synced`, {
-      source: 'LENDING',
+    logEvents.lendingPoolSynced({
       balance: status.balance,
       available: status.available,
       loaned: status.loaned,

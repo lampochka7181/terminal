@@ -4,8 +4,10 @@ declare_id!("5Kq43SR2HUNsyNZWaau1p8kQzAvW2UA2mAvempdchTrk");
 
 pub mod state;
 pub mod state_v2;  // V2 tokenized shares state
+pub mod session;
 pub mod instructions;
 pub mod errors;
+pub mod security;
 
 use instructions::*;
 
@@ -97,6 +99,26 @@ pub mod degen_terminal {
         strike_price: u64,
     ) -> Result<()> {
         instructions::activate_market(ctx, strike_price)
+    }
+
+    pub fn create_session_authority(
+        ctx: Context<CreateSessionAuthority>,
+        session_pubkey: Pubkey,
+        expires_at: i64,
+    ) -> Result<()> {
+        instructions::create_session_authority(ctx, session_pubkey, expires_at)
+    }
+
+    pub fn create_session_authority_by_sig(
+        ctx: Context<CreateSessionAuthorityBySig>,
+        session_pubkey: Pubkey,
+        expires_at: i64,
+    ) -> Result<()> {
+        instructions::create_session_authority_by_sig(ctx, session_pubkey, expires_at)
+    }
+
+    pub fn revoke_session_authority(ctx: Context<RevokeSessionAuthority>) -> Result<()> {
+        instructions::revoke_session_authority(ctx)
     }
 
     /// Resolve a market with outcome from relayer
@@ -269,8 +291,10 @@ pub mod degen_terminal {
         taker_args: PlaceOrderArgs,
         match_size: u64,
         taker_fee: u64,
+        maker_signer: Pubkey,
+        taker_signer: Pubkey,
     ) -> Result<()> {
-        instructions::execute_match_v2(ctx, maker_args, taker_args, match_size, taker_fee)
+        instructions::execute_match_v2(ctx, maker_args, taker_args, match_size, taker_fee, maker_signer, taker_signer)
     }
 
     /// Execute a closing trade in a V2 market (token transfer)
@@ -282,12 +306,20 @@ pub mod degen_terminal {
     /// 4. Open interest unchanged (no new tokens minted)
     ///
     /// # Arguments
-    /// * `args` - Close trade parameters (outcome, price, size, fee)
+    /// * `buyer_args` - Buy-side order parameters
+    /// * `seller_args` - Sell-side order parameters
+    /// * `match_size` - Number of shares matched
+    /// * `taker_fee` - Fee amount in USDC (6 decimals)
     pub fn execute_close_v2(
         ctx: Context<ExecuteCloseV2>,
-        args: CloseTradeArgsV2,
+        buyer_args: PlaceOrderArgs,
+        seller_args: PlaceOrderArgs,
+        match_size: u64,
+        taker_fee: u64,
+        buyer_signer: Pubkey,
+        seller_signer: Pubkey,
     ) -> Result<()> {
-        instructions::execute_close_v2(ctx, args)
+        instructions::execute_close_v2(ctx, buyer_args, seller_args, match_size, taker_fee, buyer_signer, seller_signer)
     }
 
     /// Activate a pending V2 market by setting the strike price
@@ -330,6 +362,14 @@ pub mod degen_terminal {
     /// * `args` - Merkle root, total amount, and settlement count
     pub fn post_merkle_root(ctx: Context<PostMerkleRoot>, args: PostMerkleRootArgs) -> Result<()> {
         instructions::post_merkle_root(ctx, args)
+    }
+
+    /// Initialize an additional settlement bitmap chunk for large markets.
+    pub fn init_settlement_bitmap(
+        ctx: Context<InitSettlementBitmap>,
+        chunk_index: u16,
+    ) -> Result<()> {
+        instructions::init_settlement_bitmap(ctx, chunk_index)
     }
 
     /// Atomically resolve a V2 market AND post the merkle root in one TX
@@ -396,7 +436,9 @@ pub mod degen_terminal {
     /// This instruction verifies all settlements are done, closes the vault,
     /// closes YES/NO mints (Token-2022 MintCloseAuthority), recovers all rent,
     /// and transitions market to SETTLED status.
-    pub fn finalize_market_v2(ctx: Context<FinalizeMarketV2>) -> Result<()> {
+    pub fn finalize_market_v2<'info>(
+        ctx: Context<'_, '_, 'info, 'info, FinalizeMarketV2<'info>>,
+    ) -> Result<()> {
         instructions::finalize_market_v2(ctx)
     }
 

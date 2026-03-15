@@ -5,7 +5,6 @@ use anchor_lang::solana_program::system_instruction;
 use anchor_spl::token::{Token, TokenAccount};
 use anchor_spl::token_interface::TokenInterface;
 use anchor_spl::token_2022::spl_token_2022;
-use anchor_spl::associated_token::AssociatedToken;
 use crate::state_v2::{MarketV2, MarketStatusV2, MarketOutcomeV2, SHARE_TOKEN_DECIMALS};
 use crate::state::{str_to_bytes, MAX_ASSET_LEN, MAX_TIMEFRAME_LEN};
 use crate::errors::DegenError;
@@ -48,6 +47,9 @@ pub struct InitializeMarketV2<'info> {
 
     #[account(mut)]
     pub authority: Signer<'info>,
+
+    /// Canonical USDC mint for market collateral.
+    pub usdc_mint: Box<Account<'info, anchor_spl::token::Mint>>,
 
     pub token_program: Program<'info, Token>,
     /// Token-2022 program for YES/NO share token mints
@@ -165,6 +167,8 @@ pub fn initialize_market_v2(
     let market = &mut ctx.accounts.market;
     market.id = 0;
     market.authority = ctx.accounts.authority.key();
+    market.usdc_mint = ctx.accounts.usdc_mint.key();
+    market.vault = Pubkey::default();
     market.asset = str_to_bytes::<10>(&asset);
     market.timeframe = str_to_bytes::<10>(&timeframe);
     market.strike_price = strike_price;
@@ -187,8 +191,10 @@ pub fn initialize_market_v2(
     market.settlement_merkle_root = [0u8; 32];
     market.has_merkle_root = false;
     market.total_settlement_amount = 0;
+    market.settlement_amount_paid = 0;
     market.settlements_processed = 0;
     market.settlements_total = 0;
+    market.settlement_bitmap_chunks = 0;
 
     // Bumps
     market.bump = ctx.bumps.market;
@@ -209,6 +215,7 @@ pub struct InitializeMarketV2Finalize<'info> {
     #[account(
         mut,
         constraint = market.no_mint == Pubkey::default() @ DegenError::InvalidMarketParams,
+        constraint = market.authority == authority.key() @ DegenError::Unauthorized,
     )]
     pub market: Box<Account<'info, MarketV2>>,
 
@@ -224,7 +231,7 @@ pub struct InitializeMarketV2Finalize<'info> {
     )]
     pub no_mint: AccountInfo<'info>,
 
-    /// USDC mint for vault creation — validated against known mint in GlobalState
+    /// USDC mint for vault creation — must match the mint bound in phase 1
     pub usdc_mint: Box<Account<'info, anchor_spl::token::Mint>>,
 
     /// The market's USDC vault (PDA owned by market PDA, regular Token program)
@@ -260,8 +267,15 @@ pub fn initialize_market_v2_finalize(
     msg!("Entering initialize_market_v2_finalize");
     msg!("Market: {}", market_key);
 
-    // Validate USDC mint matches the known mint from config (M-01 fix)
-    // The caller must pass the correct USDC mint — this prevents markets with fake tokens
+    // Validate the finalize caller and collateral mint match the values fixed in phase 1.
+    require!(
+        ctx.accounts.market.authority == ctx.accounts.authority.key(),
+        DegenError::Unauthorized
+    );
+    require!(
+        ctx.accounts.market.usdc_mint == ctx.accounts.usdc_mint.key(),
+        DegenError::InvalidMarketParams
+    );
     require!(
         ctx.accounts.usdc_mint.decimals == 6,
         DegenError::InvalidMarketParams
@@ -343,6 +357,7 @@ pub fn initialize_market_v2_finalize(
     let market = &mut ctx.accounts.market;
     market.no_mint = ctx.accounts.no_mint.key();
     market.no_mint_bump = ctx.bumps.no_mint;
+    market.vault = ctx.accounts.vault.key();
 
     if strike_price > 0 {
         market.strike_price = strike_price;

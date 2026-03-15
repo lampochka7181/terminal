@@ -75,6 +75,10 @@ pub struct MarketV2 {
     pub id: u64,
     /// Authority (the relayer that can resolve/settle)
     pub authority: Pubkey,
+    /// Canonical USDC mint for this market
+    pub usdc_mint: Pubkey,
+    /// Canonical collateral vault for this market
+    pub vault: Pubkey,
     /// Asset symbol (BTC, ETH, SOL)
     pub asset: [u8; 10],  // MAX_ASSET_LEN
     /// Timeframe (5m, 15m, 1h, 4h, 24h)
@@ -122,10 +126,14 @@ pub struct MarketV2 {
     pub has_merkle_root: bool,
     /// Total USDC to be distributed in settlement
     pub total_settlement_amount: u64,
+    /// Total USDC already paid out in settlement
+    pub settlement_amount_paid: u64,
     /// Number of settlements processed so far
     pub settlements_processed: u64,
     /// Total number of settlements expected
     pub settlements_total: u64,
+    /// Number of settlement bitmap chunks expected for this market
+    pub settlement_bitmap_chunks: u16,
 
     /// Bump seed for PDA
     pub bump: u8,
@@ -143,6 +151,8 @@ impl MarketV2 {
     pub const SIZE: usize = 8 +     // discriminator
         8 +                         // id
         32 +                        // authority
+        32 +                        // usdc_mint
+        32 +                        // vault
         10 +                        // asset
         10 +                        // timeframe
         8 +                         // strike_price
@@ -163,8 +173,10 @@ impl MarketV2 {
         32 +                        // settlement_merkle_root
         1 +                         // has_merkle_root
         8 +                         // total_settlement_amount
+        8 +                         // settlement_amount_paid
         8 +                         // settlements_processed
         8 +                         // settlements_total
+        2 +                         // settlement_bitmap_chunks
         // Bumps
         1 +                         // bump
         1 +                         // yes_mint_bump
@@ -204,7 +216,14 @@ impl MarketV2 {
 
     /// Check if all settlements are complete
     pub fn is_settlement_complete(&self) -> bool {
-        self.has_merkle_root && self.settlements_processed >= self.settlements_total
+        self.has_merkle_root &&
+        self.settlements_processed == self.settlements_total &&
+        self.settlement_amount_paid == self.total_settlement_amount
+    }
+
+    /// Validate the canonical collateral vault for this market.
+    pub fn matches_vault(&self, market_key: &Pubkey, vault_key: &Pubkey, vault_owner: &Pubkey, vault_mint: &Pubkey) -> bool {
+        self.vault == *vault_key && self.usdc_mint == *vault_mint && *vault_owner == *market_key
     }
 }
 

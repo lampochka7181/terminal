@@ -12,6 +12,7 @@ import { useWallet, useConnection } from '@solana/wallet-adapter-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useUserStore } from '@/stores/userStore';
 import { api, ApiError } from '@/lib/api';
+import { buildCanonicalOrderMessage } from '@/lib/order-auth';
 import { submitCancelOrder } from '@/lib/order-builder';
 import { validatePrice, validateSize } from '@/lib/solana';
 
@@ -34,7 +35,7 @@ export interface PlaceOrderParams {
 // Session signer interface - allows session key to sign orders
 export interface SessionSigner {
   publicKey: string;
-  sign: (orderData: Record<string, unknown>) => string | null;
+  sign: (messageBytes: Uint8Array) => string | null;
 }
 
 export interface OrderResult {
@@ -46,6 +47,7 @@ export interface OrderResult {
   filledSize: number;
   totalSpent?: number;
   avgPrice?: number;
+  totalFee?: number;
   unfilledDollars?: number;
   error?: string;
 }
@@ -86,12 +88,6 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
 
     if (!connected || !publicKey) {
       setError('Please connect your wallet');
-      placingRef.current = false;
-      return null;
-    }
-
-    if (!signTransaction) {
-      setError('Wallet does not support transaction signing');
       placingRef.current = false;
       return null;
     }
@@ -182,84 +178,46 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
       let signature: string = '';
       let binaryMessage: string = '';
       let sessionPublicKey: string | undefined;
-      let useSessionSigning = false;
-
-      // ========================================
-      // TRY SESSION KEY SIGNING (No popup - instant!)
-      // ========================================
-      console.log('[Order] Session signer check:', { 
-        hasSessionSigner: !!sessionSigner, 
-        sessionPubkey: sessionSigner?.publicKey?.slice(0, 8) 
+      const useSessionSigning = !!sessionSigner;
+      const canonicalPrice = isMarketOrder ? (params.maxPrice ?? params.price) : params.price;
+      const canonicalSize = isMarketOrder && !isSellOrder && params.dollarAmount
+        ? params.dollarAmount
+        : truncatedSize;
+      const signerPublicKey = useSessionSigning && sessionSigner
+        ? sessionSigner.publicKey
+        : publicKey.toBase58();
+      const messageBytes = buildCanonicalOrderMessage({
+        marketAddress: params.marketAddress,
+        walletAddress: publicKey.toBase58(),
+        signerPublicKey,
+        side: params.side.toUpperCase() as 'BID' | 'ASK',
+        outcome: params.outcome.toUpperCase() as 'YES' | 'NO',
+        orderType: params.orderType.toUpperCase() as 'LIMIT' | 'MARKET' | 'IOC' | 'FOK',
+        price: canonicalPrice,
+        size: canonicalSize,
+        expiryTs: expiryTimestamp,
+        clientOrderId,
       });
-      
-      if (sessionSigner) {
-        const sessionSignature = sessionSigner.sign(orderData);
-        console.log('[Order] Session signature result:', !!sessionSignature);
-        
-        if (sessionSignature) {
-          signature = sessionSignature;
-          binaryMessage = Buffer.from(JSON.stringify(orderData)).toString('base64');
-          sessionPublicKey = sessionSigner.publicKey;
-          useSessionSigning = true;
-          
-          const orderTypeLabel = isSellOrder ? 'SELL' : isMarketOrder ? 'MARKET BUY' : 'LIMIT BUY';
-          console.log('[Order] ✅ Session key signed', orderTypeLabel, 'order (no popup)');
-        } else {
-          console.warn('[Order] Session sign returned null, falling back to wallet signing');
+
+      if (useSessionSigning && sessionSigner) {
+        const sessionSignature = sessionSigner.sign(messageBytes);
+        if (!sessionSignature) {
+          setError('Session key is unavailable or expired');
+          return null;
         }
-      }
-      
-      // ========================================
-      // WALLET SIGNING (Popup per order) - fallback
-      // ========================================
-      if (!useSessionSigning) {
+        signature = sessionSignature;
+        binaryMessage = Buffer.from(messageBytes).toString('base64');
+        sessionPublicKey = sessionSigner.publicKey;
+        console.log('[Order] Session signed canonical authorization payload');
+      } else {
         if (!signMessage) {
           setError('Wallet does not support message signing');
           return null;
         }
-
-        const orderTypeLabel = isSellOrder ? 'SELL' : isMarketOrder ? 'MARKET BUY' : 'LIMIT BUY';
-        console.log('[Order] Wallet signing', orderTypeLabel, 'order (popup)');
-
-        // Create human-readable message for wallet display
-        let humanMessage: string;
-        
-        if (isSellOrder) {
-          humanMessage = `Degen Terminal - MARKET SELL
-
-Sell ${params.size.toFixed(2)} ${outcomeLabel} Contracts
-Type: Market Order (best available price)
-
-Market: ${params.marketAddress.slice(0, 8)}...
-Order ID: ${clientOrderId}
-Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
-        } else if (isMarketOrder && params.dollarAmount) {
-          humanMessage = `Degen Terminal - MARKET Order
-
-Buy ${outcomeLabel} Contracts
-Amount: $${params.dollarAmount} USDC
-Max Price: $${params.maxPrice?.toFixed(2) || '0.99'}
-
-Market: ${params.marketAddress.slice(0, 8)}...
-Order ID: ${clientOrderId}
-Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
-        } else {
-          humanMessage = `Degen Terminal - LIMIT Order
-
-Buy ${params.size.toFixed(2)} ${outcomeLabel} Contracts
-Limit Price: $${params.price.toFixed(2)}
-
-Market: ${params.marketAddress.slice(0, 8)}...
-Order ID: ${clientOrderId}
-Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
-        }
-
-        // Combine human + machine readable
-        const fullMessage = `${humanMessage}\n\n---\n${JSON.stringify(orderData)}`;
-        const messageBytes = new TextEncoder().encode(fullMessage);
         const signatureBytes = await signMessage(messageBytes);
         
-        signature = Buffer.from(signatureBytes).toString('base64');
+        const bs58 = await import('bs58');
+        signature = bs58.default.encode(signatureBytes);
         binaryMessage = Buffer.from(messageBytes).toString('base64');
         
         console.log('[Order] Signed authorization message');
@@ -282,7 +240,7 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         side: params.side,
         outcome: params.outcome,
         type: params.orderType,
-        price: params.price,
+        price: canonicalPrice,
         size: truncatedSize,
         expiry: expiryTimestamp,
         clientOrderId,
@@ -386,6 +344,7 @@ Expires: ${new Date(expiryTimestamp * 1000).toLocaleTimeString()}`;
         filledSize: response.filledSize || 0,
         totalSpent: (response as any).totalSpent,
         avgPrice: response.avgPrice,
+        totalFee: (response as any).totalFee,
         unfilledDollars: (response as any).unfilledDollars,
       };
 

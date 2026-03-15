@@ -1,4 +1,5 @@
 import pino, { Logger, LoggerOptions, DestinationStream, TransportTargetOptions } from 'pino';
+import pinoPretty from 'pino-pretty';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -127,22 +128,51 @@ function createProdTransports(category: LogCategory): TransportTargetOptions[] {
 }
 
 /**
- * Main system logger - for general application logs
+ * File stream that writes system logs to logs/system/YYYY-MM-DD/system.log
  */
-export const logger = pino({
-  ...baseOptions,
-  name: 'system',
-  ...(isDev && {
-    transport: {
-      target: 'pino-pretty',
-      options: {
-        colorize: true,
-        translateTime: 'SYS:HH:MM:ss',
-        ignore: 'pid,hostname',
-      },
+function createSystemFileStream() {
+  return {
+    write(msg: string) {
+      if (!WRITE_LOGS_TO_FILE) return;
+      try {
+        const date = getDateString();
+        const dir = path.join(LOG_DIR, 'system', date);
+        ensureLogDir(dir);
+        fs.appendFileSync(path.join(dir, 'system.log'), msg);
+      } catch {
+        // Silently ignore file write errors
+      }
     },
-  }),
-});
+  };
+}
+
+/**
+ * Main system logger - for general application logs
+ * Writes to console (pretty in dev, JSON warn+ in prod) AND to log files
+ */
+export const logger = pino(
+  {
+    ...baseOptions,
+    name: 'system',
+  },
+  pino.multistream([
+    ...(isDev
+      ? [{
+          stream: pinoPretty({
+            colorize: true,
+            translateTime: 'SYS:HH:MM:ss',
+            ignore: 'pid,hostname',
+          }) as unknown as DestinationStream,
+        }]
+      : [{
+          level: 'warn' as const,
+          stream: pino.destination(1),
+        }]),
+    ...(WRITE_LOGS_TO_FILE
+      ? [{ stream: createSystemFileStream() as unknown as DestinationStream }]
+      : []),
+  ]),
+);
 
 /**
  * Category-specific logger factory
@@ -722,6 +752,76 @@ export const logEvents = {
       event: 'KEEPER_JOB_FAILED',
     });
   },
+
+  // Market activation (distinct from creation — when strike price is set)
+  marketActivated: (data: {
+    marketId: string;
+    pubkey: string;
+    asset: string;
+    timeframe: string;
+    strikePrice: number;
+    expiryAt: Date;
+    activationLatencyMs: number;
+  }) => {
+    marketLogger.info(
+      `MARKET ACTIVATED: ${data.asset}-${data.timeframe} strike=$${data.strikePrice.toLocaleString()} (${data.activationLatencyMs}ms latency)`,
+      {
+        marketId: data.marketId,
+        pubkey: data.pubkey,
+        asset: data.asset,
+        timeframe: data.timeframe,
+        strikePrice: data.strikePrice,
+        expiryAt: data.expiryAt.toISOString(),
+        activationLatencyMs: data.activationLatencyMs,
+        event: 'MARKET_ACTIVATED',
+      }
+    );
+  },
+
+  // On-chain match execution confirmation
+  matchOnChainExecuted: (data: {
+    marketId: string;
+    marketPubkey: string;
+    asset: string;
+    timeframe: string;
+    matchSize: number;
+    price: number;
+    txSignature: string;
+    durationMs: number;
+  }) => {
+    tradeLogger.info(
+      `MATCH ON-CHAIN: ${data.asset}-${data.timeframe} ${data.matchSize} shares @ $${data.price.toFixed(6)} (${data.durationMs}ms)`,
+      {
+        marketId: data.marketId,
+        marketPubkey: data.marketPubkey,
+        asset: data.asset,
+        timeframe: data.timeframe,
+        matchSize: data.matchSize,
+        price: data.price,
+        txSignature: data.txSignature,
+        durationMs: data.durationMs,
+        event: 'MATCH_ON_CHAIN_EXECUTED',
+      }
+    );
+  },
+
+  // Orderbook cleared on market close
+  orderbookCleared: (data: {
+    marketId: string;
+    asset: string;
+    timeframe: string;
+  }) => {
+    marketLogger.info(
+      `ORDERBOOK CLEARED: ${data.asset}-${data.timeframe}`,
+      {
+        marketId: data.marketId,
+        asset: data.asset,
+        timeframe: data.timeframe,
+        event: 'ORDERBOOK_CLEARED',
+      }
+    );
+  },
+
 };
 
 /**

@@ -175,6 +175,12 @@ pub enum DegenError {
     #[msg("Signature does not match the expected signer")]
     SignerMismatch,
 
+    #[msg("Session has expired")]
+    SessionExpired,
+
+    #[msg("Invalid session duration")]
+    InvalidSessionDuration,
+
     // =========================================================================
     // Merkle Settlement Errors (6120-6139)
     // =========================================================================

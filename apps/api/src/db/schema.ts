@@ -107,6 +107,8 @@ export const orders = pgTable('orders', {
   signature: text('signature'), // Nullable for dollar-based MARKET orders
   encodedInstruction: text('encoded_instruction'), // Nullable - MM orders don't have this
   binaryMessage: text('binary_message'), // For signature verification (base64 encoded)
+  sessionPublicKey: varchar('session_public_key', { length: 44 }),
+  authVersion: varchar('auth_version', { length: 20 }).default('DT_ORDER_V1'),
   isMmOrder: boolean('is_mm_order').default(false).notNull(), // True for Market Maker bot orders
   isAgentOrder: boolean('is_agent_order').default(false).notNull(), // True for AI agent orders
   // Dollar-based market orders: original USD amount requested (e.g., $25)

@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use crate::state::{Market, Order};
 use crate::errors::DegenError;
+use crate::security::require_market_vault;
 
 #[derive(Accounts)]
 pub struct CancelOrder<'info> {
@@ -14,14 +15,17 @@ pub struct CancelOrder<'info> {
     /// Market's USDC vault - holds escrowed funds
     #[account(
         mut,
-        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams
+        constraint = market.vault == vault.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub vault: Account<'info, TokenAccount>,
     
     /// User's USDC token account - will receive refund
     #[account(
         mut,
-        constraint = user_usdc.owner == owner.key() @ DegenError::Unauthorized
+        constraint = user_usdc.owner == owner.key() @ DegenError::Unauthorized,
+        constraint = user_usdc.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub user_usdc: Account<'info, TokenAccount>,
     
@@ -49,6 +53,7 @@ pub struct CancelOrder<'info> {
 pub fn cancel_order(ctx: Context<CancelOrder>) -> Result<()> {
     let order = &ctx.accounts.order;
     let market = &ctx.accounts.market;
+    require_market_vault(market, &market.key(), &ctx.accounts.vault.key(), &ctx.accounts.vault)?;
     
     // Calculate refund amount based on remaining size
     // locked_amount is for full order, refund proportional to remaining

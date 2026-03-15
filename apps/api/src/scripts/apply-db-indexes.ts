@@ -70,8 +70,6 @@ async function main(): Promise<void> {
       // These dramatically improve performance as SETTLED markets accumulate
       `create index if not exists idx_markets_not_settled_created on markets (created_at desc) where status != 'SETTLED';`,
       `create index if not exists idx_markets_active_created on markets (status, created_at desc) where status != 'SETTLED';`,
-      // Index for margin_accounts liquidation checker (runs every 2s)
-      `create index if not exists idx_margin_accounts_open_confirmed on margin_accounts (status, on_chain_confirmed_at) where status = 'OPEN';`,
       // Index for pending market activation (strikePrice = '0' indicates pending)
       `create index if not exists idx_markets_pending_activation on markets (status) where status = 'OPEN' and strike_price = '0';`,
     ];

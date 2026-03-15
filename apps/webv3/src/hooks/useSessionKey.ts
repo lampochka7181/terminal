@@ -15,10 +15,12 @@
 
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
-import { Keypair } from '@solana/web3.js';
+import { useConnection } from '@solana/wallet-adapter-react';
+import { Keypair, PublicKey, Transaction } from '@solana/web3.js';
 import { useAuthStore } from '@/stores/authStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import { api } from '@/lib/api';
+import { buildCanonicalSessionGrantMessage, buildRevokeSessionAuthorityInstruction } from '@/lib/session-authority';
 import bs58 from 'bs58';
 import nacl from 'tweetnacl';
 
@@ -42,7 +44,7 @@ interface StoredSession {
 // Session signer interface for useOrder hook
 export interface SessionSigner {
   publicKey: string;
-  sign: (orderData: Record<string, unknown>) => string | null;
+  sign: (messageBytes: Uint8Array) => string | null;
 }
 
 export interface SessionKeyState {
@@ -59,7 +61,7 @@ export interface SessionKeyState {
   // Actions
   createSession: (durationSeconds?: number, remember?: boolean) => Promise<boolean>;
   revokeSession: () => Promise<void>;
-  signOrder: (orderData: Record<string, unknown>) => string | null;
+  signOrder: (messageBytes: Uint8Array) => string | null;
   getTimeRemaining: () => number;
 }
 
@@ -67,7 +69,8 @@ export interface SessionKeyState {
 let globalSessionKeypair: Keypair | null = null;
 
 export function useSessionKey(): SessionKeyState {
-  const { publicKey: walletPublicKey, signMessage, connected } = useWallet();
+  const { publicKey: walletPublicKey, signTransaction, signMessage, connected } = useWallet();
+  const { connection } = useConnection();
   const { isAuthenticated } = useAuthStore();
   
   // Use shared store for session state (read from store, not local state)
@@ -218,37 +221,30 @@ export function useSessionKey(): SessionKeyState {
       const sessionKeypair = Keypair.generate();
       const sessionPubkeyStr = sessionKeypair.publicKey.toBase58();
       const expiry = Math.floor(Date.now() / 1000) + durationSeconds;
-      
-      // 2. Create authorization message
-      const authMessage = `Degen Terminal - Trading Session
 
-I authorize this session key to sign orders on my behalf:
-
-Session Key: ${sessionPubkeyStr}
-Valid Until: ${new Date(expiry * 1000).toLocaleString()}
-Duration: ${Math.floor(durationSeconds / 3600)} hours
-
-This session can be revoked at any time.`;
-      
-      // 3. User signs with wallet (this is the ONLY popup)
-      const messageBytes = new TextEncoder().encode(authMessage);
+      // 2. Authorize the session with a wallet signature, then let the relayer pay gas.
+      const messageBytes = buildCanonicalSessionGrantMessage(
+        walletPublicKey,
+        sessionKeypair.publicKey,
+        expiry
+      );
       const signatureBytes = await signMessage(messageBytes);
       const signature = bs58.encode(signatureBytes);
-      
-      // 4. Register session with backend
-      await api.createSession({
+      const binaryMessage = Buffer.from(messageBytes).toString('base64');
+
+      const response = await api.createSession({
         sessionPublicKey: sessionPubkeyStr,
         walletAddress: walletPublicKey.toBase58(),
         expiresAt: expiry,
         signature,
-        message: authMessage,
+        binaryMessage,
       });
-      
-      // 5. Store session keypair (globally so all hook instances can access it)
+
+      // 3. Store session keypair (globally so all hook instances can access it)
       globalSessionKeypair = sessionKeypair;
       setStoreSession(sessionPubkeyStr, expiry);
       
-      // 6. Optionally persist to localStorage
+      // 4. Optionally persist to localStorage
       if (remember) {
         const storedSession: StoredSession = {
           secretKey: bs58.encode(sessionKeypair.secretKey),
@@ -259,7 +255,7 @@ This session can be revoked at any time.`;
         localStorage.setItem(STORAGE_KEY, JSON.stringify(storedSession));
       }
       
-      console.log('[SessionKey] Session created:', sessionPubkeyStr);
+      console.log('[SessionKey] Session created on-chain:', sessionPubkeyStr, response.txSignature);
       return true;
       
     } catch (err) {
@@ -279,13 +275,33 @@ This session can be revoked at any time.`;
     } finally {
       setIsCreating(false);
     }
-  }, [connected, walletPublicKey, signMessage, isAuthenticated]);
+  }, [connected, walletPublicKey, signMessage, isAuthenticated, setStoreSession]);
   
   /**
    * Revoke the current session
    */
   const revokeSession = useCallback(async () => {
     if (sessionPublicKey) {
+      try {
+        if (walletPublicKey && signTransaction) {
+          const sessionSigner = globalSessionKeypair?.publicKey || new PublicKey(sessionPublicKey);
+          const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+          const instruction = await buildRevokeSessionAuthorityInstruction(
+            walletPublicKey,
+            sessionSigner
+          );
+          const transaction = new Transaction({
+            recentBlockhash: blockhash,
+            feePayer: walletPublicKey,
+          }).add(instruction);
+          const signedTransaction = await signTransaction(transaction);
+          const signature = await connection.sendRawTransaction(signedTransaction.serialize());
+          await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');
+        }
+      } catch (err) {
+        console.warn('[SessionKey] Failed to revoke on-chain session:', err);
+      }
+
       try {
         await api.revokeSession(sessionPublicKey);
         console.log('[SessionKey] Session revoked');
@@ -295,13 +311,13 @@ This session can be revoked at any time.`;
     }
     
     clearSession();
-  }, [sessionPublicKey, clearSession]);
+  }, [sessionPublicKey, clearSession, walletPublicKey, signTransaction, connection]);
   
   /**
    * Sign order data with session key
    * Returns base58-encoded signature or null if session not active
    */
-  const signOrder = useCallback((orderData: Record<string, unknown>): string | null => {
+  const signOrder = useCallback((messageBytes: Uint8Array): string | null => {
     console.log('[SessionKey] signOrder called:', { 
       isActive, 
       hasKeypair: !!globalSessionKeypair,
@@ -327,10 +343,6 @@ This session can be revoked at any time.`;
     }
     
     try {
-      // Create deterministic message from order data
-      const message = JSON.stringify(orderData);
-      const messageBytes = new TextEncoder().encode(message);
-      
       // Sign with session key (using global keypair)
       const signature = nacl.sign.detached(
         messageBytes,

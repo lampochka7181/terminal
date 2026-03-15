@@ -376,24 +376,6 @@ export function broadcastUserSettlement(
   broadcastToUser(userId, 'settlement', settlement);
 }
 
-export function broadcastUserLiquidation(
-  userId: string,
-  liquidation: {
-    marketId: string;
-    marketAddress: string;
-    side: 'YES' | 'NO';
-    shares: number;
-    entryPrice: number;
-    liquidationPrice: number;
-    executionPrice: number;
-    proceeds: number;
-    returnedToUser: number;
-    leverage: number;
-  },
-): void {
-  broadcastToUser(userId, 'liquidation', liquidation);
-}
-
 export function broadcastTradeFailure(
   userId: string,
   failure: {

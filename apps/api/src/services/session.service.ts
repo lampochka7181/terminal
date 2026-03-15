@@ -18,6 +18,7 @@ interface Session {
   createdAt: number;
   authSignature: string;
   authMessage: string;
+  txSignature?: string;
 }
 
 // In-memory session store (can be moved to Redis for multi-instance)
@@ -48,9 +49,10 @@ export async function createSession(params: {
   walletAddress: string;
   expiresAt: number;
   signature: string;
-  message: string;
+  binaryMessage: string;
+  txSignature?: string;
 }): Promise<{ success: boolean; error?: string }> {
-  const { sessionPublicKey, walletAddress, expiresAt, signature, message } = params;
+  const { sessionPublicKey, walletAddress, expiresAt, signature, binaryMessage, txSignature } = params;
   
   try {
     // 1. Validate session public key format
@@ -80,14 +82,9 @@ export async function createSession(params: {
       return { success: false, error: 'Session expiry cannot exceed 7 days' };
     }
     
-    // 4. Verify the authorization signature
-    // The message should contain the session public key and expiry
-    if (!message.includes(sessionPublicKey)) {
-      return { success: false, error: 'Authorization message must contain session key' };
-    }
-    
+    // 4. Verify the authorization signature over the canonical binary payload
     try {
-      const messageBytes = new TextEncoder().encode(message);
+      const messageBytes = Buffer.from(binaryMessage, 'base64');
       const signatureBytes = bs58.decode(signature);
       
       const isValid = nacl.sign.detached.verify(
@@ -119,7 +116,8 @@ export async function createSession(params: {
       expiresAt,
       createdAt: now,
       authSignature: signature,
-      authMessage: message,
+      authMessage: binaryMessage,
+      txSignature,
     };
     
     sessions.set(sessionPublicKey, session);

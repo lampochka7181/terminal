@@ -25,6 +25,7 @@ let delayedRefetchTimer: NodeJS.Timeout | null = null;
 // After an optimistic update (upsertPosition), the write-behind queue needs ~1-2s to flush.
 // During that window, fetchPositions() would return stale data and cause a flicker.
 const positionProtectedUntil = new Map<string, number>();
+const closedPositionProtectedUntil = new Map<string, number>();
 const POSITION_PROTECT_MS = 4000; // 4s — comfortably covers write-behind flush
 
 // Track orderIds that were already handled by the API response (useOrder.ts upsertPosition).
@@ -132,27 +133,42 @@ export const useUserStore = create<UserState>((set, get) => ({
       set((state) => {
         const now = Date.now();
         // Smart merge: don't let stale DB data overwrite recent optimistic updates
-        const merged = fetched.map(fp => {
+        const merged: Position[] = [];
+        for (const fp of fetched) {
+          const existing = state.positions.find(p => p.marketAddress === fp.marketAddress);
+          const closedProtectedUntil = closedPositionProtectedUntil.get(fp.marketAddress);
+          const fetchedTotal = (fp.yesShares || 0) + (fp.noShares || 0);
+
+          // A recent full close/remove wins over stale DB rows for a short window.
+          if (closedProtectedUntil && now < closedProtectedUntil && !existing && fetchedTotal > 0) {
+            continue;
+          }
+
           const protectedUntil = positionProtectedUntil.get(fp.marketAddress);
           if (protectedUntil && now < protectedUntil) {
-            const existing = state.positions.find(p => p.marketAddress === fp.marketAddress);
             if (existing) {
               // DB caught up if fetched shares >= local — safe to use fetched data
               const existingTotal = (existing.yesShares || 0) + (existing.noShares || 0);
-              const fetchedTotal = (fp.yesShares || 0) + (fp.noShares || 0);
               if (fetchedTotal >= existingTotal) {
                 positionProtectedUntil.delete(fp.marketAddress);
-                return fp;
+                merged.push(fp);
+                continue;
               }
               // Still stale — keep local optimistic version
-              return existing;
+              merged.push(existing);
+              continue;
             }
           }
-          return fp;
-        });
+          merged.push(fp);
+        }
+
         // Keep any local-only positions still within protection window (not yet in DB)
         for (const existing of state.positions) {
           if (!merged.find(p => p.marketAddress === existing.marketAddress)) {
+            const closedProtectedUntil = closedPositionProtectedUntil.get(existing.marketAddress);
+            if (closedProtectedUntil && now < closedProtectedUntil) {
+              continue;
+            }
             const protectedUntil = positionProtectedUntil.get(existing.marketAddress);
             if (protectedUntil && now < protectedUntil && ((existing.yesShares || 0) + (existing.noShares || 0)) > 0) {
               merged.push(existing);
@@ -436,8 +452,19 @@ export const useUserStore = create<UserState>((set, get) => ({
 
   upsertPosition: (position) => {
     console.log(`[⏱️ STORE] upsertPosition called for ${position.marketAddress.slice(0,8)}...`);
+    const totalShares = (position.yesShares || 0) + (position.noShares || 0);
+    if (totalShares <= 0) {
+      closedPositionProtectedUntil.set(position.marketAddress, Date.now() + POSITION_PROTECT_MS);
+      positionProtectedUntil.delete(position.marketAddress);
+      set((state) => ({
+        positions: state.positions.filter((p) => p.marketAddress !== position.marketAddress),
+      }));
+      return;
+    }
+
     // Protect this position from being overwritten by stale DB fetches
     positionProtectedUntil.set(position.marketAddress, Date.now() + POSITION_PROTECT_MS);
+    closedPositionProtectedUntil.delete(position.marketAddress);
     set((state) => {
       const existingIndex = state.positions.findIndex(
         (p) => p.marketAddress === position.marketAddress
@@ -471,6 +498,8 @@ export const useUserStore = create<UserState>((set, get) => ({
   },
 
   removePosition: (marketAddress) => {
+    closedPositionProtectedUntil.set(marketAddress, Date.now() + POSITION_PROTECT_MS);
+    positionProtectedUntil.delete(marketAddress);
     set((state) => ({
       positions: state.positions.filter((p) => p.marketAddress !== marketAddress),
     }));

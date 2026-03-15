@@ -256,12 +256,13 @@ export default function BottomPanel({ height }: { height?: number }) {
     setTimeout(() => setPnlToasts(prev => prev.filter(t => t.id !== id)), 2000);
   }, []);
 
-  const handleClosePosition = useCallback(async (pos: Position, closeOutcome?: 'yes' | 'no') => {
+  const handleClosePosition = useCallback(async (pos: Position, closeOutcome?: 'yes' | 'no', entryCostBasis?: number) => {
     const outcome = closeOutcome ?? (pos.yesShares > 0 ? 'yes' : 'no');
     const shares = outcome === 'yes' ? pos.yesShares : pos.noShares;
     const entryPrice = outcome === 'yes'
       ? (pos.avgEntryYes ?? pos.avgEntryPrice)
       : (pos.avgEntryNo ?? pos.avgEntryPrice);
+    const costBasis = entryCostBasis ?? pos.totalCost ?? (shares * entryPrice);
     setClosingMarket(pos.marketAddress + '-' + outcome);
     try {
       const result = await placeOrder({
@@ -273,8 +274,9 @@ export default function BottomPanel({ height }: { height?: number }) {
         size: shares,
       });
       if (result && result.filledSize > 0) {
-        const sellPrice = result.avgPrice ?? 0;
-        showPnlToast((sellPrice - entryPrice) * result.filledSize);
+        const proceeds = (result.avgPrice ?? 0) * result.filledSize;
+        const sellFee = result.totalFee ?? 0;
+        showPnlToast(proceeds - costBasis - sellFee);
       } else if (result && result.filledSize === 0) {
         showPrompt('No Liquidity', 'No liquidity available to close your position. It will settle automatically at market expiry.', 'warning');
       }
@@ -474,9 +476,9 @@ export default function BottomPanel({ height }: { height?: number }) {
               {posEntries.map((entry) => {
                 const { pos, isYes, shares, costBasis, entryPrice } = entry;
                 const outcomeLabel = isYes ? 'Above' : 'Below';
-                const bestAsk = isYes ? yesBook.bestAsk : noBook.bestAsk;
-                const hasLiquidity = bestAsk > 0 && bestAsk < 1;
-                let liveMark = hasLiquidity ? bestAsk : 0;
+                const bestBid = isYes ? yesBook.bestBid : noBook.bestBid;
+                const hasLiquidity = bestBid > 0 && bestBid < 1;
+                let liveMark = hasLiquidity ? bestBid : 0;
                 let hasFallback = false;
                 if (!hasLiquidity) {
                   const assetPrice = prices[pos.asset as keyof typeof prices];
@@ -512,7 +514,7 @@ export default function BottomPanel({ height }: { height?: number }) {
                     </div>
                     <div style={{ flex: 1 }}>
                       <button
-                        onClick={() => handleClosePosition(pos, isYes ? 'yes' : 'no')}
+                        onClick={() => handleClosePosition(pos, isYes ? 'yes' : 'no', costBasis)}
                         disabled={isClosing || isPlacing}
                         style={{
                           fontSize: 15, padding: '3px 12px', borderRadius: 6, border: 'none',

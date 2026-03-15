@@ -36,6 +36,9 @@ export interface PendingOrder {
   price: string;
   size: string;
   signature: string | null;
+  binaryMessage?: string | null;
+  sessionPublicKey?: string | null;
+  authVersion?: string | null;
   encodedInstruction: null;
   isMmOrder: boolean;
   expiresAt: Date;
@@ -43,8 +46,6 @@ export interface PendingOrder {
   filledSize: string;
   remainingSize: string;
   dollarAmount?: string;  // Original USD amount for dollar-based market orders
-  leverage: string;
-  marginAmount: string | null;
 }
 
 export interface PendingTrade {
@@ -216,6 +217,9 @@ class WriteBehindService {
       price: o.price,
       size: o.size,
       signature: o.signature,
+      binaryMessage: o.binaryMessage || null,
+      sessionPublicKey: o.sessionPublicKey || null,
+      authVersion: o.authVersion || null,
       encodedInstruction: o.encodedInstruction,
       isMmOrder: o.isMmOrder,
       expiresAt: o.expiresAt,
@@ -223,8 +227,6 @@ class WriteBehindService {
       filledSize: o.filledSize,
       remainingSize: o.remainingSize,
       dollarAmount: o.dollarAmount || null,
-      leverage: o.leverage,
-      marginAmount: o.marginAmount,
     }));
 
     await db.insert(orders).values(values as any).onConflictDoNothing();

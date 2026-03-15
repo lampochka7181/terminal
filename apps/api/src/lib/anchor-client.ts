@@ -141,12 +141,12 @@ try {
   const idlPath = path.resolve(__dirname, '../../../../packages/contracts/target/idl/degen_terminal.json');
   if (fs.existsSync(idlPath)) {
     idl = JSON.parse(fs.readFileSync(idlPath, 'utf-8'));
-    logger.info(`✅ Loaded IDL from: ${idlPath}`);
+    logger.info(`âœ… Loaded IDL from: ${idlPath}`);
   } else {
-    logger.warn(`❌ IDL file not found at: ${idlPath}`);
+    logger.warn(`âŒ IDL file not found at: ${idlPath}`);
   }
 } catch (err) {
-  logger.warn('❌ Could not load IDL:', err);
+  logger.warn('âŒ Could not load IDL:', err);
 }
 
 export const PROGRAM_ID = new PublicKey(config.programId || '11111111111111111111111111111111');
@@ -198,25 +198,6 @@ export function getMarketVaultPda(marketPubkey: PublicKey): PublicKey {
   return pda;
 }
 
-export function getUserPositionPda(marketPubkey: PublicKey, user: PublicKey): PublicKey {
-  const [pda] = PublicKey.findProgramAddressSync(
-    [Buffer.from('position'), marketPubkey.toBuffer(), user.toBuffer()],
-    PROGRAM_ID
-  );
-  return pda;
-}
-
-export function getOrderPda(marketPubkey: PublicKey, owner: PublicKey, clientOrderId: number): PublicKey {
-  // Seeds must match on-chain:
-  // ["order", market.key(), owner.key(), client_order_id.to_le_bytes()]
-  const clientIdBuffer = Buffer.alloc(8);
-  clientIdBuffer.writeBigUInt64LE(BigInt(clientOrderId), 0);
-  const [pda] = PublicKey.findProgramAddressSync(
-    [Buffer.from('order'), marketPubkey.toBuffer(), owner.toBuffer(), clientIdBuffer],
-    PROGRAM_ID
-  );
-  return pda;
-}
 
 // ============================================================================
 // V2 PDA DERIVATION FUNCTIONS (Tokenized Shares Model)
@@ -265,6 +246,14 @@ export function getSettlementBitmapPda(marketV2Pubkey: PublicKey, chunkIndex: nu
   return pda;
 }
 
+export function getSessionAuthorityPda(wallet: PublicKey, sessionSigner: PublicKey): PublicKey {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('session_authority'), wallet.toBuffer(), sessionSigner.toBuffer()],
+    PROGRAM_ID
+  );
+  return pda;
+}
+
 // On-chain MarketStatusV2 enum values (must match state_v2.rs)
 const CHAIN_STATUS_MAP: Record<number, string> = {
   0: 'OPEN',       // Pending on-chain (DB uses OPEN + strikePrice='0')
@@ -275,15 +264,18 @@ const CHAIN_STATUS_MAP: Record<number, string> = {
   5: 'SETTLED',    // Fully settled
 };
 
-// Byte offset of `status` field inside a MarketV2 account (after 8-byte discriminator)
-// 8(disc) + 8(id) + 32(authority) + 10(asset) + 10(timeframe) + 8(strike) + 8(final) + 8(created) + 8(expiry) + 8(resolved) + 8(settled) = 116
-const MARKET_V2_STATUS_OFFSET = 116;
+// Byte offset of `status` field inside a MarketV2 account (after 8-byte discriminator).
+// New layout adds `usdc_mint` + `vault` (64 bytes) before the asset bytes.
+const MARKET_V2_STRIKE_PRICE_OFFSET = 132;
+const MARKET_V2_STATUS_OFFSET = 180;
 // open_interest offset: status(1) + outcome(1) + volume(8) + trades(4) + yes_mint(32) + no_mint(32) = +78 from status
-const MARKET_V2_OPEN_INTEREST_OFFSET = MARKET_V2_STATUS_OFFSET + 1 + 1 + 8 + 4 + 32 + 32; // 194
+const MARKET_V2_OPEN_INTEREST_OFFSET = MARKET_V2_STATUS_OFFSET + 1 + 1 + 8 + 4 + 32 + 32; // 258
 
 export interface MarketV2ChainState {
   status: string;       // Mapped DB status string
   statusRaw: number;    // Raw on-chain enum value
+  strikePriceRaw: bigint;
+  strikePrice: number;
   openInterest: bigint; // Raw open_interest (USDC lamports)
 }
 
@@ -300,11 +292,18 @@ export async function fetchMarketV2OnChainState(
     return null;
   }
 
+  const strikePriceRaw = info.data.readBigUInt64LE(MARKET_V2_STRIKE_PRICE_OFFSET);
   const statusRaw = info.data[MARKET_V2_STATUS_OFFSET];
   const status = CHAIN_STATUS_MAP[statusRaw] ?? 'OPEN';
   const openInterest = info.data.readBigUInt64LE(MARKET_V2_OPEN_INTEREST_OFFSET);
 
-  return { status, statusRaw, openInterest };
+  return {
+    status,
+    statusRaw,
+    strikePriceRaw,
+    strikePrice: Number(strikePriceRaw) / 100_000_000,
+    openInterest,
+  };
 }
 
 /**
@@ -318,21 +317,21 @@ export class AnchorClient {
   private mmKeypair: Keypair | null = null;
   private relayerUsdcAtaReady: boolean | null = null;
 
-  // ── RPC Connection Pool ──
+  // â”€â”€ RPC Connection Pool â”€â”€
   // Round-robins TX submission across multiple RPC endpoints for higher throughput.
   // Each endpoint has its own rate limit (~50 RPC/s on Helius Dev), so 3 endpoints = ~150 RPC/s.
   private execConnectionPool: Connection[] = [];
   private execPoolIndex = 0;
 
-  // ── Blockhash cache (saves 1 RPC call per TX) ──
+  // â”€â”€ Blockhash cache (saves 1 RPC call per TX) â”€â”€
   private cachedBlockhash: { blockhash: string; lastValidBlockHeight: number; fetchedAt: number } | null = null;
   private blockhashInflight: Promise<{ blockhash: string; lastValidBlockHeight: number }> | null = null;
   private readonly BLOCKHASH_CACHE_TTL_MS = 5000; // Reuse blockhash for 5s (valid for ~60-90s, saves RPC calls under sustained load)
 
-  // ── Helius Sender (15 tx/sec via Jito dual-routing) ──
+  // â”€â”€ Helius Sender (15 tx/sec via Jito dual-routing) â”€â”€
   private readonly heliusSenderUrl: string;
   private readonly jitoTipLamports: number;
-  // Official Jito tip accounts (mainnet-beta) — full list from Helius docs
+  // Official Jito tip accounts (mainnet-beta) â€” full list from Helius docs
   private readonly JITO_TIP_ACCOUNTS = [
     '4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE',
     'D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ',
@@ -364,23 +363,23 @@ export class AnchorClient {
     }
 
     if (this.execConnectionPool.length > 1) {
-      logger.info(`🔗 RPC connection pool: ${this.execConnectionPool.length} endpoints (${this.execConnectionPool.length * 50} est. RPC/s)`);
+      logger.info(`ðŸ”— RPC connection pool: ${this.execConnectionPool.length} endpoints (${this.execConnectionPool.length * 50} est. RPC/s)`);
     } else if (config.solanaExecutionRpcUrl) {
-      logger.info(`🔗 Separate execution RPC configured: ${execUrl.slice(0, 50)}...`);
+      logger.info(`ðŸ”— Separate execution RPC configured: ${execUrl.slice(0, 50)}...`);
     }
 
     // Helius Sender setup (mainnet ONLY: 15 tx/sec via Jito dual-routing)
-    // Sender requires Jito which doesn't exist on devnet — auto-disable for devnet
+    // Sender requires Jito which doesn't exist on devnet â€” auto-disable for devnet
     const isDevnet = config.solanaRpcUrl.includes('devnet');
     if (config.heliusSenderUrl && isDevnet) {
-      logger.warn(`⚠️  Helius Sender disabled: Jito (required by Sender) is not available on devnet`);
+      logger.warn(`âš ï¸  Helius Sender disabled: Jito (required by Sender) is not available on devnet`);
       this.heliusSenderUrl = '';
     } else {
       this.heliusSenderUrl = config.heliusSenderUrl;
     }
     this.jitoTipLamports = Math.floor(config.jitoTipSol * LAMPORTS_PER_SOL);
     if (this.heliusSenderUrl) {
-      logger.info(`🚀 Helius Sender enabled: ${this.heliusSenderUrl} (tip: ${config.jitoTipSol} SOL/tx)`);
+      logger.info(`ðŸš€ Helius Sender enabled: ${this.heliusSenderUrl} (tip: ${config.jitoTipSol} SOL/tx)`);
     }
 
     // Load relayer keypair
@@ -388,12 +387,12 @@ export class AnchorClient {
       try {
         const secretKey = bs58.decode(config.relayerPrivateKey);
         this.relayerKeypair = Keypair.fromSecretKey(secretKey);
-        logger.info(`✅ Relayer wallet loaded: ${this.relayerKeypair.publicKey.toBase58()}`);
+        logger.info(`âœ… Relayer wallet loaded: ${this.relayerKeypair.publicKey.toBase58()}`);
       } catch (err) {
-        logger.warn('❌ Invalid RELAYER_PRIVATE_KEY');
+        logger.warn('âŒ Invalid RELAYER_PRIVATE_KEY');
       }
     } else {
-      logger.warn('⚠️  RELAYER_PRIVATE_KEY not set - on-chain operations will be simulated');
+      logger.warn('âš ï¸  RELAYER_PRIVATE_KEY not set - on-chain operations will be simulated');
     }
 
     // Load MM keypair
@@ -402,17 +401,17 @@ export class AnchorClient {
       try {
         const secretKey = bs58.decode(mmKey);
         this.mmKeypair = Keypair.fromSecretKey(secretKey);
-        logger.info(`✅ MM wallet loaded: ${this.mmKeypair.publicKey.toBase58()}`);
+        logger.info(`âœ… MM wallet loaded: ${this.mmKeypair.publicKey.toBase58()}`);
       } catch (err) {
-        logger.warn('❌ Invalid MM_WALLET_PRIVATE_KEY');
+        logger.warn('âŒ Invalid MM_WALLET_PRIVATE_KEY');
       }
     }
     
     // Log ready status
     if (this.isReady()) {
-      logger.info(`✅ Anchor client ready for on-chain operations`);
+      logger.info(`âœ… Anchor client ready for on-chain operations`);
     } else {
-      logger.warn(`⚠️  Anchor client NOT ready - trades/settlements will be SIMULATED`);
+      logger.warn(`âš ï¸  Anchor client NOT ready - trades/settlements will be SIMULATED`);
       if (!this.relayerKeypair) logger.warn('   - Missing: RELAYER_PRIVATE_KEY');
       if (!idl) logger.warn('   - Missing: IDL file');
     }
@@ -447,7 +446,7 @@ export class AnchorClient {
   }
 
   /**
-   * Get execution connection (for sending transactions — may use separate RPC)
+   * Get execution connection (for sending transactions â€” may use separate RPC)
    */
   getExecutionConnection(): Connection {
     return this.executionConnection;
@@ -464,7 +463,7 @@ export class AnchorClient {
   /**
    * Get next execution connection from the pool (round-robin).
    * Each connection points to a different RPC endpoint with its own rate limit.
-   * This multiplies our effective RPC throughput: N endpoints × 50 RPC/s each.
+   * This multiplies our effective RPC throughput: N endpoints Ã— 50 RPC/s each.
    */
   private getNextExecConnection(): Connection {
     const conn = this.execConnectionPool[this.execPoolIndex % this.execConnectionPool.length];
@@ -538,7 +537,7 @@ export class AnchorClient {
       }
       await new Promise(resolve => setTimeout(resolve, intervalMs));
     }
-    // Timed out — return null (treat as unknown)
+    // Timed out â€” return null (treat as unknown)
     return null;
   }
 
@@ -666,197 +665,19 @@ export class AnchorClient {
     return buffer;
   }
 
-  /**
-   * Build execute_match instruction using raw encoding
-   * Supports hybrid model: Order PDAs for user orders, direct transfer for MM orders
-   */
-  async buildExecuteMatchInstruction(params: {
-    marketPubkey: PublicKey;
-    makerWallet: PublicKey;
-    takerWallet: PublicKey;
-    makerArgs: PlaceOrderArgs;
-    takerArgs: PlaceOrderArgs;
-    matchSize: number;
-    takerFee: number;  // Fee in USDC (6 decimals) - calculated by relayer
-    makerOrderPda?: PublicKey | null;  // Order PDA if user order
-    takerOrderPda?: PublicKey | null;  // Order PDA if user order
-  }): Promise<TransactionInstruction> {
-    if (!this.relayerKeypair) {
-      throw new Error('Relayer not initialized');
-    }
-
-    const globalState = getGlobalStatePda();
-    const market = params.marketPubkey;
-    
-    // Get vault as market's ATA
-    const vault = await getAssociatedTokenAddress(USDC_MINT, market, true);
-    
-    // Get positions PDAs
-    const makerPosition = getUserPositionPda(market, params.makerWallet);
-    const takerPosition = getUserPositionPda(market, params.takerWallet);
-
-    // Get USDC ATAs
-    const makerUsdc = await getAssociatedTokenAddress(USDC_MINT, params.makerWallet);
-    const takerUsdc = await getAssociatedTokenAddress(USDC_MINT, params.takerWallet);
-
-    // Get fee recipient from config or use relayer
-    const feeRecipientWallet = config.feeRecipient 
-      ? new PublicKey(config.feeRecipient)
-      : this.relayerKeypair.publicKey;
-    const feeRecipient = await getAssociatedTokenAddress(USDC_MINT, feeRecipientWallet);
-
-    // Build instruction data
-    // Anchor discriminator = sha256("global:execute_match")[0:8]
-    const discriminator = computeDiscriminator('execute_match');
-    logger.debug(`execute_match discriminator: ${discriminator.toString('hex')}`);
-    
-    const makerArgsBuffer = this.encodePlaceOrderArgs(params.makerArgs);
-    const takerArgsBuffer = this.encodePlaceOrderArgs(params.takerArgs);
-    const matchSizeBuffer = Buffer.alloc(8);
-    matchSizeBuffer.writeBigUInt64LE(BigInt(params.matchSize), 0);
-    const takerFeeBuffer = Buffer.alloc(8);
-    takerFeeBuffer.writeBigUInt64LE(BigInt(params.takerFee), 0);
-
-    const data = Buffer.concat([discriminator, makerArgsBuffer, takerArgsBuffer, matchSizeBuffer, takerFeeBuffer]);
-
-    // Build accounts list
-    // Note: Order PDAs are optional (None = no account, Some = account present)
-    // For Anchor optional accounts, we pass the program ID to indicate None
-    const makerOrderAccount = params.makerOrderPda || PROGRAM_ID;  // None if not provided
-    const takerOrderAccount = params.takerOrderPda || PROGRAM_ID;  // None if not provided
-    // seller_usdc_receive is reserved for future closing trades, pass None for now
-    const sellerUsdcReceive = PROGRAM_ID;
-
-    logger.info(`execute_match: market=${market.toBase58()}`);
-    logger.info(`execute_match: maker=${params.makerWallet.toBase58()}, makerPosition=${makerPosition.toBase58()}`);
-    logger.info(`execute_match: taker=${params.takerWallet.toBase58()}, takerPosition=${takerPosition.toBase58()}`);
-    logger.info(`execute_match: makerOrder=${params.makerOrderPda?.toBase58() || 'None'}, takerOrder=${params.takerOrderPda?.toBase58() || 'None'}`);
-
-    return new TransactionInstruction({
-      programId: PROGRAM_ID,
-      keys: [
-        { pubkey: globalState, isSigner: false, isWritable: false },
-        { pubkey: market, isSigner: false, isWritable: true },
-        { pubkey: vault, isSigner: false, isWritable: true },
-        { pubkey: feeRecipient, isSigner: false, isWritable: true },
-        // Maker accounts
-        { pubkey: params.makerWallet, isSigner: false, isWritable: false },
-        { pubkey: makerPosition, isSigner: false, isWritable: true },
-        { pubkey: makerUsdc, isSigner: false, isWritable: true },
-        { pubkey: makerOrderAccount, isSigner: false, isWritable: params.makerOrderPda ? true : false },  // Optional Order PDA
-        // Taker accounts
-        { pubkey: params.takerWallet, isSigner: false, isWritable: false },
-        { pubkey: takerPosition, isSigner: false, isWritable: true },
-        { pubkey: takerUsdc, isSigner: false, isWritable: true },
-        { pubkey: takerOrderAccount, isSigner: false, isWritable: params.takerOrderPda ? true : false },  // Optional Order PDA
-        // Seller USDC receive (optional - reserved for closing trades, pass None)
-        { pubkey: sellerUsdcReceive, isSigner: false, isWritable: false },
-        // Common accounts
-        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
-        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      ],
-      data,
-    });
-  }
-
-  /**
-   * Build all instructions needed for execute_match including Ed25519 signature verifications
-   * Returns [makerEd25519, takerEd25519, executeMatch]
-   */
-  async buildExecuteMatchWithSignatures(params: {
-    marketPubkey: PublicKey;
-    makerWallet: PublicKey;
-    takerWallet: PublicKey;
-    makerArgs: PlaceOrderArgs;
-    takerArgs: PlaceOrderArgs;
-    matchSize: number;
-    makerSignature: string;  // Base58 encoded signature
-    takerSignature: string;  // Base58 encoded signature
-    makerMessage: string;    // Base64 encoded binary message
-    takerMessage: string;    // Base64 encoded binary message
-  }): Promise<TransactionInstruction[]> {
-    // Decode signatures and messages
-    const makerSigBuffer = Buffer.from(bs58.decode(params.makerSignature));
-    const takerSigBuffer = Buffer.from(bs58.decode(params.takerSignature));
-    const makerMsgBuffer = Buffer.from(params.makerMessage, 'base64');
-    const takerMsgBuffer = Buffer.from(params.takerMessage, 'base64');
-
-    // Build Ed25519 verify instructions
-    const makerEd25519Ix = buildEd25519VerifyInstruction(
-      params.makerWallet,
-      makerMsgBuffer,
-      makerSigBuffer
-    );
-
-    const takerEd25519Ix = buildEd25519VerifyInstruction(
-      params.takerWallet,
-      takerMsgBuffer,
-      takerSigBuffer
-    );
-
-    // Build execute_match instruction
-    // Note: This legacy function is for Ed25519 signed orders - fee defaults to flat minimum
-    const executeMatchIx = await this.buildExecuteMatchInstruction({
-      marketPubkey: params.marketPubkey,
-      makerWallet: params.makerWallet,
-      takerWallet: params.takerWallet,
-      makerArgs: params.makerArgs,
-      takerArgs: params.takerArgs,
-      matchSize: params.matchSize,
-      takerFee: 20_000,  // Default $0.02 flat fee for legacy signed orders
-    });
-
-    // Order matters: Ed25519 verifications must come before execute_match
-    // so the contract can read them from the instructions sysvar
-    return [makerEd25519Ix, takerEd25519Ix, executeMatchIx];
-  }
-
-  /**
-   * Build settle_positions instruction using raw encoding
-   */
-  async buildSettlePositionInstruction(params: {
-    marketPubkey: PublicKey;
-    userWallet: PublicKey;
-  }): Promise<TransactionInstruction> {
-    if (!this.relayerKeypair) {
-      throw new Error('Relayer not initialized');
-    }
-
-    const market = params.marketPubkey;
-    const vault = await getAssociatedTokenAddress(USDC_MINT, market, true);
-    const position = getUserPositionPda(market, params.userWallet);
-    const userUsdc = await getAssociatedTokenAddress(USDC_MINT, params.userWallet);
-
-    // Anchor discriminator = sha256("global:settle_positions")[0:8]
-    const discriminator = computeDiscriminator('settle_positions');
-    logger.info(`settle_positions: market=${market.toBase58()}`);
-    logger.info(`settle_positions: user=${params.userWallet.toBase58()}, position=${position.toBase58()}`);
-
-    return new TransactionInstruction({
-      programId: PROGRAM_ID,
-      keys: [
-        { pubkey: market, isSigner: false, isWritable: true },
-        { pubkey: vault, isSigner: false, isWritable: true },
-        { pubkey: position, isSigner: false, isWritable: true },
-        { pubkey: userUsdc, isSigner: false, isWritable: true },
-        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: false },
-        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      ],
-      data: discriminator,
-    });
-  }
-
-  /**
-   * Submit a transaction with compute budget and confirmation.
-   * Routes via Helius Sender (15 tx/sec) when configured, otherwise standard RPC (5 tx/sec).
-   */
   async submitTransaction(
     instructions: TransactionInstruction[],
     additionalSigners: Keypair[] = [],
     contextLabel: string = 'Transaction',
-    opts?: { priorityMicroLamports?: number; computeUnits?: number; feePayerOverride?: Keypair; skipSimulation?: boolean }
-  ): Promise<string> {
+    opts?: {
+      priorityMicroLamports?: number;
+      computeUnits?: number;
+      feePayerOverride?: Keypair;
+      skipSimulation?: boolean;
+      omitComputeBudgetIxs?: boolean;
+      omitJitoTip?: boolean;
+    }
+  ): Promise<{ signature: string; confirmed: boolean }> {
     if (!this.relayerKeypair) {
       throw new Error('Relayer keypair not set');
     }
@@ -864,33 +685,30 @@ export class AnchorClient {
     const feePayer = opts?.feePayerOverride || this.relayerKeypair;
     const transaction = new Transaction();
 
-    // Add compute budget with priority fee (override-able for settlement ops)
-    const computeUnits = opts?.computeUnits ?? 400000;
-    const priorityFee = opts?.priorityMicroLamports ?? 10000;
-    transaction.add(
-      ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
-    );
+    if (!opts?.omitComputeBudgetIxs) {
+      const computeUnits = opts?.computeUnits ?? 400000;
+      const priorityFee = opts?.priorityMicroLamports ?? 10000;
+      transaction.add(
+        ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
+      );
+    }
 
-    // Add instructions
     for (const ix of instructions) {
       transaction.add(ix);
     }
 
-    // Add Jito tip instruction when using Helius Sender (required for dual-routing)
-    if (this.heliusSenderUrl) {
+    if (this.heliusSenderUrl && !opts?.omitJitoTip) {
       transaction.add(this.getJitoTipInstruction(feePayer.publicKey));
     }
 
-    // Get recent blockhash (cached to save RPC calls under high throughput)
     const { blockhash, lastValidBlockHeight } = await this.getCachedBlockhash();
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = feePayer.publicKey;
 
-    // Sign with fee payer + relayer (if different) + additional signers
     const signers: Keypair[] = [feePayer];
     if (opts?.feePayerOverride) {
-      signers.push(this.relayerKeypair); // Master also signs as relayer authority
+      signers.push(this.relayerKeypair);
     }
     signers.push(...additionalSigners);
     transaction.sign(...signers);
@@ -901,20 +719,16 @@ export class AnchorClient {
     try {
       let signature: string;
 
-      // ── Try Helius Sender first (15 tx/sec, dual-routed to validators + Jito) ──
       const senderSig = await this.sendViaHeliusSender(serializedTx as Buffer);
 
       if (senderSig) {
         signature = senderSig;
-        // Sender uses a different endpoint — confirm via polling on our RPC connection
         const pollResult = await this.pollConfirmation(signature, execConn);
         if (pollResult === null) {
-          // Timeout — TX may have landed but we can't confirm. Treat as success (caller retries if needed)
           logger.warn(`[Sender] ${contextLabel}: confirmation timed out for ${signature.slice(0, 16)}...`);
-          return signature;
+          return { signature, confirmed: false };
         }
         if (pollResult.err) {
-          // TX confirmed but failed on-chain
           let logMessages: string[] | undefined;
           try {
             const tx = await this.connection.getTransaction(signature, {
@@ -929,17 +743,9 @@ export class AnchorClient {
           (error as any).logs = logMessages;
           throw error;
         }
-        return signature;
+        return { signature, confirmed: true };
       }
 
-      // ── Fallback: standard sendRawTransaction with aggressive resend loop ──
-      // On devnet (no Helius Sender) the RPC's built-in retry is insufficient.
-      // We resend the same signed TX every 2s to reach new leaders as they rotate,
-      // while confirmTransaction waits for inclusion or block-height expiry.
-
-      // Run preflight simulation FIRST to fail fast on invalid transactions
-      // instead of waiting ~60s for block height to expire.
-      // Skip simulation for speed-critical paths (match/close) when configured.
       const shouldSimulate = !opts?.skipSimulation && !config.skipPreflightSimulation;
       if (shouldSimulate) {
         try {
@@ -949,9 +755,6 @@ export class AnchorClient {
             const errJson = JSON.stringify(simResult.value.err);
             const logText = simLogs.join(' ');
 
-            // Map simulation errors to recognizable keywords that downstream handlers check for.
-            // Without this, the preflight wraps errors in a new message format that breaks
-            // idempotent "already in use" / "AccountNotInitialized" detection.
             if (logText.includes('already in use') || errJson.includes('"Custom":0}')) {
               logger.debug(`[${contextLabel}] Preflight: account already in use (idempotent)`);
               const error = new Error(`already in use (0x0)`);
@@ -983,7 +786,6 @@ export class AnchorClient {
               throw error;
             }
 
-            // Genuinely unexpected failure — log full details at ERROR
             logger.error(`[${contextLabel}] Preflight simulation FAILED: ${errJson}`);
             if (simLogs.length > 0) {
               logger.error(`[${contextLabel}] Simulation logs:\n${simLogs.join('\n')}`);
@@ -994,9 +796,7 @@ export class AnchorClient {
           }
           logger.debug(`[${contextLabel}] Preflight simulation OK (units: ${simResult.value.unitsConsumed})`);
         } catch (simErr: any) {
-          // Re-throw errors from our own preflight handling above
           if (simErr.logs !== undefined) throw simErr;
-          // Network errors — log and proceed with send anyway (simulation endpoint might be down)
           logger.warn(`[${contextLabel}] Preflight simulation request failed (proceeding anyway): ${simErr.message?.slice(0, 100)}`);
         }
       } else {
@@ -1005,24 +805,19 @@ export class AnchorClient {
 
       signature = await execConn.sendRawTransaction(
         serializedTx,
-        { skipPreflight: true, maxRetries: 0 } // We manage retries ourselves
+        { skipPreflight: true, maxRetries: 0 }
       );
 
-      // Aggressive resend: keep forwarding the TX to new leaders every 2 seconds
-      // across ALL connections in the pool for maximum propagation.
       const resendIntervalMs = 2000;
       const resendTimer = setInterval(async () => {
         for (const conn of this.execConnectionPool) {
           try {
             await conn.sendRawTransaction(serializedTx, { skipPreflight: true, maxRetries: 0 });
-          } catch { /* ignore — TX may already be confirmed or blockhash expired */ }
+          } catch { /* ignore */ }
         }
       }, resendIntervalMs);
 
       try {
-        // Confirm transaction with a hard timeout to avoid waiting 60+ seconds on devnet.
-        // Solana's confirmTransaction waits for block height expiry (~151 blocks = ~60s on devnet).
-        // For good UX, we timeout after 10 seconds - if not confirmed, BullMQ will retry.
         const MAX_CONFIRM_TIMEOUT_MS = 10_000;
 
         const confirmationPromise = execConn.confirmTransaction(
@@ -1036,20 +831,13 @@ export class AnchorClient {
 
         const confirmation = await Promise.race([confirmationPromise, timeoutPromise]) as any;
 
-        // If timed out, return signature - tx may still confirm later, caller can retry via BullMQ
         if (confirmation.timedOut) {
           logger.warn(`[${contextLabel}] Confirmation timeout (${MAX_CONFIRM_TIMEOUT_MS}ms) for ${signature.slice(0, 16)}... — will retry`);
-          // Clear resend timer before returning
           clearInterval(resendTimer);
-          // Throw to trigger BullMQ retry
           throw new Error(`Confirmation timeout after ${MAX_CONFIRM_TIMEOUT_MS}ms`);
         }
 
-        // IMPORTANT: confirmTransaction does NOT throw if the tx executed and failed.
-        // We must explicitly check `err` and surface a real failure so callers don't
-        // assume the transaction succeeded (e.g. market creation).
         if (confirmation?.value?.err) {
-          // Best-effort fetch logs for debugging (may be null depending on RPC)
           let logMessages: string[] | undefined;
           try {
             const tx = await this.connection.getTransaction(signature, {
@@ -1063,7 +851,6 @@ export class AnchorClient {
           const errJson = JSON.stringify(confirmation.value.err);
           const logsStr = logMessages ? JSON.stringify(logMessages, null, 2) : 'No logs available';
           const error = new Error(`[${contextLabel}] CONFIRMED BUT FAILED: ${errJson}\nLogs: ${logsStr}`);
-          // Attach logs for existing error handler formatting
           (error as any).logs = logMessages;
           throw error;
         }
@@ -1071,24 +858,22 @@ export class AnchorClient {
         clearInterval(resendTimer);
       }
 
-      return signature;
+      return { signature, confirmed: true };
     } catch (err: any) {
       const logsStr = err.logs ? JSON.stringify(err.logs, null, 2) : 'No logs available';
       const errorMsg = err.message || '';
 
-      // Invalidate blockhash cache on expiry errors so retries get a fresh one
       if (errorMsg.includes('block height exceeded') || errorMsg.includes('Blockhash not found') || errorMsg.includes('expired')) {
         this.cachedBlockhash = null;
       }
       
-      // Downgrade common "drift" errors to DEBUG level to avoid terminal noise
       const isCommonError = 
         errorMsg.includes('already in use') || 
         errorMsg.includes('0x0') ||
         errorMsg.includes('AccountNotInitialized') ||
         errorMsg.includes('0xbc4') ||
         errorMsg.includes('MarketNotPending') ||
-        errorMsg.includes('0x1774'); // MarketNotPending error code (6004)
+        errorMsg.includes('0x1774');
 
       if (isCommonError) {
         logger.debug(`[${contextLabel}] skipped (expected): ${errorMsg.slice(0, 100)}...`);
@@ -1097,711 +882,6 @@ export class AnchorClient {
       }
       throw err;
     }
-  }
-
-  /**
-   * Execute a match on-chain
-   * 
-   * @param params Match parameters including signatures for Ed25519 verification
-   * @returns Transaction signature
-   */
-  async executeMatch(params: {
-    marketPubkey: string;
-    makerWallet: string;
-    takerWallet: string;
-    makerSide: 'BID' | 'ASK';
-    takerSide: 'BID' | 'ASK';
-    outcome: 'YES' | 'NO';
-    price: number;
-    matchSize: number;
-    takerFee: number;  // Fee in USD (will be converted to 6 decimals)
-    makerClientOrderId: number;
-    takerClientOrderId: number;
-    makerExpiryTs: number;
-    takerExpiryTs: number;
-    // On-chain Order PDAs (for user orders - trustless verification)
-    makerOrderPda?: string;   // On-chain Order account (if user order)
-    takerOrderPda?: string;   // On-chain Order account (if user order)
-    // Legacy: signatures for MM orders (off-chain verification)
-    makerSignature?: string;  // Base58 encoded Ed25519 signature
-    takerSignature?: string;  // Base58 encoded Ed25519 signature
-    makerMessage?: string;    // Base64 encoded binary message
-    takerMessage?: string;    // Base64 encoded binary message
-    feePayerKeypair?: Keypair; // Pool child wallet as fee payer
-  }): Promise<string> {
-    if (!this.isReady()) {
-      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
-    }
-
-    const market = new PublicKey(params.marketPubkey);
-    const makerWallet = new PublicKey(params.makerWallet);
-    const takerWallet = new PublicKey(params.takerWallet);
-
-    // Convert to instruction format
-    // Price: 6 decimals (0.52 -> 520_000)
-    // Size: 6 decimals for fractional contracts (1.5 contracts -> 1_500_000)
-    // Fee: 6 decimals ($0.02 -> 20_000)
-    const priceU64 = Math.floor(params.price * 1_000_000);
-    const sizeU64 = Math.round(params.matchSize * 1_000_000);
-    const feeU64 = Math.floor(params.takerFee * 1_000_000);
-
-    const makerArgs: PlaceOrderArgs = {
-      side: params.makerSide,
-      outcome: params.outcome,
-      orderType: 'LIMIT',
-      price: priceU64,
-      size: sizeU64,  // Fractional: 6 decimals
-      expiryTs: params.makerExpiryTs,
-      clientOrderId: params.makerClientOrderId,
-    };
-
-    const takerArgs: PlaceOrderArgs = {
-      side: params.takerSide,
-      outcome: params.outcome,
-      orderType: 'LIMIT',
-      price: priceU64,
-      size: sizeU64,  // Fractional: 6 decimals
-      expiryTs: params.takerExpiryTs,
-      clientOrderId: params.takerClientOrderId,
-    };
-
-    // Parse Order PDAs if provided
-    const makerOrderPda = params.makerOrderPda ? new PublicKey(params.makerOrderPda) : null;
-    const takerOrderPda = params.takerOrderPda ? new PublicKey(params.takerOrderPda) : null;
-
-    logger.debug(`executeMatch: makerHasOrderPda=${!!makerOrderPda}, takerHasOrderPda=${!!takerOrderPda}`);
-
-    // Build execute_match instruction with optional Order PDAs
-    const ix = await this.buildExecuteMatchInstruction({
-      marketPubkey: market,
-      makerWallet,
-      takerWallet,
-      makerArgs,
-      takerArgs,
-      matchSize: sizeU64,  // Fractional: 6 decimals
-      takerFee: feeU64,    // Tiered fee calculated by relayer
-      makerOrderPda,
-      takerOrderPda,
-    });
-
-    const signature = await this.submitTransaction([ix], [], `Match ${params.matchSize} shares`, {
-      feePayerOverride: params.feePayerKeypair,
-      skipSimulation: true, // Speed-critical: skip preflight to save 100-500ms
-    });
-    logger.debug(`Match executed on-chain: ${signature}`);
-
-    return signature;
-  }
-
-  /**
-   * Execute a LEVERAGED match on-chain
-   * 
-   * Key difference from executeMatch: The Lending Pool wallet acts as the taker (buyer),
-   * executing the trade from its funds. The position is owned by Lending Pool on-chain,
-   * but tracked to the user in the database.
-   * 
-   * NOTE: The Lending Pool must have delegation set up to the relayer (just like MM).
-   * Run: npx ts-node apps/api/src/scripts/setup-lending-delegation.ts
-   * 
-   * @param params Match parameters
-   * @returns Transaction signature
-   */
-  async executeLeveragedMatch(params: {
-    marketPubkey: string;
-    makerWallet: string;       // MM wallet (selling)
-    lendingPoolWallet: string; // Lending pool wallet (buying on behalf of user)
-    userWallet: string;        // User wallet (for tracking only - not used on-chain)
-    makerSide: 'BID' | 'ASK';
-    takerSide: 'BID' | 'ASK';
-    outcome: 'YES' | 'NO';
-    price: number;
-    matchSize: number;
-    takerFee: number;
-    makerClientOrderId: number;
-    takerClientOrderId: number;
-    makerExpiryTs: number;
-    takerExpiryTs: number;
-  }): Promise<string> {
-    if (!this.isReady()) {
-      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
-    }
-
-    const market = new PublicKey(params.marketPubkey);
-    const makerWallet = new PublicKey(params.makerWallet);
-    const lendingPoolWalletPubkey = new PublicKey(params.lendingPoolWallet);
-
-    // Convert to instruction format (6 decimals)
-    const priceU64 = Math.floor(params.price * 1_000_000);
-    const sizeU64 = Math.round(params.matchSize * 1_000_000);
-    const feeU64 = Math.floor(params.takerFee * 1_000_000);
-
-    const makerArgs: PlaceOrderArgs = {
-      side: params.makerSide,
-      outcome: params.outcome,
-      orderType: 'LIMIT',
-      price: priceU64,
-      size: sizeU64,
-      expiryTs: params.makerExpiryTs,
-      clientOrderId: params.makerClientOrderId,
-    };
-
-    const takerArgs: PlaceOrderArgs = {
-      side: params.takerSide,
-      outcome: params.outcome,
-      orderType: 'LIMIT',
-      price: priceU64,
-      size: sizeU64,
-      expiryTs: params.takerExpiryTs,
-      clientOrderId: params.takerClientOrderId,
-    };
-
-    logger.info(`executeLeveragedMatch: Lending Pool ${lendingPoolWalletPubkey.toBase58().slice(0,8)} buying on behalf of user ${params.userWallet.slice(0,8)}`);
-    logger.info(`executeLeveragedMatch: ${params.matchSize} shares @ ${params.price}`);
-
-    // Build execute_match instruction with Lending Pool as taker (buyer)
-    // The relayer has delegation authority over Lending Pool's USDC (same as MM)
-    const ix = await this.buildExecuteMatchInstruction({
-      marketPubkey: market,
-      makerWallet,
-      takerWallet: lendingPoolWalletPubkey, // Lending pool is the taker!
-      makerArgs,
-      takerArgs,
-      matchSize: sizeU64,
-      takerFee: feeU64,
-      makerOrderPda: null,  // MM orders don't have PDAs
-      takerOrderPda: null,  // Lending pool doesn't use order PDAs
-    });
-
-    // Submit transaction - relayer signs and uses delegation for Lending Pool transfer
-    // (no additional signer needed since relayer has delegation authority)
-    const signature = await this.submitTransaction(
-      [ix], 
-      [], // No additional signers - relayer has delegation authority
-      `Leveraged Match ${params.matchSize} shares for user ${params.userWallet.slice(0,8)}`
-    );
-    
-    logger.info(`Leveraged match executed on-chain: ${signature}`);
-    
-    return signature;
-  }
-
-  /**
-   * Build execute_close instruction for closing trades
-   * (seller sells existing shares to buyer)
-   */
-  async buildExecuteCloseInstruction(params: {
-    marketPubkey: PublicKey;
-    buyerWallet: PublicKey;
-    sellerWallet: PublicKey;
-    outcome: 'YES' | 'NO';
-    price: number;    // In 6 decimals
-    size: number;     // In 6 decimals
-    takerFee: number; // In 6 decimals
-  }): Promise<TransactionInstruction> {
-    if (!this.relayerKeypair) {
-      throw new Error('Relayer not initialized');
-    }
-
-    const globalState = getGlobalStatePda();
-    const market = params.marketPubkey;
-
-    // Get fee recipient from config or use relayer
-    const feeRecipientWallet = config.feeRecipient 
-      ? new PublicKey(config.feeRecipient)
-      : this.relayerKeypair.publicKey;
-    const feeRecipient = await getAssociatedTokenAddress(USDC_MINT, feeRecipientWallet);
-
-    // Get positions PDAs
-    const buyerPosition = getUserPositionPda(market, params.buyerWallet);
-    const sellerPosition = getUserPositionPda(market, params.sellerWallet);
-
-    // Get USDC ATAs
-    const buyerUsdc = await getAssociatedTokenAddress(USDC_MINT, params.buyerWallet);
-    const sellerUsdc = await getAssociatedTokenAddress(USDC_MINT, params.sellerWallet);
-
-    // Build instruction data
-    // Anchor discriminator = sha256("global:execute_close")[0:8]
-    const discriminator = computeDiscriminator('execute_close');
-    
-    // CloseTradeArgs: outcome (u8) + price (u64) + size (u64) + taker_fee (u64)
-    const argsBuffer = Buffer.alloc(25);
-    argsBuffer.writeUInt8(params.outcome === 'YES' ? 0 : 1, 0);  // outcome: 0=Yes, 1=No
-    argsBuffer.writeBigUInt64LE(BigInt(params.price), 1);
-    argsBuffer.writeBigUInt64LE(BigInt(params.size), 9);
-    argsBuffer.writeBigUInt64LE(BigInt(params.takerFee), 17);
-
-    const data = Buffer.concat([discriminator, argsBuffer]);
-
-    logger.info(`execute_close: market=${market.toBase58()}`);
-    logger.info(`execute_close: buyer=${params.buyerWallet.toBase58()}, buyerPosition=${buyerPosition.toBase58()}`);
-    logger.info(`execute_close: seller=${params.sellerWallet.toBase58()}, sellerPosition=${sellerPosition.toBase58()}`);
-    logger.info(`execute_close: outcome=${params.outcome}, price=${params.price}, size=${params.size}`);
-
-    return new TransactionInstruction({
-      programId: PROGRAM_ID,
-      keys: [
-        { pubkey: globalState, isSigner: false, isWritable: false },
-        { pubkey: market, isSigner: false, isWritable: true },
-        { pubkey: feeRecipient, isSigner: false, isWritable: true },
-        // Buyer accounts
-        { pubkey: params.buyerWallet, isSigner: false, isWritable: false },
-        { pubkey: buyerPosition, isSigner: false, isWritable: true },
-        { pubkey: buyerUsdc, isSigner: false, isWritable: true },
-        // Seller accounts
-        { pubkey: params.sellerWallet, isSigner: false, isWritable: false },
-        { pubkey: sellerPosition, isSigner: false, isWritable: true },
-        { pubkey: sellerUsdc, isSigner: false, isWritable: true },
-        // Common accounts
-        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
-        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      ],
-      data,
-    });
-  }
-
-  /**
-   * Execute a closing trade on-chain
-   * (seller sells existing shares to buyer)
-   * 
-   * @param params Close trade parameters
-   * @returns Transaction signature
-   */
-  async executeClose(params: {
-    marketPubkey: string;
-    buyerWallet: string;
-    sellerWallet: string;
-    outcome: 'YES' | 'NO';
-    price: number;      // Price in dollars (e.g., 0.52)
-    matchSize: number;  // Number of contracts (e.g., 100)
-    takerFee: number;   // Fee in USD (e.g., 0.02)
-    feePayerKeypair?: Keypair; // Pool child wallet as fee payer
-  }): Promise<string> {
-    if (!this.isReady()) {
-      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
-    }
-
-    const market = new PublicKey(params.marketPubkey);
-    const buyerWallet = new PublicKey(params.buyerWallet);
-    const sellerWallet = new PublicKey(params.sellerWallet);
-
-    // Convert to instruction format
-    // Price: 6 decimals (0.52 -> 520_000)
-    // Size: 6 decimals for fractional contracts (1.5 contracts -> 1_500_000)
-    // Fee: 6 decimals ($0.02 -> 20_000)
-    const priceU64 = Math.floor(params.price * 1_000_000);
-    const sizeU64 = Math.round(params.matchSize * 1_000_000);
-    const feeU64 = Math.floor(params.takerFee * 1_000_000);
-
-    const ix = await this.buildExecuteCloseInstruction({
-      marketPubkey: market,
-      buyerWallet,
-      sellerWallet,
-      outcome: params.outcome,
-      price: priceU64,
-      size: sizeU64,
-      takerFee: feeU64,
-    });
-
-    const signature = await this.submitTransaction([ix], [], `Close Position ${params.matchSize} shares`, {
-      feePayerOverride: params.feePayerKeypair,
-      skipSimulation: true, // Speed-critical: skip preflight to save 100-500ms
-    });
-    logger.debug(`Close executed on-chain: ${signature}`);
-    
-    return signature;
-  }
-
-  /**
-   * Settle a user's position after market resolution
-   */
-  async settlePosition(params: {
-    marketPubkey: string;
-    userWallet: string;
-  }): Promise<string> {
-    if (!this.isReady()) {
-      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
-    }
-
-    const market = new PublicKey(params.marketPubkey);
-    const userWallet = new PublicKey(params.userWallet);
-
-    const instruction = await this.buildSettlePositionInstruction({
-      marketPubkey: market,
-      userWallet,
-    });
-
-    const signature = await this.submitTransaction([instruction], [], `Settle Position ${params.userWallet.slice(0, 8)}`);
-    logger.debug(`Position settled on-chain: ${signature}`);
-
-    return signature;
-  }
-
-  /**
-   * Batch settle multiple positions in ONE or MORE transactions
-   * Handles chunking to stay within Solana transaction size limits
-   */
-  async settlePositionsBatch(params: {
-    marketPubkey: string;
-    userWallets: string[];
-  }): Promise<string> {
-    if (!this.isReady()) {
-      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
-    }
-
-    if (params.userWallets.length === 0) {
-      throw new Error('No user wallets provided for batch settlement');
-    }
-
-    const market = new PublicKey(params.marketPubkey);
-    
-    // Solana tx size limit is 1232 bytes.
-    // Each settle_position instruction has 6 accounts + discriminator + overhead.
-    // We can safely fit about 5 instructions per transaction.
-    const CHUNK_SIZE = 5;
-    const signatures: string[] = [];
-
-    for (let i = 0; i < params.userWallets.length; i += CHUNK_SIZE) {
-      const chunk = params.userWallets.slice(i, i + CHUNK_SIZE);
-      
-      // Build instructions for this chunk
-      const instructions = await Promise.all(
-        chunk.map(wallet => 
-          this.buildSettlePositionInstruction({
-            marketPubkey: market,
-            userWallet: new PublicKey(wallet),
-          })
-        )
-      );
-
-      logger.info(`Sending batch settlement chunk (${chunk.length} positions)`);
-      const signature = await this.submitTransaction(
-        instructions, 
-        [], 
-        `Batch Settle ${chunk.length} positions (Market ${params.marketPubkey.slice(0, 8)})`
-      );
-      signatures.push(signature);
-      logger.debug(`Chunk settlement successful: ${signature}`);
-    }
-
-    // Return the last signature or a joined string
-    return signatures[signatures.length - 1];
-  }
-
-  /**
-   * Resolve a market on-chain after expiry
-   * The relayer determines the outcome from real price feeds (Binance/Coinbase)
-   * and passes it to the on-chain instruction.
-   * 
-   * @param params.marketPubkey - The market PDA address
-   * @param params.outcome - 'YES' or 'NO' determined by relayer
-   * @param params.finalPrice - Final price at resolution (will be stored on-chain)
-   */
-  async resolveMarket(params: {
-    marketPubkey: string;
-    outcome: 'YES' | 'NO';
-    finalPrice: number;
-  }): Promise<string> {
-    if (!this.isReady()) {
-      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
-    }
-
-    const market = new PublicKey(params.marketPubkey);
-    
-    // Build instruction data: discriminator + ResolveMarketArgs
-    const discriminator = computeDiscriminator('resolve_market');
-    
-    // ResolveMarketArgs: outcome (u8) + final_price (u64)
-    const argsBuffer = Buffer.alloc(9);
-    argsBuffer.writeUInt8(params.outcome === 'YES' ? 0 : 1, 0);  // outcome: 0=Yes, 1=No
-    // Final price with 8 decimals (matching on-chain strike price format)
-    const finalPriceU64 = BigInt(Math.floor(params.finalPrice * 100_000_000));
-    argsBuffer.writeBigUInt64LE(finalPriceU64, 1);
-    
-    const data = Buffer.concat([discriminator, argsBuffer]);
-
-    const instruction = new TransactionInstruction({
-      programId: PROGRAM_ID,
-      keys: [
-        { pubkey: market, isSigner: false, isWritable: true },
-        { pubkey: this.relayerKeypair!.publicKey, isSigner: true, isWritable: false },
-      ],
-      data,
-    });
-
-    const signature = await this.submitTransaction([instruction], [], `Resolve Market ${params.marketPubkey.slice(0, 8)} (${params.outcome})`);
-    logger.info(`Market resolved on-chain: ${signature} (outcome=${params.outcome}, price=${params.finalPrice})`);
-
-    return signature;
-  }
-
-  /**
-   * Build initialize_market instruction
-   */
-  async buildInitializeMarketInstruction(params: {
-    asset: string;
-    timeframe: string;
-    strikePrice: number;
-    expiryTs: number;
-  }): Promise<TransactionInstruction> {
-    if (!this.relayerKeypair) {
-      throw new Error('Relayer not initialized');
-    }
-
-    const globalState = getGlobalStatePda();
-    const market = getMarketPda(params.asset, params.timeframe, params.expiryTs);
-    const vault = await getAssociatedTokenAddress(USDC_MINT, market, true);
-
-    const discriminator = computeDiscriminator('initialize_market');
-    
-    const assetBytes = Buffer.from(params.asset);
-    const assetLenBuffer = Buffer.alloc(4);
-    assetLenBuffer.writeUInt32LE(assetBytes.length, 0);
-    
-    const timeframeBytes = Buffer.from(params.timeframe);
-    const timeframeLenBuffer = Buffer.alloc(4);
-    timeframeLenBuffer.writeUInt32LE(timeframeBytes.length, 0);
-    
-    const strikePriceU64 = BigInt(Math.floor(params.strikePrice * 100_000_000));
-    const strikePriceBuffer = Buffer.alloc(8);
-    strikePriceBuffer.writeBigUInt64LE(strikePriceU64, 0);
-    
-    const expiryTsBuffer = Buffer.alloc(8);
-    expiryTsBuffer.writeBigInt64LE(BigInt(params.expiryTs), 0);
-
-    const data = Buffer.concat([
-      discriminator,
-      assetLenBuffer,
-      assetBytes,
-      timeframeLenBuffer,
-      timeframeBytes,
-      strikePriceBuffer,
-      expiryTsBuffer,
-    ]);
-
-    return new TransactionInstruction({
-      programId: PROGRAM_ID,
-      keys: [
-        { pubkey: globalState, isSigner: false, isWritable: true },
-        { pubkey: market, isSigner: false, isWritable: true },
-        { pubkey: vault, isSigner: false, isWritable: true },
-        { pubkey: USDC_MINT, isSigner: false, isWritable: false },
-        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
-        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-        { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      ],
-      data,
-    });
-  }
-
-  /**
-   * Initialize a market on-chain
-   * If strikePrice = 0, market is created with PENDING status
-   * If strikePrice > 0, market is created with OPEN status
-   */
-  async initializeMarket(params: {
-    asset: string;
-    timeframe: string;
-    strikePrice: number;
-    expiryTs: number;  // Unix timestamp in seconds
-  }): Promise<string> {
-    const market = getMarketPda(params.asset, params.timeframe, params.expiryTs);
-    const instruction = await this.buildInitializeMarketInstruction(params);
-    const status = params.strikePrice > 0 ? 'OPEN' : 'PENDING';
-    const signature = await this.submitTransaction([instruction], [], `Init Market ${params.asset}-${params.timeframe} (${status}) (${market.toBase58().slice(0, 8)})`);
-    
-    logger.info(`Market initialized on-chain: ${market.toBase58()} (status=${status}, tx: ${signature})`);
-    
-    return signature;
-  }
-
-  /**
-   * Build activate_market instruction
-   * Sets the strike price and changes status from PENDING to OPEN
-   */
-  async buildActivateMarketInstruction(params: {
-    marketPubkey: string;
-    strikePrice: number;  // Strike price in dollars (e.g., 95432.50)
-  }): Promise<TransactionInstruction> {
-    if (!this.relayerKeypair) {
-      throw new Error('Relayer not initialized');
-    }
-
-    const market = new PublicKey(params.marketPubkey);
-    const discriminator = computeDiscriminator('activate_market');
-    
-    // Strike price with 8 decimals (matching on-chain format)
-    const strikePriceU64 = BigInt(Math.floor(params.strikePrice * 100_000_000));
-    const strikePriceBuffer = Buffer.alloc(8);
-    strikePriceBuffer.writeBigUInt64LE(strikePriceU64, 0);
-
-    const data = Buffer.concat([discriminator, strikePriceBuffer]);
-
-    return new TransactionInstruction({
-      programId: PROGRAM_ID,
-      keys: [
-        { pubkey: market, isSigner: false, isWritable: true },
-        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
-      ],
-      data,
-    });
-  }
-
-  /**
-   * Activate a pending market on-chain
-   * Sets the strike price and changes status from PENDING to OPEN
-   */
-  async activateMarket(params: {
-    marketPubkey: string;
-    strikePrice: number;  // Strike price in dollars (e.g., 95432.50)
-  }): Promise<string> {
-    if (!this.isReady()) {
-      throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
-    }
-
-    const instruction = await this.buildActivateMarketInstruction(params);
-    const signature = await this.submitTransaction([instruction], [], `Activate Market ${params.marketPubkey.slice(0, 8)} (strike=${params.strikePrice})`);
-    
-    logger.info(`Market activated on-chain: ${params.marketPubkey} (strike=${params.strikePrice}, tx: ${signature})`);
-    
-    return signature;
-  }
-
-  /**
-   * Build close_market instruction
-   */
-  async buildCloseMarketInstruction(params: {
-    marketPubkey: string;
-  }): Promise<TransactionInstruction> {
-    if (!this.relayerKeypair) {
-      throw new Error('Relayer not initialized');
-    }
-
-    const market = new PublicKey(params.marketPubkey);
-    const vault = await getAssociatedTokenAddress(USDC_MINT, market, true);
-    const relayerUsdc = await getAssociatedTokenAddress(USDC_MINT, this.relayerKeypair.publicKey);
-    const discriminator = computeDiscriminator('close_market');
-
-    return new TransactionInstruction({
-      programId: PROGRAM_ID,
-      keys: [
-        { pubkey: market, isSigner: false, isWritable: true },
-        { pubkey: vault, isSigner: false, isWritable: true },
-        { pubkey: relayerUsdc, isSigner: false, isWritable: true }, // Added relayer_usdc
-        { pubkey: this.relayerKeypair!.publicKey, isSigner: true, isWritable: false },
-        { pubkey: this.relayerKeypair!.publicKey, isSigner: false, isWritable: true }, // rent_recipient
-        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      ],
-      data: discriminator,
-    });
-  }
-
-  /**
-   * Build cancel_order_by_relayer instruction (force-cancel user orders after market close)
-   */
-  async buildCancelOrderByRelayerInstruction(params: {
-    marketPubkey: string;
-    ownerPubkey: string;
-    clientOrderId: number;
-  }): Promise<TransactionInstruction> {
-    if (!this.relayerKeypair) {
-      throw new Error('Relayer not initialized');
-    }
-
-    const market = new PublicKey(params.marketPubkey);
-    const owner = new PublicKey(params.ownerPubkey);
-
-    // Market vault is the USDC ATA owned by the market PDA
-    const vault = await getAssociatedTokenAddress(USDC_MINT, market, true);
-    const userUsdc = await getAssociatedTokenAddress(USDC_MINT, owner);
-    const orderPda = getOrderPda(market, owner, params.clientOrderId);
-
-    const discriminator = computeDiscriminator('cancel_order_by_relayer');
-
-    return new TransactionInstruction({
-      programId: PROGRAM_ID,
-      keys: [
-        { pubkey: market, isSigner: false, isWritable: false }, // market
-        { pubkey: vault, isSigner: false, isWritable: true }, // vault
-        { pubkey: userUsdc, isSigner: false, isWritable: true }, // user_usdc
-        { pubkey: orderPda, isSigner: false, isWritable: true }, // order (close = owner)
-        { pubkey: owner, isSigner: false, isWritable: true }, // owner (rent recipient)
-        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: false }, // authority
-        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }, // token_program
-      ],
-      data: discriminator,
-    });
-  }
-
-  /**
-   * Force-cancel a batch of user orders after market close to recover user rent + refund escrow.
-   * Retries individually if a batch fails.
-   */
-  async cancelOrdersByRelayer(params: {
-    marketPubkey: string;
-    orders: Array<{ ownerPubkey: string; clientOrderId: number }>;
-    batchSize?: number;
-  }): Promise<void> {
-    const batchSize = params.batchSize ?? 3;
-    if (params.orders.length === 0) return;
-
-    for (let i = 0; i < params.orders.length; i += batchSize) {
-      const batch = params.orders.slice(i, i + batchSize);
-      try {
-        const instructions = await Promise.all(
-          batch.map((o) =>
-            this.buildCancelOrderByRelayerInstruction({
-              marketPubkey: params.marketPubkey,
-              ownerPubkey: o.ownerPubkey,
-              clientOrderId: o.clientOrderId,
-            })
-          )
-        );
-        const sig = await this.submitTransaction(instructions, [], `Force-cancel ${batch.length} orders`);
-        logger.info(`✅ Force-cancelled ${batch.length} orders on-chain: ${sig}`);
-      } catch (err: any) {
-        const msg = err?.message || String(err);
-        logger.warn(`Batch force-cancel failed (${batch.length} orders), retrying individually: ${msg}`);
-        for (const o of batch) {
-          try {
-            const ix = await this.buildCancelOrderByRelayerInstruction({
-              marketPubkey: params.marketPubkey,
-              ownerPubkey: o.ownerPubkey,
-              clientOrderId: o.clientOrderId,
-            });
-            const sig = await this.submitTransaction([ix], [], `Force-cancel 1 order`);
-            logger.info(`✅ Force-cancelled order on-chain (clientOrderId=${o.clientOrderId}): ${sig}`);
-          } catch (inner: any) {
-            const innerMsg = inner?.message || String(inner);
-            // Common cases: already closed, never existed, wrong network
-            if (
-              innerMsg.includes('AccountNotFound') ||
-              innerMsg.includes('AccountNotInitialized') ||
-              innerMsg.includes('0xbc4')
-            ) {
-              logger.debug(`Order PDA missing for clientOrderId=${o.clientOrderId}; skipping`);
-            } else {
-              logger.error(`Force-cancel failed for clientOrderId=${o.clientOrderId}: ${innerMsg}`);
-            }
-          }
-        }
-      }
-    }
-  }
-
-  /**
-   * Close a fully settled market and recover rent
-   * Returns ~0.0039 SOL to the relayer wallet
-   */
-  async closeMarket(params: {
-    marketPubkey: string;
-  }): Promise<string> {
-    const pre = await this.ensureRelayerUsdcAtaIxs();
-    const instruction = await this.buildCloseMarketInstruction(params);
-    const signature = await this.submitTransaction([...pre, instruction], [], `Close Market ${params.marketPubkey.slice(0, 8)}`);
-    logger.info(`Market closed on-chain: ${params.marketPubkey} (tx: ${signature})`);
-    
-    return signature;
   }
 
   /**
@@ -1853,6 +933,59 @@ export class AnchorClient {
    */
   getRelayerKeypair(): Keypair | null {
     return this.relayerKeypair;
+  }
+
+  async buildCreateSessionAuthorityBySigInstruction(params: {
+    walletAddress: string;
+    sessionPublicKey: string;
+    expiresAt: number;
+  }): Promise<TransactionInstruction> {
+    if (!this.relayerKeypair) {
+      throw new Error('Relayer not initialized');
+    }
+
+    const wallet = new PublicKey(params.walletAddress);
+    const sessionPubkey = new PublicKey(params.sessionPublicKey);
+    const sessionAuthority = getSessionAuthorityPda(wallet, sessionPubkey);
+    const discriminator = computeDiscriminator('create_session_authority_by_sig');
+    const expiresAtBuffer = Buffer.alloc(8);
+    expiresAtBuffer.writeBigInt64LE(BigInt(params.expiresAt), 0);
+    const data = Buffer.concat([discriminator, sessionPubkey.toBuffer(), expiresAtBuffer]);
+
+    return new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: sessionAuthority, isSigner: false, isWritable: true },
+        { pubkey: wallet, isSigner: false, isWritable: false },
+        { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
+        { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data,
+    });
+  }
+
+  async createSessionAuthorityBySig(params: {
+    walletAddress: string;
+    sessionPublicKey: string;
+    expiresAt: number;
+    signature: string;
+    binaryMessage: string;
+  }): Promise<string> {
+    const wallet = new PublicKey(params.walletAddress);
+    const authIx = buildEd25519VerifyInstruction(
+      wallet,
+      Buffer.from(params.binaryMessage, 'base64'),
+      Buffer.from(bs58.decode(params.signature))
+    );
+    const instruction = await this.buildCreateSessionAuthorityBySigInstruction(params);
+    const { signature } = await this.submitTransaction(
+      [authIx, instruction],
+      [],
+      `CreateSessionAuthorityBySig ${params.sessionPublicKey.slice(0, 8)}`
+    );
+    logger.info(`SessionAuthority created on-chain: ${signature}`);
+    return signature;
   }
 
   // ============================================================================
@@ -1916,6 +1049,7 @@ export class AnchorClient {
         { pubkey: market, isSigner: false, isWritable: true },
         { pubkey: yesMint, isSigner: false, isWritable: true },
         { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
+        { pubkey: USDC_MINT, isSigner: false, isWritable: false },
         { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
         { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },  // share_token_program (Token-2022)
         { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
@@ -1992,19 +1126,19 @@ export class AnchorClient {
       balanceBefore = await this.connection.getBalance(this.relayerKeypair!.publicKey, 'confirmed');
     } catch { /* ignore */ }
 
-    // Phase 1: Create market + YES mint (idempotent — skip if already exists)
+    // Phase 1: Create market + YES mint (idempotent â€” skip if already exists)
     // Retries on transient failures (e.g. block height exceeded / expired blockhash)
     const PHASE1_MAX_RETRIES = 3;
     for (let attempt = 1; attempt <= PHASE1_MAX_RETRIES; attempt++) {
       try {
         const ix1 = await this.buildInitializeMarketV2Instruction(params);
-        const sig1 = await this.submitTransaction([ix1], [], `Init MarketV2 ${params.asset}-${params.timeframe} (phase 1)`);
+        const { signature: sig1 } = await this.submitTransaction([ix1], [], `Init MarketV2 ${params.asset}-${params.timeframe} (phase 1)`);
         logger.info(`MarketV2 phase 1 complete: ${market.toBase58()} (tx: ${sig1})`);
         break; // Success
       } catch (err: any) {
         const msg = err.message || '';
         if (msg.includes('already in use') || msg.includes('0x0')) {
-          logger.info(`MarketV2 phase 1 already exists: ${market.toBase58()} — proceeding to phase 2`);
+          logger.info(`MarketV2 phase 1 already exists: ${market.toBase58()} â€” proceeding to phase 2`);
           break;
         }
         // Retry on transient errors (expired blockhash, timeout, network issues)
@@ -2018,18 +1152,18 @@ export class AnchorClient {
           msg.includes('socket hang up');
         if (isTransient && attempt < PHASE1_MAX_RETRIES) {
           logger.warn(`MarketV2 phase 1 attempt ${attempt}/${PHASE1_MAX_RETRIES} failed (transient): ${msg.slice(0, 120)}`);
-          // Exponential backoff: 2s, 4s — fresh blockhash on next submitTransaction call
+          // Exponential backoff: 2s, 4s â€” fresh blockhash on next submitTransaction call
           await new Promise(r => setTimeout(r, 2000 * Math.pow(2, attempt - 1)));
           continue;
         }
         if (attempt === PHASE1_MAX_RETRIES) {
           logger.error(`MarketV2 phase 1 FAILED after ${PHASE1_MAX_RETRIES} attempts for ${market.toBase58()}`);
         }
-        throw err; // Non-idempotent / non-transient error — Phase 1 genuinely failed
+        throw err; // Non-idempotent / non-transient error â€” Phase 1 genuinely failed
       }
     }
 
-    // Phase 2: Create NO mint + vault (with retries — Phase 1 is already on-chain)
+    // Phase 2: Create NO mint + vault (with retries â€” Phase 1 is already on-chain)
     const PHASE2_MAX_RETRIES = 3;
     let signature = '';
     for (let attempt = 1; attempt <= PHASE2_MAX_RETRIES; attempt++) {
@@ -2045,19 +1179,20 @@ export class AnchorClient {
             break;
           }
         } catch (fetchErr) {
-          // Ignore fetch errors — proceed to attempt Phase 2
+          // Ignore fetch errors â€” proceed to attempt Phase 2
         }
 
         const ix2 = await this.buildInitializeMarketV2FinalizeInstruction({
           marketPubkey: market,
           strikePrice: params.strikePrice,
         });
-        signature = await this.submitTransaction([ix2], [], `Init MarketV2 ${params.asset}-${params.timeframe} (phase 2)`);
+        const { signature: phase2Signature } = await this.submitTransaction([ix2], [], `Init MarketV2 ${params.asset}-${params.timeframe} (phase 2)`);
+        signature = phase2Signature;
         logger.info(`MarketV2 phase 2 complete: ${market.toBase58()} (tx: ${signature})`);
         break; // Success
       } catch (err: any) {
         const msg = err.message || '';
-        // If "already in use" → Phase 2 was already completed (idempotent)
+        // If "already in use" â†’ Phase 2 was already completed (idempotent)
         if (msg.includes('already in use') || msg.includes('0x0')) {
           logger.info(`MarketV2 phase 2 already completed for ${market.toBase58()}`);
           signature = 'already_initialized';
@@ -2078,7 +1213,7 @@ export class AnchorClient {
 
         // InsufficientFundsForRent: relayer doesn't have enough SOL to cover
         // rent for the new accounts (NO mint ~0.0035 SOL, vault ~0.002 SOL).
-        // Retrying won't help — the balance won't change between attempts.
+        // Retrying won't help â€” the balance won't change between attempts.
         // Throw immediately so the market creator can skip and retry next cycle
         // after the auto-funding keeper has topped up the relayer.
         if (msg.includes('InsufficientFundsForRent') || msg.includes('insufficient lamports')) {
@@ -2088,7 +1223,7 @@ export class AnchorClient {
 
         logger.warn(`MarketV2 phase 2 attempt ${attempt}/${PHASE2_MAX_RETRIES} failed: ${msg.split('\n')[0].slice(0, 150)}`);
         if (attempt === PHASE2_MAX_RETRIES) {
-          logger.error(`MarketV2 phase 2 FAILED after ${PHASE2_MAX_RETRIES} attempts for ${market.toBase58()} — market has NO mint missing!`);
+          logger.error(`MarketV2 phase 2 FAILED after ${PHASE2_MAX_RETRIES} attempts for ${market.toBase58()} â€” market has NO mint missing!`);
           throw err; // Re-throw so caller knows Phase 2 failed
         }
         // Exponential backoff: 2s, 4s, 8s
@@ -2130,7 +1265,7 @@ export class AnchorClient {
         marketPubkey,
         strikePrice,
       });
-      const sig = await this.submitTransaction([ix2], [], `Recovery Phase 2: ${marketPubkey.toBase58().slice(0, 8)}`);
+      const { signature: sig } = await this.submitTransaction([ix2], [], `Recovery Phase 2: ${marketPubkey.toBase58().slice(0, 8)}`);
       logger.info(`[Recovery] Phase 2 complete for ${marketPubkey.toBase58()} (tx: ${sig})`);
       return sig;
     } catch (err: any) {
@@ -2157,6 +1292,10 @@ export class AnchorClient {
     takerArgs: PlaceOrderArgs;
     matchSize: number;
     takerFee: number;
+    makerSigner: PublicKey;
+    takerSigner: PublicKey;
+    makerSessionAuthority: PublicKey;
+    takerSessionAuthority: PublicKey;
     makerOrderPda?: PublicKey | null;
     takerOrderPda?: PublicKey | null;
   }): Promise<TransactionInstruction> {
@@ -2196,8 +1335,18 @@ export class AnchorClient {
     matchSizeBuffer.writeBigUInt64LE(BigInt(params.matchSize), 0);
     const takerFeeBuffer = Buffer.alloc(8);
     takerFeeBuffer.writeBigUInt64LE(BigInt(params.takerFee), 0);
+    const makerSignerBuffer = Buffer.from(params.makerSigner.toBytes());
+    const takerSignerBuffer = Buffer.from(params.takerSigner.toBytes());
 
-    const data = Buffer.concat([discriminator, makerArgsBuffer, takerArgsBuffer, matchSizeBuffer, takerFeeBuffer]);
+    const data = Buffer.concat([
+      discriminator,
+      makerArgsBuffer,
+      takerArgsBuffer,
+      matchSizeBuffer,
+      takerFeeBuffer,
+      makerSignerBuffer,
+      takerSignerBuffer,
+    ]);
 
     // Optional Order PDAs
     const makerOrderAccount = params.makerOrderPda || PROGRAM_ID;
@@ -2233,7 +1382,9 @@ export class AnchorClient {
         { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
         { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },           // USDC operations
         { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },      // share_token_program (Token-2022 for YES/NO mint)
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false },
+        { pubkey: params.makerSessionAuthority, isSigner: false, isWritable: false },
+        { pubkey: params.takerSessionAuthority, isSigner: false, isWritable: false },
       ],
       data,
     });
@@ -2251,6 +1402,8 @@ export class AnchorClient {
     takerWallet: string;
     makerSide: 'BID' | 'ASK';
     takerSide: 'BID' | 'ASK';
+    makerOrderType: 'LIMIT' | 'MARKET' | 'IOC' | 'FOK';
+    takerOrderType: 'LIMIT' | 'MARKET' | 'IOC' | 'FOK';
     outcome: 'YES' | 'NO';
     price: number;
     matchSize: number;
@@ -2259,10 +1412,16 @@ export class AnchorClient {
     takerClientOrderId: number;
     makerExpiryTs: number;
     takerExpiryTs: number;
+    makerSignature?: string;
+    takerSignature?: string;
+    makerMessage?: string;
+    takerMessage?: string;
+    makerSessionPublicKey?: string;
+    takerSessionPublicKey?: string;
     makerOrderPda?: string;
     takerOrderPda?: string;
     feePayerKeypair?: Keypair; // Pool child wallet as fee payer
-  }): Promise<string> {
+  }): Promise<{ signature: string; confirmed: boolean }> {
     if (!this.isReady()) {
       throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
     }
@@ -2281,7 +1440,7 @@ export class AnchorClient {
     const makerArgs: PlaceOrderArgs = {
       side: params.makerSide,
       outcome: params.outcome,
-      orderType: 'LIMIT',
+      orderType: params.makerOrderType,
       price: priceU64,
       size: sizeU64,
       expiryTs: params.makerExpiryTs,
@@ -2291,7 +1450,7 @@ export class AnchorClient {
     const takerArgs: PlaceOrderArgs = {
       side: params.takerSide,
       outcome: params.outcome,
-      orderType: 'LIMIT',
+      orderType: params.takerOrderType,
       price: priceU64,
       size: sizeU64,
       expiryTs: params.takerExpiryTs,
@@ -2300,6 +1459,28 @@ export class AnchorClient {
 
     const makerOrderPda = params.makerOrderPda ? new PublicKey(params.makerOrderPda) : null;
     const takerOrderPda = params.takerOrderPda ? new PublicKey(params.takerOrderPda) : null;
+    const mmWallet = this.mmKeypair?.publicKey.toBase58();
+    const makerRequiresAuth = !makerOrderPda &&
+      !!params.makerSignature &&
+      !!params.makerMessage &&
+      params.makerWallet !== mmWallet;
+    const takerRequiresAuth = !takerOrderPda &&
+      !!params.takerSignature &&
+      !!params.takerMessage &&
+      params.takerWallet !== mmWallet;
+    const defaultSigner = new PublicKey(new Uint8Array(32));
+    const makerSigner = makerRequiresAuth
+      ? new PublicKey(params.makerSessionPublicKey || params.makerWallet)
+      : defaultSigner;
+    const takerSigner = takerRequiresAuth
+      ? new PublicKey(params.takerSessionPublicKey || params.takerWallet)
+      : defaultSigner;
+    const makerSessionAuthority = makerRequiresAuth && params.makerSessionPublicKey
+      ? getSessionAuthorityPda(makerWallet, makerSigner)
+      : PROGRAM_ID;
+    const takerSessionAuthority = takerRequiresAuth && params.takerSessionPublicKey
+      ? getSessionAuthorityPda(takerWallet, takerSigner)
+      : PROGRAM_ID;
 
     // Pre-create ATAs for both parties (idempotent - skips if already exists)
     // Token-2022 program for YES/NO share tokens
@@ -2353,6 +1534,22 @@ export class AnchorClient {
       maybeCreateAta(takerNoAta, takerWallet, noMint),
     ]);
 
+    const authIxs: TransactionInstruction[] = [];
+    if (makerRequiresAuth) {
+      authIxs.push(buildEd25519VerifyInstruction(
+        makerSigner,
+        Buffer.from(params.makerMessage, 'base64'),
+        Buffer.from(bs58.decode(params.makerSignature)),
+      ));
+    }
+    if (takerRequiresAuth) {
+      authIxs.push(buildEd25519VerifyInstruction(
+        takerSigner,
+        Buffer.from(params.takerMessage, 'base64'),
+        Buffer.from(bs58.decode(params.takerSignature)),
+      ));
+    }
+
     const matchIx = await this.buildExecuteMatchV2Instruction({
       marketPubkey: market,
       yesMint,
@@ -2363,19 +1560,37 @@ export class AnchorClient {
       takerArgs,
       matchSize: sizeU64,
       takerFee: feeU64,
+      makerSigner,
+      takerSigner,
+      makerSessionAuthority,
+      takerSessionAuthority,
       makerOrderPda,
       takerOrderPda,
     });
 
-    // Combine ATA creation with match in single transaction
-    const allIxs = [...createAtaIxs, matchIx];
-    const signature = await this.submitTransaction(allIxs, [], `MatchV2 ${params.matchSize} shares`, {
+    // ATA setup can push relayed + Ed25519 verified matches over Solana's
+    // 1232-byte transaction limit, so submit setup separately when needed.
+    if (createAtaIxs.length > 0) {
+      await this.submitTransaction(
+        createAtaIxs,
+        [],
+        `MatchV2 ATA setup ${params.matchSize} shares`,
+        {
+          feePayerOverride: params.feePayerKeypair,
+          skipSimulation: true,
+        }
+      );
+    }
+
+    const result = await this.submitTransaction([...authIxs, matchIx], [], `MatchV2 ${params.matchSize} shares`, {
       feePayerOverride: params.feePayerKeypair,
       skipSimulation: true, // Speed-critical: skip preflight to save 100-500ms
+      omitComputeBudgetIxs: true,
+      omitJitoTip: true,
     });
-    logger.info(`MatchV2 executed on-chain: ${signature}`);
+    logger.info(`MatchV2 executed on-chain: ${result.signature} (confirmed=${result.confirmed})`);
 
-    return signature;
+    return result;
   }
 
   /**
@@ -2420,7 +1635,7 @@ export class AnchorClient {
     }
 
     const instruction = await this.buildActivateMarketV2Instruction(params);
-    const signature = await this.submitTransaction(
+    const { signature } = await this.submitTransaction(
       [instruction], [], `Activate MarketV2 ${params.marketPubkey.slice(0, 8)}`,
       { skipSimulation: true },
     );
@@ -2476,7 +1691,7 @@ export class AnchorClient {
     }
 
     const instruction = await this.buildResolveMarketV2Instruction(params);
-    const signature = await this.submitTransaction(
+    const { signature } = await this.submitTransaction(
       [instruction], [],
       `Resolve MarketV2 ${params.marketPubkey.slice(0, 8)} (${params.outcome})`,
       { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
@@ -2496,10 +1711,16 @@ export class AnchorClient {
     noMint: PublicKey;
     buyerWallet: PublicKey;
     sellerWallet: PublicKey;
+    buyerArgs: PlaceOrderArgs;
+    sellerArgs: PlaceOrderArgs;
     outcome: 'YES' | 'NO';
     price: number;      // 6 decimals
     size: number;       // 6 decimals
     takerFee: number;   // 6 decimals
+    buyerSigner: PublicKey;
+    sellerSigner: PublicKey;
+    buyerSessionAuthority: PublicKey;
+    sellerSessionAuthority: PublicKey;
   }): Promise<TransactionInstruction> {
     if (!this.relayerKeypair) {
       throw new Error('Relayer not initialized');
@@ -2513,26 +1734,43 @@ export class AnchorClient {
       : this.relayerKeypair.publicKey;
     const feeRecipientAta = await getAssociatedTokenAddress(USDC_MINT, feeRecipientWallet);
 
-    // Buyer accounts (USDC: regular Token, YES/NO: Token-2022)
+    // Buyer accounts (USDC: regular Token, one outcome ATA: Token-2022)
     const buyerUsdc = await getAssociatedTokenAddress(USDC_MINT, params.buyerWallet);
-    const buyerYesAta = await getAssociatedTokenAddress(params.yesMint, params.buyerWallet, false, TOKEN_2022_PROGRAM_ID);
-    const buyerNoAta = await getAssociatedTokenAddress(params.noMint, params.buyerWallet, false, TOKEN_2022_PROGRAM_ID);
+    const buyerTokenAta = await getAssociatedTokenAddress(
+      params.outcome === 'YES' ? params.yesMint : params.noMint,
+      params.buyerWallet,
+      false,
+      TOKEN_2022_PROGRAM_ID
+    );
 
-    // Seller accounts (USDC: regular Token, YES/NO: Token-2022)
+    // Seller accounts (USDC: regular Token, one outcome ATA: Token-2022)
     const sellerUsdc = await getAssociatedTokenAddress(USDC_MINT, params.sellerWallet);
-    const sellerYesAta = await getAssociatedTokenAddress(params.yesMint, params.sellerWallet, false, TOKEN_2022_PROGRAM_ID);
-    const sellerNoAta = await getAssociatedTokenAddress(params.noMint, params.sellerWallet, false, TOKEN_2022_PROGRAM_ID);
+    const sellerTokenAta = await getAssociatedTokenAddress(
+      params.outcome === 'YES' ? params.yesMint : params.noMint,
+      params.sellerWallet,
+      false,
+      TOKEN_2022_PROGRAM_ID
+    );
 
     const discriminator = computeDiscriminator('execute_close_v2');
+    const buyerArgsBuffer = this.encodePlaceOrderArgs(params.buyerArgs);
+    const sellerArgsBuffer = this.encodePlaceOrderArgs(params.sellerArgs);
+    const matchSizeBuffer = Buffer.alloc(8);
+    matchSizeBuffer.writeBigUInt64LE(BigInt(params.size), 0);
+    const takerFeeBuffer = Buffer.alloc(8);
+    takerFeeBuffer.writeBigUInt64LE(BigInt(params.takerFee), 0);
+    const buyerSignerBuffer = Buffer.from(params.buyerSigner.toBytes());
+    const sellerSignerBuffer = Buffer.from(params.sellerSigner.toBytes());
 
-    // CloseTradeArgsV2: outcome (u8) + price (u64) + size (u64) + taker_fee (u64) = 25 bytes
-    const argsBuffer = Buffer.alloc(25);
-    argsBuffer.writeUInt8(params.outcome === 'YES' ? 0 : 1, 0);
-    argsBuffer.writeBigUInt64LE(BigInt(params.price), 1);
-    argsBuffer.writeBigUInt64LE(BigInt(params.size), 9);
-    argsBuffer.writeBigUInt64LE(BigInt(params.takerFee), 17);
-
-    const data = Buffer.concat([discriminator, argsBuffer]);
+    const data = Buffer.concat([
+      discriminator,
+      buyerArgsBuffer,
+      sellerArgsBuffer,
+      matchSizeBuffer,
+      takerFeeBuffer,
+      buyerSignerBuffer,
+      sellerSignerBuffer,
+    ]);
 
     // NOTE: Buyer ATAs must be pre-created before this instruction is called
     // The instruction no longer uses init_if_needed for stack optimization
@@ -2546,16 +1784,16 @@ export class AnchorClient {
         { pubkey: feeRecipientAta, isSigner: false, isWritable: true },
         { pubkey: params.buyerWallet, isSigner: false, isWritable: false },
         { pubkey: buyerUsdc, isSigner: false, isWritable: true },
-        { pubkey: buyerYesAta, isSigner: false, isWritable: true },
-        { pubkey: buyerNoAta, isSigner: false, isWritable: true },
+        { pubkey: buyerTokenAta, isSigner: false, isWritable: true },
         { pubkey: params.sellerWallet, isSigner: false, isWritable: false },
         { pubkey: sellerUsdc, isSigner: false, isWritable: true },
-        { pubkey: sellerYesAta, isSigner: false, isWritable: true },
-        { pubkey: sellerNoAta, isSigner: false, isWritable: true },
+        { pubkey: sellerTokenAta, isSigner: false, isWritable: true },
         { pubkey: this.relayerKeypair.publicKey, isSigner: true, isWritable: true },
         { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },           // USDC operations
         { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },      // share_token_program (Token-2022 for YES/NO transfers)
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false },
+        { pubkey: params.buyerSessionAuthority, isSigner: false, isWritable: false },
+        { pubkey: params.sellerSessionAuthority, isSigner: false, isWritable: false },
       ],
       data,
     });
@@ -2574,8 +1812,20 @@ export class AnchorClient {
     price: number;      // Price in dollars (e.g., 0.52)
     matchSize: number;  // Number of shares (e.g., 100)
     takerFee: number;   // Fee in USD (e.g., 0.02)
+    buyerOrderType: 'LIMIT' | 'MARKET' | 'IOC' | 'FOK';
+    sellerOrderType: 'LIMIT' | 'MARKET' | 'IOC' | 'FOK';
+    buyerClientOrderId: number;
+    sellerClientOrderId: number;
+    buyerExpiryTs: number;
+    sellerExpiryTs: number;
+    buyerSignature?: string;
+    sellerSignature?: string;
+    buyerMessage?: string;
+    sellerMessage?: string;
+    buyerSessionPublicKey?: string;
+    sellerSessionPublicKey?: string;
     feePayerKeypair?: Keypair; // Pool child wallet as fee payer
-  }): Promise<string> {
+  }): Promise<{ signature: string; confirmed: boolean }> {
     if (!this.isReady()) {
       throw new Error('Anchor client not ready - check RELAYER_PRIVATE_KEY');
     }
@@ -2591,22 +1841,31 @@ export class AnchorClient {
     let sizeU64 = Math.round(params.matchSize * 1_000_000);
     const feeU64 = Math.floor(params.takerFee * 1_000_000);
 
-    // Guard: cap close size to seller's actual on-chain token balance.
-    // DB can accumulate fractional lamport drift over many fills (each Math.floor
-    // loses up to 1 lamport). Over N fills the DB total may be N lamports higher
-    // than on-chain, causing InsufficientShares (error 6029).
+    // Guard: require the seller's confirmed on-chain token balance to cover the
+    // full requested close size. Silently partial-closing here would desync the
+    // off-chain matched trade from the on-chain executed size.
     try {
       const sellerMint = params.outcome === 'YES' ? yesMint : noMint;
       const sellerAta = await getAssociatedTokenAddress(sellerMint, sellerWallet, false, TOKEN_2022_PROGRAM_ID);
       const sellerAccount = await getAccount(this.connection, sellerAta, 'confirmed', TOKEN_2022_PROGRAM_ID);
       const onChainBalance = Number(sellerAccount.amount);
       if (sizeU64 > onChainBalance) {
-        logger.warn(`[CloseV2] Capping size from ${sizeU64} to on-chain balance ${onChainBalance} (drift: ${sizeU64 - onChainBalance} lamports)`);
-        sizeU64 = onChainBalance;
+        throw new Error(
+          `PENDING_POSITION_SYNC: requested close ${sizeU64} lamports exceeds confirmed on-chain balance ${onChainBalance}`
+        );
       }
     } catch (err: any) {
-      // If ATA doesn't exist or fetch fails, proceed with original size
+      // ATA missing or insufficient confirmed balance means the position is not
+      // currently sellable on-chain.
+      if (String(err?.message || '').includes('PENDING_POSITION_SYNC')) {
+        throw err;
+      }
       logger.warn(`[CloseV2] Could not fetch seller token balance: ${err.message}`);
+    }
+
+    const MIN_ORDER_SIZE_LAMPORTS = 1_000; // 0.001 shares, matches on-chain MIN_ORDER_SIZE
+    if (sizeU64 < MIN_ORDER_SIZE_LAMPORTS) {
+      throw new Error(`NO_SELLABLE_BALANCE: seller on-chain balance too low for close (${sizeU64} lamports)`);
     }
 
     // ATA creation payer: use fee payer override if available (child pays rent too)
@@ -2614,25 +1873,81 @@ export class AnchorClient {
 
     // Pre-create buyer ATAs (idempotent - skips if already exists)
     // Token-2022 program for YES/NO share tokens
-    const buyerYesAta = await getAssociatedTokenAddress(yesMint, buyerWallet, false, TOKEN_2022_PROGRAM_ID);
-    const buyerNoAta = await getAssociatedTokenAddress(noMint, buyerWallet, false, TOKEN_2022_PROGRAM_ID);
+    const buyerTokenMint = params.outcome === 'YES' ? yesMint : noMint;
+    const buyerTokenAta = await getAssociatedTokenAddress(
+      buyerTokenMint,
+      buyerWallet,
+      false,
+      TOKEN_2022_PROGRAM_ID
+    );
 
     const createAtaIxs: TransactionInstruction[] = [
       createAssociatedTokenAccountIdempotentInstruction(
         ataPayer,
-        buyerYesAta,
+        buyerTokenAta,
         buyerWallet,
-        yesMint,
-        TOKEN_2022_PROGRAM_ID  // Token-2022 for share tokens
-      ),
-      createAssociatedTokenAccountIdempotentInstruction(
-        ataPayer,
-        buyerNoAta,
-        buyerWallet,
-        noMint,
+        buyerTokenMint,
         TOKEN_2022_PROGRAM_ID
       ),
     ];
+
+    const buyerArgs: PlaceOrderArgs = {
+      side: 'BID',
+      outcome: params.outcome,
+      orderType: params.buyerOrderType,
+      price: priceU64,
+      size: sizeU64,
+      expiryTs: params.buyerExpiryTs,
+      clientOrderId: params.buyerClientOrderId,
+    };
+    const sellerArgs: PlaceOrderArgs = {
+      side: 'ASK',
+      outcome: params.outcome,
+      orderType: params.sellerOrderType,
+      price: priceU64,
+      size: sizeU64,
+      expiryTs: params.sellerExpiryTs,
+      clientOrderId: params.sellerClientOrderId,
+    };
+    const mmWallet = this.mmKeypair?.publicKey.toBase58();
+    const buyerRequiresAuth = Boolean(
+      params.buyerSignature &&
+      params.buyerMessage &&
+      params.buyerWallet !== mmWallet
+    );
+    const sellerRequiresAuth = Boolean(
+      params.sellerSignature &&
+      params.sellerMessage &&
+      params.sellerWallet !== mmWallet
+    );
+    const defaultSigner = new PublicKey(new Uint8Array(32)); // Represents Pubkey::default()
+    const buyerSigner = buyerRequiresAuth
+      ? new PublicKey(params.buyerSessionPublicKey || params.buyerWallet)
+      : defaultSigner;
+    const sellerSigner = sellerRequiresAuth
+      ? new PublicKey(params.sellerSessionPublicKey || params.sellerWallet)
+      : defaultSigner;
+    const buyerSessionAuthority = buyerRequiresAuth && params.buyerSessionPublicKey
+      ? getSessionAuthorityPda(buyerWallet, buyerSigner)
+      : PROGRAM_ID;
+    const sellerSessionAuthority = sellerRequiresAuth && params.sellerSessionPublicKey
+      ? getSessionAuthorityPda(sellerWallet, sellerSigner)
+      : PROGRAM_ID;
+    const authIxs: TransactionInstruction[] = [];
+    if (buyerRequiresAuth) {
+      authIxs.push(buildEd25519VerifyInstruction(
+        buyerSigner,
+        Buffer.from(params.buyerMessage, 'base64'),
+        Buffer.from(bs58.decode(params.buyerSignature)),
+      ));
+    }
+    if (sellerRequiresAuth) {
+      authIxs.push(buildEd25519VerifyInstruction(
+        sellerSigner,
+        Buffer.from(params.sellerMessage, 'base64'),
+        Buffer.from(bs58.decode(params.sellerSignature)),
+      ));
+    }
 
     const closeIx = await this.buildExecuteCloseV2Instruction({
       marketPubkey: market,
@@ -2640,21 +1955,41 @@ export class AnchorClient {
       noMint,
       buyerWallet,
       sellerWallet,
+      buyerArgs,
+      sellerArgs,
       outcome: params.outcome,
       price: priceU64,
       size: sizeU64,
       takerFee: feeU64,
+      buyerSigner,
+      sellerSigner,
+      buyerSessionAuthority,
+      sellerSessionAuthority,
     });
 
-    // Combine ATA creation with close in single transaction
-    const allIxs = [...createAtaIxs, closeIx];
-    const signature = await this.submitTransaction(allIxs, [], `CloseV2 ${params.matchSize} shares`, {
+    // ATA setup can push relayed closes over Solana's 1232-byte limit,
+    // so submit setup separately when needed.
+    if (createAtaIxs.length > 0) {
+      await this.submitTransaction(
+        createAtaIxs,
+        [],
+        `CloseV2 ATA setup ${params.matchSize} shares`,
+        {
+          feePayerOverride: params.feePayerKeypair,
+          skipSimulation: true,
+        }
+      );
+    }
+
+    const result = await this.submitTransaction([...authIxs, closeIx], [], `CloseV2 ${params.matchSize} shares`, {
       feePayerOverride: params.feePayerKeypair,
       skipSimulation: true, // Speed-critical: skip preflight to save 100-500ms
+      omitComputeBudgetIxs: true,
+      omitJitoTip: true,
     });
-    logger.info(`CloseV2 executed on-chain: ${signature}`);
+    logger.info(`CloseV2 executed on-chain: ${result.signature} (confirmed=${result.confirmed})`);
 
-    return signature;
+    return result;
   }
 
   /**
@@ -2713,7 +2048,7 @@ export class AnchorClient {
     }
 
     const ix = await this.buildCloseMarketV2Instruction(params);
-    const signature = await this.submitTransaction([ix], [], `CloseMarketV2 ${params.marketPubkey.slice(0,8)}`);
+    const { signature } = await this.submitTransaction([ix], [], `CloseMarketV2 ${params.marketPubkey.slice(0,8)}`);
     logger.info(`CloseMarketV2 executed: ${signature}`);
 
     return signature;
@@ -2725,7 +2060,7 @@ export class AnchorClient {
 
   /**
    * Post merkle root to begin batch settlement.
-   * Transitions market from RESOLVED → SETTLING on-chain.
+   * Transitions market from RESOLVED â†’ SETTLING on-chain.
    */
   async postMerkleRoot(params: {
     marketPubkey: string;
@@ -2761,7 +2096,7 @@ export class AnchorClient {
       data,
     });
 
-    const signature = await this.submitTransaction(
+    const { signature } = await this.submitTransaction(
       [instruction], [],
       `PostMerkleRoot ${params.marketPubkey.slice(0, 8)} (${params.totalSettlements} settlements)`,
       { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
@@ -2770,8 +2105,41 @@ export class AnchorClient {
     return signature;
   }
 
+  async initSettlementBitmapChunk(params: {
+    marketPubkey: string;
+    chunkIndex: number;
+  }): Promise<string> {
+    if (!this.isReady()) {
+      throw new Error('Anchor client not ready');
+    }
+
+    const market = new PublicKey(params.marketPubkey);
+    const bitmapPda = getSettlementBitmapPda(market, params.chunkIndex);
+    const discriminator = computeDiscriminator('init_settlement_bitmap');
+    const args = Buffer.alloc(2);
+    args.writeUInt16LE(params.chunkIndex, 0);
+
+    const instruction = new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        { pubkey: market, isSigner: false, isWritable: true },
+        { pubkey: bitmapPda, isSigner: false, isWritable: true },
+        { pubkey: this.relayerKeypair!.publicKey, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: Buffer.concat([discriminator, args]),
+    });
+
+    const { signature } = await this.submitTransaction(
+      [instruction], [],
+      `InitSettlementBitmap ${params.marketPubkey.slice(0, 8)} chunk ${params.chunkIndex}`,
+      { priorityMicroLamports: 50000 }
+    );
+    return signature;
+  }
+
   /**
-   * Batch settle V2 — submit up to 15 settlements with merkle proofs.
+   * Batch settle V2 â€” submit up to 15 settlements with merkle proofs.
    * Recipient USDC ATAs must exist (pass createAta instructions separately).
    */
   async batchSettleV2(params: {
@@ -2831,7 +2199,7 @@ export class AnchorClient {
     const argsBuffer = Buffer.concat(bufParts);
     const data = Buffer.concat([discriminator, argsBuffer]);
 
-    // Build remaining accounts — recipient USDC ATAs in same order as settlements
+    // Build remaining accounts â€” recipient USDC ATAs in same order as settlements
     const remainingAccounts = await Promise.all(
       entries.map(async (entry) => {
         const recipientPubkey = new PublicKey(entry.recipient);
@@ -2869,7 +2237,7 @@ export class AnchorClient {
     });
 
     const allIxs = [...createAtaIxs, instruction];
-    const signature = await this.submitTransaction(
+    const { signature } = await this.submitTransaction(
       allIxs, [],
       `BatchSettleV2 ${entries.length} entries (Market ${params.marketPubkey.slice(0, 8)})`,
       { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
@@ -2929,7 +2297,7 @@ export class AnchorClient {
     countBuf.writeUInt8(params.settlements.length, 0);
     bufParts.push(countBuf);
 
-    // amounts: Vec<u64> — u32 length prefix + count × u64 LE
+    // amounts: Vec<u64> â€” u32 length prefix + count Ã— u64 LE
     const amountsLenBuf = Buffer.alloc(4);
     amountsLenBuf.writeUInt32LE(params.settlements.length, 0);
     bufParts.push(amountsLenBuf);
@@ -2939,7 +2307,7 @@ export class AnchorClient {
       bufParts.push(amountBuf);
     }
 
-    // bridge_proof: Vec<[u8;32]> — u32 length prefix + N × 32 bytes
+    // bridge_proof: Vec<[u8;32]> â€” u32 length prefix + N Ã— 32 bytes
     const bridgeLenBuf = Buffer.alloc(4);
     bridgeLenBuf.writeUInt32LE(params.bridgeProof.length, 0);
     bufParts.push(bridgeLenBuf);
@@ -2950,7 +2318,7 @@ export class AnchorClient {
     const argsBuffer = Buffer.concat(bufParts);
     const data = Buffer.concat([discriminator, argsBuffer]);
 
-    // Build remaining accounts — recipient USDC ATAs in same order as settlements
+    // Build remaining accounts â€” recipient USDC ATAs in same order as settlements
     const remainingAccounts = await Promise.all(
       params.settlements.map(async (entry) => {
         const recipientPubkey = new PublicKey(entry.recipient);
@@ -2988,7 +2356,7 @@ export class AnchorClient {
     });
 
     const allIxs = [...createAtaIxs, instruction];
-    const signature = await this.submitTransaction(
+    const { signature } = await this.submitTransaction(
       allIxs, [],
       `BatchSettleV3 ${params.settlements.length} entries (Market ${params.marketPubkey.slice(0, 8)})`,
       { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
@@ -3039,7 +2407,7 @@ export class AnchorClient {
       data: discriminator,
     });
 
-    const signature = await this.submitTransaction(
+    const { signature } = await this.submitTransaction(
       [instruction], [],
       `BurnRemainingSharesV2 ${params.userShareAtas.length} ATAs (Market ${params.marketPubkey.slice(0, 8)})`,
       { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
@@ -3075,7 +2443,7 @@ export class AnchorClient {
     // Authority's USDC ATA to receive vault dust
     const authorityAta = await getAssociatedTokenAddress(USDC_MINT, this.relayerKeypair!.publicKey);
 
-    // Derive settlement bitmap PDA (chunk 0) — closed during finalize to recover ~0.008 SOL
+    // Derive settlement bitmap PDA (chunk 0) â€” closed during finalize to recover ~0.008 SOL
     const chunkBuffer = Buffer.alloc(2);
     chunkBuffer.writeUInt16LE(0, 0); // chunk_index = 0
     const [settlementBitmap] = PublicKey.findProgramAddressSync(
@@ -3101,7 +2469,7 @@ export class AnchorClient {
       data: discriminator,
     });
 
-    const signature = await this.submitTransaction(
+    const { signature } = await this.submitTransaction(
       [instruction], [],
       `FinalizeMarketV2 ${params.marketPubkey.slice(0, 8)}`,
       { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
@@ -3113,7 +2481,7 @@ export class AnchorClient {
   /**
    * Atomically resolve a V2 market AND post the merkle root in one TX.
    * Saves ~2s by eliminating one full TX round-trip between resolve and postMerkleRoot.
-   * Market transitions directly from Open/Closed → Settling.
+   * Market transitions directly from Open/Closed â†’ Settling.
    */
   async resolveAndPostMerkleRootV2(params: {
     marketPubkey: string;
@@ -3155,7 +2523,7 @@ export class AnchorClient {
       data,
     });
 
-    const signature = await this.submitTransaction(
+    const { signature } = await this.submitTransaction(
       [instruction], [],
       `ResolveAndPostMerkleRoot ${params.marketPubkey.slice(0, 8)} (${params.outcome}, ${params.totalSettlements} settlements)`,
       { priorityMicroLamports: 50000 }  // 5x priority for settlement speed

@@ -19,7 +19,6 @@ import { orderRoutes } from './routes/orders.js';
 import { perfRoutes } from './routes/perf.js';
 import { userRoutes } from './routes/user.js';
 import { tradesRoutes } from './routes/trades.js';
-import { marginRoutes } from './routes/margin.js';
 import { wsHandler } from './routes/websocket.js';
 import { metricsRoutes } from './routes/metrics.js';
 import { apiLogger } from './lib/logger.js';
@@ -398,7 +397,6 @@ async function main() {
   await app.register(perfRoutes, { prefix: '/perf' });
   await app.register(userRoutes, { prefix: '/user' });
   await app.register(tradesRoutes, { prefix: '/trades' });
-  await app.register(marginRoutes, { prefix: '/margin' });
   await app.register(metricsRoutes);  // Metrics at /metrics
 
   // Public config endpoint (relayer address for delegation)

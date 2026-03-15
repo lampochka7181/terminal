@@ -339,7 +339,7 @@ export interface CreateSessionParams {
   walletAddress: string;
   expiresAt: number;
   signature: string;
-  message: string;
+  binaryMessage: string;
 }
 
 export interface SessionStatus {
@@ -348,8 +348,8 @@ export interface SessionStatus {
   expiresAt?: number;
 }
 
-export async function createSession(params: CreateSessionParams): Promise<{ success: boolean }> {
-  return apiFetch<{ success: boolean }>('/auth/session', {
+export async function createSession(params: CreateSessionParams): Promise<{ success: boolean; txSignature: string }> {
+  return apiFetch<{ success: boolean; txSignature: string }>('/auth/session', {
     method: 'POST',
     body: JSON.stringify(params),
   });

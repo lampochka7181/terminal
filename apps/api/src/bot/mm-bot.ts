@@ -14,6 +14,7 @@ import nacl from 'tweetnacl';
 import bs58 from 'bs58';
 import { randomUUID } from 'crypto';
 import { config } from '../config.js';
+import { buildCanonicalOrderMessage } from '../lib/order-auth.js';
 import { mmLogger } from '../lib/logger.js';
 import { priceFeedService } from '../services/price-feed.service.js';
 import { marketService } from '../services/market.service.js';
@@ -29,8 +30,6 @@ import { fairValue, ewmaVarianceUpdate, annualizeVol, seedVariance, clamp, round
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
-
-const ORDER_MESSAGE_PREFIX = 'DEGEN_ORDER_V1:';
 
 interface MMConfig {
   // Quoting
@@ -431,7 +430,14 @@ class MarketMakerBot {
       const orderExpiryTs = Math.floor(expiresAt.getTime() / 1000);
 
       const binaryMessage = buildOrderMessage(
-        onChainMarketPda, side, 'YES', price, size, orderExpiryTs, clientOrderId,
+        onChainMarketPda,
+        this.walletAddress,
+        side,
+        'YES',
+        price,
+        size,
+        orderExpiryTs,
+        clientOrderId,
       );
       const signature = bs58.encode(nacl.sign.detached(binaryMessage, this.keypair.secretKey));
       const binaryMessageBase64 = Buffer.from(binaryMessage).toString('base64');
@@ -449,6 +455,8 @@ class MarketMakerBot {
             price: price.toString(),
             size: size.toString(),
             signature,
+            binaryMessage: binaryMessageBase64,
+            authVersion: 'DT_ORDER_V1',
             encodedInstruction: null,
             isMmOrder: true,
             expiresAt,
@@ -468,6 +476,7 @@ class MarketMakerBot {
         expiresAt: expiresAt.getTime(),
         signature,
         binaryMessage: binaryMessageBase64,
+        sessionPublicKey: undefined,
       };
 
       // Add to orderbook
@@ -842,6 +851,7 @@ class MarketMakerBot {
 
 function buildOrderMessage(
   marketPubkey: PublicKey,
+  walletAddress: string,
   side: 'BID' | 'ASK',
   outcome: 'YES' | 'NO',
   price: number,
@@ -849,38 +859,18 @@ function buildOrderMessage(
   expiryTs: number,
   clientOrderId: number,
 ): Uint8Array {
-  const prefixBytes = new TextEncoder().encode(ORDER_MESSAGE_PREFIX);
-  const buffer = new ArrayBuffer(81);
-  const view = new DataView(buffer);
-  const bytes = new Uint8Array(buffer);
-
-  let offset = 0;
-
-  bytes.set(prefixBytes, offset);
-  offset += prefixBytes.length;
-
-  bytes.set(marketPubkey.toBytes(), offset);
-  offset += 32;
-
-  view.setUint8(offset, side === 'BID' ? 0 : 1);
-  offset += 1;
-
-  view.setUint8(offset, outcome === 'YES' ? 0 : 1);
-  offset += 1;
-
-  const priceU64 = BigInt(Math.floor(price * 1_000_000));
-  view.setBigUint64(offset, priceU64, true);
-  offset += 8;
-
-  view.setBigUint64(offset, BigInt(Math.floor(size)), true);
-  offset += 8;
-
-  view.setBigInt64(offset, BigInt(expiryTs), true);
-  offset += 8;
-
-  view.setBigUint64(offset, BigInt(clientOrderId), true);
-
-  return bytes;
+  return buildCanonicalOrderMessage({
+    marketAddress: marketPubkey.toBase58(),
+    walletAddress,
+    signerPublicKey: walletAddress,
+    side,
+    outcome,
+    orderType: 'LIMIT',
+    price,
+    size,
+    expiryTs,
+    clientOrderId,
+  });
 }
 
 // ============================================================================

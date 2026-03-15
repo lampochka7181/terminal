@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, CloseAccount, Transfer};
 use crate::state::{Market, MarketStatus};
 use crate::errors::DegenError;
+use crate::security::require_market_vault;
 
 #[derive(Accounts)]
 pub struct CloseMarket<'info> {
@@ -15,14 +16,17 @@ pub struct CloseMarket<'info> {
     /// Market's USDC vault - will be closed and rent returned
     #[account(
         mut,
+        constraint = market.vault == vault.key() @ DegenError::InvalidMarketParams,
         constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.mint == market.usdc_mint @ DegenError::InvalidMarketParams,
     )]
     pub vault: Account<'info, TokenAccount>,
     
     /// Relayer's USDC account to receive leftover dust (rounding remainders)
     #[account(
         mut,
-        constraint = relayer_usdc.owner == rent_recipient.key() @ DegenError::Unauthorized
+        constraint = relayer_usdc.owner == rent_recipient.key() @ DegenError::Unauthorized,
+        constraint = relayer_usdc.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub relayer_usdc: Account<'info, TokenAccount>,
     
@@ -51,6 +55,7 @@ pub struct CloseMarket<'info> {
 pub fn close_market(ctx: Context<CloseMarket>) -> Result<()> {
     let market = &ctx.accounts.market;
     let clock = Clock::get()?;
+    require_market_vault(market, &market.key(), &ctx.accounts.vault.key(), &ctx.accounts.vault)?;
 
     // Market must be expired before it can be closed (even for empty/no-trade markets)
     require!(clock.unix_timestamp >= market.expiry_at, DegenError::MarketNotExpired);

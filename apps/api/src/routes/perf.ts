@@ -31,8 +31,7 @@ import { resolve } from 'path';
 import { randomUUID } from 'crypto';
 import { priceFeedService } from '../services/price-feed.service.js';
 import { anchorClient, getMarketV2Pda } from '../lib/anchor-client.js';
-import { deriveMarketPda } from '../jobs/market-creator.js';
-import { positionSettlerJob } from '../jobs/position-settler.js';
+import { merkleSettlerJob } from '../jobs/merkle-settler.js';
 import { PublicKey } from '@solana/web3.js';
 
 // ─── In-memory test state ────────────────────────────────────────────────────
@@ -415,8 +414,7 @@ export async function perfRoutes(app: FastifyInstance) {
       let yesMint: string | undefined;
       let noMint: string | undefined;
 
-      if (config.useV2 && anchorClient.isReady()) {
-        // V2: Create on-chain market with tokenized shares
+      if (anchorClient.isReady()) {
         const result = await anchorClient.initializeMarketV2({
           asset,
           timeframe,
@@ -427,16 +425,6 @@ export async function perfRoutes(app: FastifyInstance) {
         yesMint = result.yesMint;
         noMint = result.noMint;
         logger.info(`[PERF] Created V2 on-chain market: ${marketPubkey.slice(0, 16)}...`);
-      } else if (anchorClient.isReady()) {
-        // V1: Create on-chain market
-        await anchorClient.initializeMarket({
-          asset,
-          timeframe,
-          strikePrice: finalStrike,
-          expiryTs,
-        });
-        marketPubkey = deriveMarketPda(asset, timeframe, expiryTs);
-        logger.info(`[PERF] Created V1 on-chain market: ${marketPubkey.slice(0, 16)}...`);
       } else {
         // No on-chain - create DB-only market for testing
         marketPubkey = `test-market-${Date.now()}`;
@@ -509,17 +497,16 @@ export async function perfRoutes(app: FastifyInstance) {
       logger.info(`[PERF] Market closed in DB`);
 
       // 2. Close on-chain if available
-      if (config.useV2 && anchorClient.isReady()) {
+      if (anchorClient.isReady()) {
         try {
-          // For V2, we need yes/no mints - fetch from on-chain
           const marketAccount = await anchorClient.getConnection().getAccountInfo(new PublicKey(market.pubkey));
           if (marketAccount) {
             await anchorClient.closeMarketV2({
               marketPubkey: market.pubkey,
-              yesMint: 'pending', // Will be fetched from on-chain
+              yesMint: 'pending',
               noMint: 'pending',
             });
-            logger.info(`[PERF] Market closed on-chain (V2)`);
+            logger.info(`[PERF] Market closed on-chain`);
           }
         } catch (err: any) {
           logger.warn(`[PERF] Failed to close market on-chain: ${err.message}`);
@@ -589,13 +576,13 @@ export async function perfRoutes(app: FastifyInstance) {
 
       logger.info(`[PERF] Market resolved: outcome=${resolvedOutcome}, finalPrice=${resolvedPrice}`);
 
-      if (config.useV2 && anchorClient.isReady()) {
+      if (anchorClient.isReady()) {
         try {
           await anchorClient.resolveMarketV2({
             marketPubkey: market.pubkey,
             finalPrice: resolvedPrice,
           });
-          logger.info(`[PERF] Market resolved on-chain (V2)`);
+          logger.info(`[PERF] Market resolved on-chain`);
         } catch (err: any) {
           logger.warn(`[PERF] Failed to resolve market on-chain: ${err.message}`);
         }
@@ -633,7 +620,7 @@ export async function perfRoutes(app: FastifyInstance) {
 
       // Run settlement
       const startTime = Date.now();
-      await positionSettlerJob();
+      await merkleSettlerJob();
       const elapsed = Date.now() - startTime;
 
       // Check final status

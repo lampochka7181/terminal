@@ -1,7 +1,5 @@
 import { eq, and, sql } from 'drizzle-orm';
-import { db, positions, markets, settlements, marginAccounts, type Position, type NewPosition } from '../db/index.js';
-import { logger } from '../lib/logger.js';
-import { lendingService } from './lending.service.js';
+import { db, positions, markets, settlements, type Position, type NewPosition } from '../db/index.js';
 
 export interface PositionWithMarket extends Position {
   market?: {
@@ -197,45 +195,11 @@ export class PositionService {
 
   /**
    * Settle a position
-   * Also handles margin accounts - repays loans when leveraged positions settle
    */
   async settlePosition(
     positionId: string,
     payout: number
   ): Promise<void> {
-    // Check if this position has a margin account (leveraged position)
-    const [marginAccount] = await db
-      .select()
-      .from(marginAccounts)
-      .where(and(
-        eq(marginAccounts.positionId, positionId),
-        eq(marginAccounts.status, 'OPEN')
-      ))
-      .limit(1);
-    
-    // If there's an open margin account, repay the loan
-    if (marginAccount) {
-      const loanAmount = parseFloat(marginAccount.loanAmount);
-      
-      if (loanAmount > 0) {
-        // Repay the loan from the payout
-        await lendingService.recordRepayment(loanAmount);
-        logger.info(`Loan repaid on settlement: $${loanAmount.toFixed(2)} for position ${positionId}`);
-      }
-      
-      // Close the margin account
-      await db
-        .update(marginAccounts)
-        .set({
-          status: 'CLOSED',
-          updatedAt: new Date(),
-        })
-        .where(eq(marginAccounts.id, marginAccount.id));
-      
-      logger.info(`Closed margin account ${marginAccount.id} on position settlement`);
-    }
-    
-    // Mark position as settled
     await db
       .update(positions)
       .set({
@@ -269,23 +233,6 @@ export class PositionService {
     return result;
   }
 
-  /**
-   * Mark a position as settled (used when leveraged positions are manually closed)
-   * FIX L5: Prevents position-settler from trying to settle already-closed positions
-   */
-  async markAsSettled(positionId: string, payout: number): Promise<void> {
-    await db
-      .update(positions)
-      .set({
-        status: 'SETTLED',
-        payout: payout.toString(),
-        settledAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(eq(positions.id, positionId));
-    
-    logger.info(`Position ${positionId} marked as SETTLED (manual leveraged close, payout: $${payout.toFixed(2)})`);
-  }
 }
 
 export const positionService = new PositionService();

@@ -96,6 +96,19 @@ async function executeBatchSettle(payload: Record<string, any>): Promise<{ succe
       proof: s.proof.map((p: string) => Buffer.from(p, 'hex')),
     }));
 
+    if ((bitmapChunkIndex || 0) > 0) {
+      try {
+        await anchorClient.initSettlementBitmapChunk({
+          marketPubkey,
+          chunkIndex: bitmapChunkIndex,
+        });
+      } catch (err: any) {
+        if (!String(err.message || '').includes('already in use')) {
+          throw err;
+        }
+      }
+    }
+
     const sig = await anchorClient.batchSettleV2({
       marketPubkey,
       bitmapChunkIndex: bitmapChunkIndex || 0,
@@ -163,6 +176,19 @@ async function executeBatchSettleV3(payload: Record<string, any>): Promise<{ suc
       new Uint8Array(Buffer.from(p, 'hex'))
     );
 
+    if ((bitmapChunkIndex || 0) > 0) {
+      try {
+        await anchorClient.initSettlementBitmapChunk({
+          marketPubkey,
+          chunkIndex: bitmapChunkIndex,
+        });
+      } catch (err: any) {
+        if (!String(err.message || '').includes('already in use')) {
+          throw err;
+        }
+      }
+    }
+
     const sig = await anchorClient.batchSettleV3({
       marketPubkey,
       bitmapChunkIndex: bitmapChunkIndex || 0,
@@ -217,7 +243,7 @@ async function processJob(job: Job<OnchainSubmitJobData>): Promise<void> {
   const acquired = await relayerPoolService.acquireFeePayer().catch(() => null);
   const feePayerPubkey = acquired?.pubkey;
 
-  let result: { success: boolean; signature?: string; error?: string; errorCode?: string };
+  let result: { success: boolean; signature?: string; pendingConfirmation?: boolean; error?: string; errorCode?: string };
 
   // Pre-flight check: skip match/close jobs if market is no longer OPEN
   // Uses in-memory cache (5s TTL) to avoid DB pressure during sustained load
@@ -265,8 +291,7 @@ async function processJob(job: Job<OnchainSubmitJobData>): Promise<void> {
         });
         break;
       case 'settle':
-        // Settlement uses master wallet (market authority) — no child fee payer
-        result = await transactionService.executeSettlement(payload as any);
+        throw new Error('V1 settlement removed — use batch-settle (merkle) instead');
         break;
       case 'batch-settle':
         result = await executeBatchSettle(payload);
@@ -309,7 +334,7 @@ async function processJob(job: Job<OnchainSubmitJobData>): Promise<void> {
         makerOrderId: payload.makerOrderId,
         takerOrderId: payload.takerOrderId,
         txSignature: result.signature || '',
-        status: 'CONFIRMED',
+        status: result.pendingConfirmation ? 'PENDING' : 'CONFIRMED',
       };
       await dbSyncQueue.add('db-sync', syncData, {
         jobId: `dbsync-${idempotencyKey}`,

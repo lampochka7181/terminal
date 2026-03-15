@@ -6,6 +6,8 @@ import { randomBytes } from 'crypto';
 import { userService } from '../services/user.service.js';
 import { sessionService } from '../services/session.service.js';
 import { logger } from '../lib/logger.js';
+import { anchorClient } from '../lib/anchor-client.js';
+import { canonicalSessionGrantMessageToBase64 } from '../lib/session-grant.js';
 
 // Validation schemas
 const nonceQuerySchema = z.object({
@@ -418,7 +420,7 @@ export async function authRoutes(app: FastifyInstance) {
     walletAddress: z.string().length(44),
     expiresAt: z.number().int().positive(),
     signature: z.string().min(1),
-    message: z.string().min(1),
+    binaryMessage: z.string().min(1),
   });
 
   /**
@@ -464,7 +466,68 @@ export async function authRoutes(app: FastifyInstance) {
       });
     }
     
-    const result = await sessionService.createSession(body.data);
+    const expectedBinaryMessage = canonicalSessionGrantMessageToBase64({
+      walletAddress: body.data.walletAddress,
+      sessionPublicKey: body.data.sessionPublicKey,
+      expiresAt: body.data.expiresAt,
+    });
+
+    if (body.data.binaryMessage !== expectedBinaryMessage) {
+      return reply.code(400).send({
+        error: {
+          code: 'INVALID_MESSAGE',
+          message: 'Session grant message does not match the canonical payload.',
+        },
+      });
+    }
+
+    try {
+      const publicKey = bs58.decode(body.data.walletAddress);
+      const signatureBytes = bs58.decode(body.data.signature);
+      const messageBytes = Buffer.from(body.data.binaryMessage, 'base64');
+
+      const isValid = nacl.sign.detached.verify(messageBytes, signatureBytes, publicKey);
+      if (!isValid) {
+        return reply.code(401).send({
+          error: {
+            code: 'INVALID_SIGNATURE',
+            message: 'Session grant signature verification failed.',
+          },
+        });
+      }
+    } catch (err) {
+      logger.error('Session grant verification error:', err);
+      return reply.code(401).send({
+        error: {
+          code: 'INVALID_SIGNATURE',
+          message: 'Invalid session grant signature format.',
+        },
+      });
+    }
+
+    let txSignature: string;
+    try {
+      txSignature = await anchorClient.createSessionAuthorityBySig({
+        walletAddress: body.data.walletAddress,
+        sessionPublicKey: body.data.sessionPublicKey,
+        expiresAt: body.data.expiresAt,
+        signature: body.data.signature,
+        binaryMessage: body.data.binaryMessage,
+      });
+    } catch (err: any) {
+      logger.error('[Sessions] Failed to create session authority on-chain:', err);
+      return reply.code(500).send({
+        error: {
+          code: 'SESSION_RELAY_FAILED',
+          message: err.message || 'Failed to relay session authorization.',
+        },
+      });
+    }
+
+    const result = await sessionService.createSession({
+      ...body.data,
+      txSignature,
+    });
     
     if (!result.success) {
       return reply.code(400).send({
@@ -475,7 +538,7 @@ export async function authRoutes(app: FastifyInstance) {
       });
     }
     
-    return { success: true };
+    return { success: true, txSignature };
   });
 
   /**

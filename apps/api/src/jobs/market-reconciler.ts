@@ -3,7 +3,6 @@ import { db, markets } from '../db/index.js';
 import { anchorClient } from '../lib/anchor-client.js';
 import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
 import { logger } from '../lib/logger.js';
-import { config } from '../config.js';
 
 /**
  * Market Reconciler Job
@@ -18,7 +17,7 @@ import { config } from '../config.js';
  */
 
 export async function marketReconcilerJob(): Promise<void> {
-  if (!anchorClient.isReady() || !config.useV2) return;
+  if (!anchorClient.isReady()) return;
 
   const activeMarkets = await db
     .select({

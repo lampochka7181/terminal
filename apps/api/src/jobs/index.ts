@@ -2,15 +2,13 @@ import { logger, keeperLogger, logEvents } from '../lib/logger.js';
 import { marketCreatorJob } from './market-creator.js';
 import { marketActivatorJob } from './market-activator.js';
 import { marketResolverJob } from './market-resolver.js';
-import { positionSettlerJob } from './position-settler.js';
 import { orderExpirerJob } from './order-expirer.js';
 import { marketCloserJob } from './market-closer.js';
-import { liquidationCheckerJob, lendingPoolSyncJob } from './liquidation-checker.js';
 import { merkleSettlerJob } from './merkle-settler.js';
 import { marketReconcilerJob } from './market-reconciler.js';
 import { reconciliationJob } from '../queue/jobs/reconciliation.job.js';
 import { relayerPoolService } from '../services/relayer-pool.service.js';
-import { db, pool } from '../db/index.js'; // To check pool load directly
+import { pool } from '../db/index.js';
 import { config } from '../config.js';
 
 /**
@@ -43,39 +41,18 @@ const isPerfMode = config.perfTestMode;
 
 const jobs: JobConfig[] = [
   {
-    name: 'Lending Pool Sync',
-    intervalMs: 60 * 1000,
-    job: lendingPoolSyncJob,
-    enabled: !isPerfMode && !!config.lendingWalletPrivateKey,
-    startupDelayMs: 2000,
-  },
-  {
     name: 'Market Activator',
-    intervalMs: isPerfMode ? 10 * 1000 : 500, // 500ms for tighter strike accuracy on 1m markets
+    intervalMs: isPerfMode ? 10 * 1000 : 500,
     job: marketActivatorJob,
     enabled: true,
     startupDelayMs: 5000,
   },
   {
     name: 'Market Resolver',
-    intervalMs: isPerfMode ? 10 * 1000 : 3 * 1000, // Slower in perf mode
+    intervalMs: isPerfMode ? 10 * 1000 : 3 * 1000,
     job: marketResolverJob,
     enabled: true,
     startupDelayMs: 12000,
-  },
-  {
-    name: 'Liquidation Checker',
-    intervalMs: 2 * 1000,
-    job: liquidationCheckerJob,
-    enabled: !isPerfMode && !!config.lendingWalletPrivateKey,
-    startupDelayMs: 20000,
-  },
-  {
-    name: 'Position Settler',
-    intervalMs: isPerfMode ? 15 * 1000 : 5 * 1000,
-    job: positionSettlerJob,
-    enabled: !config.useV2, // V2 uses merkle settler exclusively
-    startupDelayMs: isPerfMode ? 60000 : 28000, // Later in perf mode
   },
   {
     name: 'Market Creator',
@@ -92,11 +69,11 @@ const jobs: JobConfig[] = [
     startupDelayMs: 45000,
   },
   {
-    name: 'Merkle Settler V2',
-    intervalMs: isPerfMode ? 30 * 1000 : 3 * 1000, // 3s safety net (direct triggers handle happy path)
+    name: 'Merkle Settler',
+    intervalMs: isPerfMode ? 30 * 1000 : 3 * 1000,
     job: merkleSettlerJob,
-    enabled: config.useV2,
-    startupDelayMs: isPerfMode ? 90000 : 30000, // Much later in perf mode
+    enabled: true,
+    startupDelayMs: isPerfMode ? 90000 : 30000,
   },
   {
     name: 'Market Closer',
@@ -109,7 +86,7 @@ const jobs: JobConfig[] = [
     name: 'Market Reconciler',
     intervalMs: 60 * 1000,
     job: marketReconcilerJob,
-    enabled: !isPerfMode && config.useV2,
+    enabled: !isPerfMode,
     startupDelayMs: 50000,
   },
   {
@@ -244,9 +221,6 @@ async function runJobSafe(config: JobConfig): Promise<void> {
       break;
     case 'Market Closer':
       skipThreshold = Infinity; // Never skip - helps recover resources
-      break;
-    case 'Lending Pool Sync':
-      skipThreshold = 20; // Less critical, can wait
       break;
     default:
       skipThreshold = 15; // Conservative default

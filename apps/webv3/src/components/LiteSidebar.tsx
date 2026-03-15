@@ -86,6 +86,9 @@ export default function LiteSidebar() {
     setPromptOpen(true);
   }, []);
 
+  const yesHasBuyLiquidity = yesPrices.bestAskSize > 0 && yesPrices.bestAsk > 0 && yesPrices.bestAsk < 1;
+  const noHasBuyLiquidity = noPrices.bestAskSize > 0 && noPrices.bestAsk > 0 && noPrices.bestAsk < 1;
+
   const handlePlaceOrder = useCallback(async (outcome: 'yes' | 'no') => {
     if (!wallet.connected) { setWalletModalVisible(true); return; }
     if (!isAuthenticated) {
@@ -102,6 +105,11 @@ export default function LiteSidebar() {
     if (!market) { showPrompt('No Market', 'No active market.', 'error'); return; }
 
     const prices = outcome === 'yes' ? yesPrices : noPrices;
+    const hasLiquidity = outcome === 'yes' ? yesHasBuyLiquidity : noHasBuyLiquidity;
+    if (!hasLiquidity) {
+      showPrompt('No Liquidity', `No liquidity available to buy ${outcome === 'yes' ? 'Above' : 'Below'} right now.`, 'warning');
+      return;
+    }
     const result = await placeOrder({
       marketAddress: market.address,
       side: 'bid',
@@ -118,7 +126,7 @@ export default function LiteSidebar() {
     } else if (result?.error) {
       showPrompt('Order Failed', result.error, 'error');
     }
-  }, [wallet.connected, isAuthenticated, market, amount, yesPrices, noPrices, placeOrder, showPrompt, delegation, signIn, setWalletModalVisible]);
+  }, [wallet.connected, isAuthenticated, market, amount, yesPrices, noPrices, yesHasBuyLiquidity, noHasBuyLiquidity, placeOrder, showPrompt, delegation, signIn, setWalletModalVisible]);
 
   const showPnlToast = useCallback((pnl: number) => {
     const id = Date.now();
@@ -126,7 +134,7 @@ export default function LiteSidebar() {
     setTimeout(() => setPnlToasts(prev => prev.filter(t => t.id !== id)), 2000);
   }, []);
 
-  const handleClosePosition = useCallback(async (entry: { pos: { marketAddress: string }; isYes: boolean; shares: number; entryPrice: number }) => {
+  const handleClosePosition = useCallback(async (entry: { pos: { marketAddress: string }; isYes: boolean; shares: number; entryPrice: number; costBasis: number }) => {
     const outcome = entry.isYes ? 'yes' : 'no';
     const key = `${entry.pos.marketAddress}-${outcome}`;
     setClosingPosition(key);
@@ -136,14 +144,15 @@ export default function LiteSidebar() {
         side: 'ask',
         outcome: outcome as 'yes' | 'no',
         orderType: 'market',
-        price: entry.isYes ? 0.01 : 0.99,
+        price: 0.01,
         size: entry.shares,
       });
       if (result?.error) {
         showPrompt('Close Failed', result.error, 'error');
       } else if (result && result.filledSize > 0) {
-        const sellPrice = result.avgPrice ?? 0;
-        showPnlToast((sellPrice - entry.entryPrice) * result.filledSize);
+        const proceeds = (result.avgPrice ?? 0) * result.filledSize;
+        const sellFee = result.totalFee ?? 0;
+        showPnlToast(proceeds - entry.costBasis - sellFee);
       } else if (result && result.filledSize === 0) {
         showPrompt('No Liquidity', 'No liquidity available to close your position. It will settle automatically at market expiry.', 'warning');
       }
@@ -161,10 +170,10 @@ export default function LiteSidebar() {
   const timeLeft = Math.max(0, Math.floor((expiryMs - Date.now()) / 1000));
   const timeDisplay = isActivating ? '—:——' : `${Math.floor(timeLeft / 60)}:${String(timeLeft % 60).padStart(2, '0')}`;
 
-  const yesMultiplier = yesPrices.bestAsk > 0 ? (1 / yesPrices.bestAsk).toFixed(2) : '--';
-  const noMultiplier = noPrices.bestAsk > 0 ? (1 / noPrices.bestAsk).toFixed(2) : '--';
-  const yesPayout = yesPrices.bestAsk > 0 ? `+$${Math.round(amount * (1 / yesPrices.bestAsk - 1))}` : '--';
-  const noPayout = noPrices.bestAsk > 0 ? `+$${Math.round(amount * (1 / noPrices.bestAsk - 1))}` : '--';
+  const yesMultiplier = yesHasBuyLiquidity ? (1 / yesPrices.bestAsk).toFixed(2) : '--';
+  const noMultiplier = noHasBuyLiquidity ? (1 / noPrices.bestAsk).toFixed(2) : '--';
+  const yesPayout = yesHasBuyLiquidity ? `+$${Math.round(amount * (1 / yesPrices.bestAsk - 1))}` : '--';
+  const noPayout = noHasBuyLiquidity ? `+$${Math.round(amount * (1 / noPrices.bestAsk - 1))}` : '--';
 
 
   // Listen for sell events from TradeBubbles overlay
@@ -178,6 +187,7 @@ export default function LiteSidebar() {
     const entryPrice = outcome === 'yes'
       ? (pos.avgEntryYes ?? pos.avgEntryPrice)
       : (pos.avgEntryNo ?? pos.avgEntryPrice);
+    const costBasis = pos.totalCost ?? (shares * entryPrice);
     const result = await placeOrder({
       marketAddress: pos.marketAddress,
       side: 'ask',
@@ -187,8 +197,9 @@ export default function LiteSidebar() {
       size: shares,
     });
     if (result && result.filledSize > 0) {
-      const sellPrice = result.avgPrice ?? 0;
-      showPnlToast((sellPrice - entryPrice) * result.filledSize);
+      const proceeds = (result.avgPrice ?? 0) * result.filledSize;
+      const sellFee = result.totalFee ?? 0;
+      showPnlToast(proceeds - costBasis - sellFee);
     } else if (result && result.filledSize === 0) {
       showPrompt('No Liquidity', 'No liquidity available to close your position. It will settle automatically at market expiry.', 'warning');
     }
@@ -245,12 +256,12 @@ export default function LiteSidebar() {
   }
   const firstEntry = displayEntries[0];
 
-  const liteBestAsk = firstEntry
-    ? (firstEntry.isYes ? yesPrices.bestAsk : noPrices.bestAsk)
+  const liteBestBid = firstEntry
+    ? (firstEntry.isYes ? yesPrices.bestBid : noPrices.bestBid)
     : 0;
-  const liteHasLiquidity = liteBestAsk > 0 && liteBestAsk < 1;
+  const liteHasLiquidity = liteBestBid > 0 && liteBestBid < 1;
   let liveMark = firstEntry
-    ? (liteHasLiquidity ? liteBestAsk : 0)
+    ? (liteHasLiquidity ? liteBestBid : 0)
     : 0;
   let liteFallback = false;
   if (firstEntry && !liteHasLiquidity && strikePrice > 0 && assetPrice) {
@@ -393,13 +404,13 @@ export default function LiteSidebar() {
               )}
               <button
                 onClick={() => handlePlaceOrder('yes')}
-                disabled={isPlacing || isActivating}
+                disabled={isPlacing || isActivating || !yesHasBuyLiquidity}
                 style={{
                   width: '100%', padding: '12px 21px', borderRadius: 9, border: bdr,
                   background: 'rgba(238,238,238,0.05)',
-                  cursor: isPlacing || isActivating ? 'not-allowed' : 'pointer',
+                  cursor: isPlacing || isActivating || !yesHasBuyLiquidity ? 'not-allowed' : 'pointer',
                   display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6,
-                  opacity: isPlacing || isActivating ? 0.4 : 1,
+                  opacity: isPlacing || isActivating || !yesHasBuyLiquidity ? 0.4 : 1,
                 }}>
                 <span style={{ fontSize: 21, fontWeight: 600, color: '#95ff94' }}>Above</span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -409,13 +420,13 @@ export default function LiteSidebar() {
               </button>
               <button
                 onClick={() => handlePlaceOrder('no')}
-                disabled={isPlacing || isActivating}
+                disabled={isPlacing || isActivating || !noHasBuyLiquidity}
                 style={{
                   width: '100%', padding: '12px 21px', borderRadius: 9, border: bdr,
                   background: 'rgba(238,238,238,0.05)',
-                  cursor: isPlacing || isActivating ? 'not-allowed' : 'pointer',
+                  cursor: isPlacing || isActivating || !noHasBuyLiquidity ? 'not-allowed' : 'pointer',
                   display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                  opacity: isPlacing || isActivating ? 0.4 : 1,
+                  opacity: isPlacing || isActivating || !noHasBuyLiquidity ? 0.4 : 1,
                 }}>
                 <span style={{ fontSize: 21, fontWeight: 600, color: '#f55252' }}>Below</span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -443,9 +454,9 @@ export default function LiteSidebar() {
                 <InfoDot text="Your active positions for the current round. PnL updates live." />
               </div>
               {displayEntries.length > 0 ? displayEntries.map((entry, idx) => {
-                const eBestAsk = entry.isYes ? yesPrices.bestAsk : noPrices.bestAsk;
-                const eHasLiq = eBestAsk > 0 && eBestAsk < 1;
-                let eMark = eHasLiq ? eBestAsk : 0;
+                const eBestBid = entry.isYes ? yesPrices.bestBid : noPrices.bestBid;
+                const eHasLiq = eBestBid > 0 && eBestBid < 1;
+                let eMark = eHasLiq ? eBestBid : 0;
                 let eFallback = false;
                 if (!eHasLiq && strikePrice > 0 && assetPrice) {
                   if (assetPrice > strikePrice) {

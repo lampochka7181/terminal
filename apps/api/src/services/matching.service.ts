@@ -3,7 +3,7 @@ import { orderService } from './order.service.js';
 import { positionService } from './position.service.js';
 import { marketService } from './market.service.js';
 import { userService } from './user.service.js';
-import { transactionService, MatchParams, CloseParams, LeveragedMatchParams } from './transaction.service.js';
+import { transactionService, MatchParams, CloseParams } from './transaction.service.js';
 import { calculateTakerFee, calculateMakerFee } from './fee.service.js';
 import { getMarketPda, anchorClient } from '../lib/anchor-client.js';
 import { db, trades, type NewTrade } from '../db/index.js';
@@ -11,10 +11,8 @@ import { eq } from 'drizzle-orm';
 import { logger, tradeLogger, orderLogger, logEvents } from '../lib/logger.js';
 import { broadcastOrderbookUpdate, broadcastTrade, broadcastGlobalTrade, broadcastUserFill } from '../lib/broadcasts.js';
 import { config } from '../config.js';
-import { onchainSubmitQueue } from '../queue/queues.js';
+import { onchainSubmitQueue, dbSyncQueue } from '../queue/queues.js';
 import { mmBotV2 } from '../bot/mm-bot.js';
-import { lendingService } from './lending.service.js';
-import { marginService } from './margin.service.js';
 import { writeBehindService } from './write-behind.service.js';
 import { randomUUID } from 'crypto';
 
@@ -29,6 +27,14 @@ function getMMUserId(): string | null {
  *  can reach N lamports, causing InsufficientShares on close. */
 function truncate6(n: number): number {
   return Math.floor(n * 1_000_000) / 1_000_000;
+}
+
+function toShareLamports(n: number): number {
+  return Math.round(n * 1_000_000);
+}
+
+function fromShareLamports(lamports: number): number {
+  return lamports / 1_000_000;
 }
 
 /**
@@ -69,8 +75,12 @@ export interface Fill {
   takerFee: number;
   makerSide: 'BID' | 'ASK';
   takerSide: 'BID' | 'ASK';
+  makerOrderType?: 'LIMIT' | 'MARKET' | 'IOC' | 'FOK';
+  takerOrderType?: 'LIMIT' | 'MARKET' | 'IOC' | 'FOK';
   makerClientOrderId: number;
   takerClientOrderId: number;
+  makerExpiryTs?: number;
+  takerExpiryTs?: number;
   // For on-chain order verification
   makerOrderPda?: string;  // On-chain Order PDA for maker (if user order)
   takerOrderPda?: string;  // On-chain Order PDA for taker (if user order)
@@ -79,12 +89,8 @@ export interface Fill {
   takerSignature?: string;
   makerMessage?: string;
   takerMessage?: string;
-  // Leverage fields (for leveraged orders executed from Lending Pool)
-  leverage?: number;         // 1 = no leverage, 2-10 = leveraged
-  marginAmount?: number;     // User's margin amount
-  loanAmount?: number;       // Loan amount from lending pool
-  // Leveraged close: on-chain shares are owned by Lending Pool, not user
-  isLeveragedClose?: boolean;
+  makerSessionPublicKey?: string;
+  takerSessionPublicKey?: string;
 }
 
 // Fee configuration - Now uses tiered fee service from fee.service.ts
@@ -123,10 +129,7 @@ export interface DollarMarketOrder {
   // For on-chain verification (user's signed authorization)
   signature?: string;
   binaryMessage?: string;
-  // Leverage fields (for leveraged orders)
-  leverage?: number;       // 1 = no leverage, 2-10 = leveraged
-  marginAmount?: number;   // User's margin amount
-  loanAmount?: number;     // Loan from lending pool
+  sessionPublicKey?: string;
 }
 
 export interface DollarMatchResult {
@@ -156,8 +159,7 @@ export interface SellOrder {
   // For on-chain verification (user's signed authorization)
   signature?: string;
   binaryMessage?: string;
-  // Leveraged position close: on-chain shares are owned by Lending Pool
-  isLeveragedClose?: boolean;
+  sessionPublicKey?: string;
 }
 
 export interface SellMatchResult {
@@ -167,6 +169,7 @@ export interface SellMatchResult {
   totalSold: number;
   avgPrice: number;
   remainingSize: number;
+  totalTakerFees: number;
 }
 
 /**
@@ -184,10 +187,7 @@ export interface LimitOrder {
   // For on-chain verification (user's signed authorization)
   signature?: string;
   binaryMessage?: string;
-  // Leverage fields (for leveraged orders)
-  leverage?: number;       // 1 = no leverage, 2-10 = leveraged
-  marginAmount?: number;   // User's margin amount
-  loanAmount?: number;     // Loan from lending pool
+  sessionPublicKey?: string;
 }
 
 export interface LimitMatchResult {
@@ -469,15 +469,20 @@ export class MatchingService {
             makerFee, takerFee,
             makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side,
             takerSide: takerOrder.side,
+            makerOrderType: (bestOrder.orderType || 'LIMIT') as 'LIMIT' | 'MARKET' | 'IOC' | 'FOK',
+            takerOrderType: (takerOrder.orderType || 'LIMIT') as 'LIMIT' | 'MARKET' | 'IOC' | 'FOK',
             makerClientOrderId: bestOrder.clientOrderId || Date.now(),
             takerClientOrderId: takerOrder.clientOrderId || Date.now(),
+            makerExpiryTs: bestOrder.expiresAt ? Math.floor(bestOrder.expiresAt / 1000) : undefined,
+            takerExpiryTs: takerOrder.expiresAt ? Math.floor(takerOrder.expiresAt / 1000) : undefined,
             makerOrderPda: (bestOrder as any).orderPda,
             takerOrderPda: (takerOrder as any).orderPda,
             makerSignature: bestOrder.signature,
             takerSignature: takerOrder.signature,
             makerMessage: bestOrder.binaryMessage,
             takerMessage: takerOrder.binaryMessage,
-            leverage: takerOrder.leverage, marginAmount: takerOrder.marginAmount, loanAmount: takerOrder.loanAmount,
+            makerSessionPublicKey: bestOrder.sessionPublicKey,
+            takerSessionPublicKey: takerOrder.sessionPublicKey,
           });
 
           const newMakerRemaining = bestOrder.remainingSize - fillSize;
@@ -552,15 +557,20 @@ export class MatchingService {
           makerFee, takerFee,
           makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side,
           takerSide: takerOrder.side,
+          makerOrderType: (bestOrder.orderType || 'LIMIT') as 'LIMIT' | 'MARKET' | 'IOC' | 'FOK',
+          takerOrderType: (takerOrder.orderType || 'LIMIT') as 'LIMIT' | 'MARKET' | 'IOC' | 'FOK',
           makerClientOrderId: bestOrder.clientOrderId || Date.now(),
           takerClientOrderId: takerOrder.clientOrderId || Date.now(),
+          makerExpiryTs: bestOrder.expiresAt ? Math.floor(bestOrder.expiresAt / 1000) : undefined,
+          takerExpiryTs: takerOrder.expiresAt ? Math.floor(takerOrder.expiresAt / 1000) : undefined,
           makerOrderPda: (bestOrder as any).orderPda,
           takerOrderPda: (takerOrder as any).orderPda,
           makerSignature: bestOrder.signature,
           takerSignature: takerOrder.signature,
           makerMessage: bestOrder.binaryMessage,
           takerMessage: takerOrder.binaryMessage,
-          leverage: takerOrder.leverage, marginAmount: takerOrder.marginAmount, loanAmount: takerOrder.loanAmount,
+          makerSessionPublicKey: bestOrder.sessionPublicKey,
+          takerSessionPublicKey: takerOrder.sessionPublicKey,
         });
 
         const newMakerRemaining = bestOrder.remainingSize - fillSize;
@@ -715,7 +725,6 @@ export class MatchingService {
                 makerSide: matchSide, takerSide: order.side,
                 makerClientOrderId: Date.now(),
                 takerClientOrderId: order.clientOrderId || Date.now(),
-                leverage: order.leverage, marginAmount: order.marginAmount, loanAmount: order.loanAmount,
               });
               totalContracts += fillSize;
               totalSpent += fillCost;
@@ -761,14 +770,19 @@ export class MatchingService {
             makerFee, takerFee: 0,
             makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side,
             takerSide: order.side,
+            makerOrderType: (bestOrder.orderType || 'LIMIT') as 'LIMIT' | 'MARKET' | 'IOC' | 'FOK',
+            takerOrderType: 'MARKET',
             makerClientOrderId: bestOrder.clientOrderId || Date.now(),
             takerClientOrderId: order.clientOrderId || Date.now(),
+            makerExpiryTs: bestOrder.expiresAt ? Math.floor(bestOrder.expiresAt / 1000) : undefined,
+            takerExpiryTs: order.expiresAt ? Math.floor(order.expiresAt / 1000) : undefined,
             makerOrderPda: (bestOrder as any).orderPda,
             makerSignature: bestOrder.signature,
             makerMessage: bestOrder.binaryMessage,
             takerSignature: order.signature,
             takerMessage: order.binaryMessage,
-            leverage: order.leverage, marginAmount: order.marginAmount, loanAmount: order.loanAmount,
+            makerSessionPublicKey: bestOrder.sessionPublicKey,
+            takerSessionPublicKey: order.sessionPublicKey,
           });
 
           const newMakerRemaining = bestOrder.remainingSize - fillSize;
@@ -865,7 +879,6 @@ export class MatchingService {
                 makerSide: matchSide, takerSide: order.side,
                 makerClientOrderId: Date.now(),
                 takerClientOrderId: order.clientOrderId || Date.now(),
-                leverage: order.leverage, marginAmount: order.marginAmount, loanAmount: order.loanAmount,
               });
               totalContracts += fillSize;
               totalSpent += fillCost;
@@ -907,14 +920,19 @@ export class MatchingService {
           makerFee, takerFee: 0,
           makerSide: isNoOrder ? (bestOrder.side === 'BID' ? 'ASK' : 'BID') : bestOrder.side,
           takerSide: order.side,
+          makerOrderType: (bestOrder.orderType || 'LIMIT') as 'LIMIT' | 'MARKET' | 'IOC' | 'FOK',
+          takerOrderType: 'MARKET',
           makerClientOrderId: bestOrder.clientOrderId || Date.now(),
           takerClientOrderId: order.clientOrderId || Date.now(),
+          makerExpiryTs: bestOrder.expiresAt ? Math.floor(bestOrder.expiresAt / 1000) : undefined,
+          takerExpiryTs: order.expiresAt ? Math.floor(order.expiresAt / 1000) : undefined,
           makerOrderPda: (bestOrder as any).orderPda,
           makerSignature: bestOrder.signature,
           makerMessage: bestOrder.binaryMessage,
           takerSignature: order.signature,
           takerMessage: order.binaryMessage,
-          leverage: order.leverage, marginAmount: order.marginAmount, loanAmount: order.loanAmount,
+          makerSessionPublicKey: bestOrder.sessionPublicKey,
+          takerSessionPublicKey: order.sessionPublicKey,
         });
         totalContracts += fillSize;
         totalSpent += fillCost;
@@ -962,7 +980,9 @@ export class MatchingService {
         totalSpent = 0;
 
         for (const fill of fills) {
-          fill.size = fill.size * scale;
+          // Canonicalize to integer share lamports so DB positions, trades,
+          // and on-chain match size all use the same rounded quantity.
+          fill.size = fromShareLamports(toShareLamports(fill.size * scale));
           totalContracts += fill.size;
           totalSpent += fill.price * fill.size;
         }
@@ -1061,6 +1081,9 @@ export class MatchingService {
       price: result.avgPrice.toString(),
       size: result.totalContracts.toString(),
       signature: order.signature || null,
+      binaryMessage: order.binaryMessage || null,
+      sessionPublicKey: order.sessionPublicKey || null,
+      authVersion: 'DT_ORDER_V1',
       encodedInstruction: null,
       isMmOrder: false,
       expiresAt: order.expiresAt ? new Date(order.expiresAt) : new Date(Date.now() + 3600000),
@@ -1068,8 +1091,6 @@ export class MatchingService {
       filledSize: filledSize.toString(),
       remainingSize: '0',
       dollarAmount: order.dollarAmount.toString(),
-      leverage: order.leverage ? order.leverage.toString() : '1',
-      marginAmount: order.marginAmount ? order.marginAmount.toString() : null,
     });
 
     // Update fills with the pre-generated order ID
@@ -1093,12 +1114,13 @@ export class MatchingService {
       const restingSize = Math.floor((result.unfilledDollars / restingPrice) * 1e6) / 1e6;
 
       if (restingSize > 0.001) {
-        restingOrderId = randomUUID();
+        const newRestingOrderId = randomUUID();
+        restingOrderId = newRestingOrderId;
         const expiresAt = order.expiresAt ? new Date(order.expiresAt) : new Date(Date.now() + 3600000);
 
         // Enqueue resting LIMIT order for DB persistence
         writeBehindService.enqueueOrder({
-          id: restingOrderId,
+          id: newRestingOrderId,
           clientOrderId: Date.now(),
           marketId: order.marketId,
           userId: order.userId,
@@ -1108,6 +1130,9 @@ export class MatchingService {
           price: restingPrice.toString(),
           size: restingSize.toString(),
           signature: order.signature || null,
+          binaryMessage: order.binaryMessage || null,
+          sessionPublicKey: order.sessionPublicKey || null,
+          authVersion: 'DT_ORDER_V1',
           encodedInstruction: null,
           isMmOrder: false,
           expiresAt,
@@ -1115,13 +1140,11 @@ export class MatchingService {
           filledSize: '0',
           remainingSize: restingSize.toString(),
           dollarAmount: result.unfilledDollars.toString(),
-          leverage: order.leverage ? order.leverage.toString() : '1',
-          marginAmount: null,
         });
 
         // Add to Redis orderbook so it matches against future asks
         await orderbookService.addOrder({
-          id: restingOrderId,
+          id: newRestingOrderId,
           marketId: order.marketId,
           userId: order.userId,
           side: order.side,
@@ -1133,6 +1156,9 @@ export class MatchingService {
           createdAt: Date.now(),
           clientOrderId: Date.now(),
           expiresAt: order.expiresAt,
+          signature: order.signature,
+          binaryMessage: order.binaryMessage,
+          sessionPublicKey: order.sessionPublicKey,
         });
 
         // Broadcast updated orderbook to WebSocket clients
@@ -1146,48 +1172,14 @@ export class MatchingService {
         );
 
         logger.info(
-          `[RESTING] Created resting limit order ${restingOrderId.slice(0,8)}: ` +
+          `[RESTING] Created resting limit order ${newRestingOrderId.slice(0,8)}: ` +
           `${restingSize.toFixed(6)} contracts @ $${restingPrice.toFixed(4)} ` +
           `from unfilled $${result.unfilledDollars.toFixed(2)} of $${order.dollarAmount}`
         );
       }
     }
 
-    // 5. For LEVERAGED orders: Create taker position SYNCHRONOUSLY
-    //    Required because orders.ts needs the position to create the margin account
-    //    For regular orders, positions are created in background for speed
-    if (order.leverage && order.leverage > 1) {
-      const takerIsBuy = order.side === 'BID';
-
-      // Aggregate all fills by outcome for taker position
-      // Use integer lamports to match on-chain precision exactly (floor(a+b) ≥ floor(a)+floor(b))
-      const outcomeSharesLamports = new Map<'YES' | 'NO', number>();
-      for (const fill of result.fills) {
-        const current = outcomeSharesLamports.get(fill.outcome) || 0;
-        outcomeSharesLamports.set(fill.outcome, current + Math.floor(fill.size * 1_000_000));
-      }
-
-      // Update taker position for each outcome
-      // Include takerFee in cost basis so SIZE shows full spend and PnL accounts for fees
-      for (const [outcome, sharesLamports] of outcomeSharesLamports) {
-        const outcomeFills = result.fills.filter(f => f.outcome === outcome);
-        const cost = outcomeFills.reduce((sum, f) => {
-          const notional = f.price * f.size;
-          return sum + (takerIsBuy ? notional + f.takerFee : notional - f.takerFee);
-        }, 0);
-
-        await positionService.updateAfterTrade(
-          order.userId,
-          order.marketId,
-          outcome,
-          sharesLamports / 1_000_000,
-          cost,
-          takerIsBuy
-        );
-      }
-    }
-
-    // 6. EXECUTE ON-CHAIN (async with error tracking)
+    // 5. EXECUTE ON-CHAIN (async with error tracking)
     // If on-chain execution fails, trades are marked with FAILED tx status for reconciliation
     if (result.fills.length > 0) {
       this.executeFillsOnChain(result.fills, order.marketId)
@@ -1206,7 +1198,7 @@ export class MatchingService {
         pubkey: market.pubkey,
         asset: market.asset,
         timeframe: market.timeframe,
-      }, !!(order.leverage && order.leverage > 1), {
+      }, {
         dollarAmount: result.dollarAmount,
         upfrontFee: result.upfrontFee,
       }).catch(err => logger.error(`Background DB processing failed: ${err.message}`));
@@ -1362,14 +1354,19 @@ export class MatchingService {
             makerFee, takerFee,
             makerSide: isNoOrder ? 'ASK' : 'BID',
             takerSide: 'ASK',
+            makerOrderType: (bestOrder.orderType || 'LIMIT') as 'LIMIT' | 'MARKET' | 'IOC' | 'FOK',
+            takerOrderType: 'MARKET',
             makerClientOrderId: bestOrder.clientOrderId || Date.now(),
             takerClientOrderId: order.clientOrderId || Date.now(),
+            makerExpiryTs: bestOrder.expiresAt ? Math.floor(bestOrder.expiresAt / 1000) : undefined,
+            takerExpiryTs: order.expiresAt ? Math.floor(order.expiresAt / 1000) : undefined,
             makerOrderPda: (bestOrder as any).orderPda,
             makerSignature: bestOrder.signature,
             makerMessage: bestOrder.binaryMessage,
             takerSignature: order.signature,
             takerMessage: order.binaryMessage,
-            isLeveragedClose: order.isLeveragedClose,
+            makerSessionPublicKey: bestOrder.sessionPublicKey,
+            takerSessionPublicKey: order.sessionPublicKey,
           });
 
           const newMakerRemaining = bestOrder.remainingSize - fillSize;
@@ -1490,7 +1487,6 @@ export class MatchingService {
                 makerSide: 'BID', takerSide: 'ASK',
                 makerClientOrderId: Date.now(),
                 takerClientOrderId: order.clientOrderId || Date.now(),
-                isLeveragedClose: order.isLeveragedClose,
               });
               totalProceeds += fillProceeds;
               remainingSize = 0;
@@ -1520,14 +1516,19 @@ export class MatchingService {
           makerFee, takerFee,
           makerSide: isNoOrder ? 'ASK' : 'BID',
           takerSide: 'ASK',
+          makerOrderType: (bestOrder.orderType || 'LIMIT') as 'LIMIT' | 'MARKET' | 'IOC' | 'FOK',
+          takerOrderType: 'MARKET',
           makerClientOrderId: bestOrder.clientOrderId || Date.now(),
           takerClientOrderId: order.clientOrderId || Date.now(),
+          makerExpiryTs: bestOrder.expiresAt ? Math.floor(bestOrder.expiresAt / 1000) : undefined,
+          takerExpiryTs: order.expiresAt ? Math.floor(order.expiresAt / 1000) : undefined,
           makerOrderPda: (bestOrder as any).orderPda,
           makerSignature: bestOrder.signature,
           makerMessage: bestOrder.binaryMessage,
           takerSignature: order.signature,
           takerMessage: order.binaryMessage,
-          isLeveragedClose: order.isLeveragedClose,
+          makerSessionPublicKey: bestOrder.sessionPublicKey,
+          takerSessionPublicKey: order.sessionPublicKey,
         });
         totalProceeds += fillProceeds;
         remainingSize -= fillSize;
@@ -1548,6 +1549,43 @@ export class MatchingService {
       }
     }
     
+    // ═══════════════════════════════════════════════════════════════════════
+    // BAILOUT FILL: When no real liquidity exists, the MM buys the user out
+    // for pennies so they get a clean exit instead of "No Liquidity".
+    // On-chain constraints: price >= $0.01, fee >= $0.02 (MIN_TAKER_FEE).
+    // Standard flat fee ($0.06) applies via calculateTakerFee().
+    // ═══════════════════════════════════════════════════════════════════════
+    if (remainingSize > 0.001) {
+      const mmUserId = getMMUserId();
+      if (mmUserId) {
+        const ON_CHAIN_MIN_PRICE = 0.01;
+        const bailoutSize = truncate6(remainingSize);
+
+        if (bailoutSize > 0.001) {
+          const bailoutPrice = ON_CHAIN_MIN_PRICE;
+          const fillProceeds = bailoutSize * bailoutPrice;
+          const bailoutFee = calculateTakerFee(fillProceeds).fee;
+
+          fills.push({
+            makerOrderId: `mm_bailout_${Date.now()}`,
+            takerOrderId: 'pending',
+            makerUserId: mmUserId, takerUserId: order.userId,
+            price: bailoutPrice, size: bailoutSize, outcome: order.outcome,
+            makerFee: 0, takerFee: bailoutFee,
+            makerSide: isNoOrder ? 'ASK' : 'BID', takerSide: 'ASK',
+            makerClientOrderId: Date.now(),
+            takerClientOrderId: order.clientOrderId || Date.now(),
+          });
+          totalProceeds += fillProceeds;
+          remainingSize = truncate6(remainingSize - bailoutSize);
+          logger.info(
+            `BAILOUT fill: MM buying ${bailoutSize.toFixed(6)} ${order.outcome} shares @ ${bailoutPrice.toFixed(2)} ` +
+            `(proceeds $${fillProceeds.toFixed(4)}, fee $${bailoutFee.toFixed(2)})`
+          );
+        }
+      }
+    }
+
     const avgPrice = fills.length > 0 && (order.size - remainingSize) > 0 
       ? totalProceeds / (order.size - remainingSize) 
       : 0;
@@ -1573,6 +1611,8 @@ export class MatchingService {
       );
     }
     
+    const totalTakerFees = fills.reduce((sum, f) => sum + f.takerFee, 0);
+    
     return {
       orderId: '',
       fills,
@@ -1580,6 +1620,7 @@ export class MatchingService {
       totalSold: order.size - remainingSize,
       avgPrice,
       remainingSize,
+      totalTakerFees,
     };
   }
 
@@ -1617,6 +1658,9 @@ export class MatchingService {
       price: result.avgPrice.toString(),
       size: result.totalSold.toString(),
       signature: order.signature || null,
+      binaryMessage: order.binaryMessage || null,
+      sessionPublicKey: order.sessionPublicKey || null,
+      authVersion: 'DT_ORDER_V1',
       encodedInstruction: null,
       isMmOrder: false,
       expiresAt: order.expiresAt ? new Date(order.expiresAt) : new Date(Date.now() + 3600000),
@@ -1649,6 +1693,7 @@ export class MatchingService {
       expiresAt: order.expiresAt,
       signature: order.signature,
       binaryMessage: order.binaryMessage,
+      sessionPublicKey: order.sessionPublicKey,
     };
     
     this.processFillsInBackground(result.fills, asMarketOrder, {
@@ -1682,12 +1727,12 @@ export class MatchingService {
       price: order.price.toString(),
       size: order.size.toString(),
       signature: order.signature || null,
+      binaryMessage: order.binaryMessage || null,
+      sessionPublicKey: order.sessionPublicKey || null,
+      authVersion: 'DT_ORDER_V1',
       encodedInstruction: null,  // No on-chain order PDA for delegation
       isMmOrder: false,
       expiresAt: order.expiresAt ? new Date(order.expiresAt) : new Date(Date.now() + 3600000),
-      // Store leverage info on order so it's visible before margin account exists
-      leverage: order.leverage,
-      marginAmount: order.marginAmount,
     });
 
     // Convert to orderbook order format
@@ -1706,10 +1751,7 @@ export class MatchingService {
       expiresAt: order.expiresAt,
       signature: order.signature,
       binaryMessage: order.binaryMessage,
-      // Leverage fields
-      leverage: order.leverage,
-      marginAmount: order.marginAmount,
-      loanAmount: order.loanAmount,
+      sessionPublicKey: order.sessionPublicKey,
     };
 
     // Process through standard matching engine
@@ -1751,15 +1793,24 @@ export class MatchingService {
    * This enables reconciliation jobs to detect and clean up phantom positions.
    */
   private async markFillsAsFailed(fills: Fill[]): Promise<void> {
+    const seenTakerOrders = new Set<string>();
     for (const fill of fills) {
+      if (seenTakerOrders.has(fill.takerOrderId)) {
+        continue;
+      }
+      seenTakerOrders.add(fill.takerOrderId);
       try {
-        await db
-          .update(trades)
-          .set({
-            txStatus: 'FAILED' as any,
-            txSignature: `failed_${Date.now()}`,
-          })
-          .where(eq(trades.takerOrderId, fill.takerOrderId));
+        const jobId = `dbsync-early-fail-${fill.takerOrderId}`;
+        await dbSyncQueue.add('db-sync', {
+          makerOrderId: fill.makerOrderId,
+          takerOrderId: fill.takerOrderId,
+          txSignature: '',
+          status: 'FAILED',
+          errorCode: 'EARLY_ONCHAIN_FAILURE',
+        }, {
+          jobId,
+          delay: 1000,
+        });
       } catch (e: any) {
         logger.error(`Failed to mark trade ${fill.takerOrderId} as FAILED: ${e.message}`);
       }
@@ -1813,32 +1864,30 @@ export class MatchingService {
     // For sell orders (forceClose=true), ALWAYS use execute_close
     // This transfers USDC from buyer to seller, not the other way around!
     if (forceClose && isClosingTrade) {
-      // LEVERAGED CLOSE: On-chain shares are owned by Lending Pool, not user
-      // The Lending Pool must be the on-chain seller
-      let actualSellerWallet = takerWallet;
-      
-      if (fill.isLeveragedClose) {
-        const lendingPoolWallet = lendingService.getLendingWalletPubkey()?.toBase58();
-        if (!lendingPoolWallet) {
-          logger.error(`[LeveragedClose] Lending pool wallet not configured, cannot execute close for user ${takerWallet.slice(0,8)}`);
-          return;
-        }
-        actualSellerWallet = lendingPoolWallet;
-        logger.info(`[LeveragedClose] Executing close on-chain: LendingPool=${actualSellerWallet.slice(0,8)} selling for user=${takerWallet.slice(0,8)}, buyer=${makerWallet.slice(0,8)}, ${fill.size} @ ${fill.price}`);
-      } else {
-        logger.info(`Executing CLOSE (sell) on-chain: seller=${takerWallet.slice(0,8)}, buyer=${makerWallet.slice(0,8)}, ${fill.size} @ ${fill.price} fee=${fill.takerFee}`);
-      }
+      logger.info(`Executing CLOSE (sell) on-chain: seller=${takerWallet.slice(0,8)}, buyer=${makerWallet.slice(0,8)}, ${fill.size} @ ${fill.price} fee=${fill.takerFee}`);
       
       const closeParams: CloseParams = {
         marketPubkey: marketPubkey,
-        buyerWallet: makerWallet,        // Maker is buying (MM)
-        sellerWallet: actualSellerWallet, // Lending Pool for leveraged, user otherwise
+        buyerWallet: makerWallet,
+        sellerWallet: takerWallet,
         outcome: fill.outcome,
         price: fill.price,
         matchSize: fill.size,
         takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
         makerOrderId: fill.makerOrderId,  // For updating trade with tx signature
         takerOrderId: fill.takerOrderId,  // For updating trade with tx signature
+        buyerOrderType: fill.makerOrderType,
+        sellerOrderType: fill.takerOrderType,
+        buyerClientOrderId: fill.makerClientOrderId,
+        sellerClientOrderId: fill.takerClientOrderId,
+        buyerExpiryTs: fill.makerExpiryTs,
+        sellerExpiryTs: fill.takerExpiryTs,
+        buyerSignature: fill.makerSignature,
+        sellerSignature: fill.takerSignature,
+        buyerMessage: fill.makerMessage,
+        sellerMessage: fill.takerMessage,
+        buyerSessionPublicKey: fill.makerSessionPublicKey,
+        sellerSessionPublicKey: fill.takerSessionPublicKey,
       };
       
       const idempotencyKey = `close-${fill.makerOrderId}-${fill.takerOrderId}`;
@@ -1871,6 +1920,18 @@ export class MatchingService {
           takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
           makerOrderId: fill.makerOrderId,  // For updating trade with tx signature
           takerOrderId: fill.takerOrderId,  // For updating trade with tx signature
+          buyerOrderType: fill.makerOrderType,
+          sellerOrderType: fill.takerOrderType,
+          buyerClientOrderId: fill.makerClientOrderId,
+          sellerClientOrderId: fill.takerClientOrderId,
+          buyerExpiryTs: fill.makerExpiryTs,
+          sellerExpiryTs: fill.takerExpiryTs,
+          buyerSignature: fill.makerSignature,
+          sellerSignature: fill.takerSignature,
+          buyerMessage: fill.makerMessage,
+          sellerMessage: fill.takerMessage,
+          buyerSessionPublicKey: fill.makerSessionPublicKey,
+          sellerSessionPublicKey: fill.takerSessionPublicKey,
         };
         
         const idempotencyKey2 = `close-${fill.makerOrderId}-${fill.takerOrderId}`;
@@ -1885,51 +1946,7 @@ export class MatchingService {
       }
     }
     
-    // Check for leveraged opening trade - use Lending Pool wallet instead of user
-    if (fill.leverage && fill.leverage > 1 && fill.marginAmount && fill.loanAmount) {
-      logger.info(`Executing LEVERAGED on-chain: ${fill.size} ${fill.outcome} @ ${fill.price} (${fill.leverage}x) - Lending Pool buying for user ${takerWallet.slice(0,8)}`);
-      transactionService.executeLeveragedMatch({
-        marketPubkey: marketPubkey,
-        makerOrderId: fill.makerOrderId,
-        takerOrderId: fill.takerOrderId,
-        makerWallet,
-        userWallet: takerWallet,  // User wallet for tracking (NOT used on-chain)
-        makerSide: fill.makerSide,
-        takerSide: fill.takerSide,
-        outcome: fill.outcome,
-        price: fill.price,
-        matchSize: fill.size,
-        takerFee: fill.takerFee,
-        makerClientOrderId: fill.makerClientOrderId,
-        takerClientOrderId: fill.takerClientOrderId,
-        leverage: fill.leverage,
-        marginAmount: fill.marginAmount,
-        loanAmount: fill.loanAmount,
-      }).then(async result => {
-        if (!result.success) {
-          logger.error(`On-chain leveraged match failed: ${result.error}`);
-        } else {
-          logger.info(`On-chain leveraged match success: ${result.signature}`);
-          
-          // Confirm margin account on-chain (allows liquidation checker to proceed)
-          // The margin account is created in orders.ts after matching completes
-          // We need to find it by userId + marketId and mark it as confirmed
-          try {
-            const marginAccount = await marginService.getByUserAndMarket(fill.takerUserId, marketId);
-            if (marginAccount && !marginAccount.onChainConfirmedAt) {
-              await marginService.confirmOnChain(marginAccount.id);
-              logger.info(`[Leveraged] Margin account ${marginAccount.id} confirmed on-chain`);
-            }
-          } catch (confirmErr: any) {
-            // Non-fatal: liquidation checker will retry
-            logger.warn(`[Leveraged] Failed to confirm margin account: ${confirmErr.message}`);
-          }
-        }
-      }).catch(err => logger.error(`On-chain leveraged match failed: ${err.message}`));
-      return;
-    }
-    
-    // Regular opening trade (or fallback) - use execute_match instruction
+    // Regular opening trade - use execute_match instruction
     // Use a unique tradeId per fill to avoid BullMQ jobId collisions
     const tradeId = fill.takerOrderId + '-' + Date.now();
     this.executeMatchOnChain(fill, marketPubkey, makerWallet, takerWallet, tradeId);
@@ -2080,18 +2097,24 @@ export class MatchingService {
       takerUserId: fill.takerUserId,
       makerSide: fill.makerSide,
       takerSide: fill.takerSide,
+      makerOrderType: fill.makerOrderType,
+      takerOrderType: fill.takerOrderType,
       outcome: fill.outcome,
       price: fill.price,
       matchSize: fill.size,
       takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
       makerClientOrderId: fill.makerClientOrderId,
       takerClientOrderId: fill.takerClientOrderId,
+      makerExpiryTs: fill.makerExpiryTs,
+      takerExpiryTs: fill.takerExpiryTs,
       makerOrderPda: fill.makerOrderPda,
       takerOrderPda: fill.takerOrderPda,
       makerSignature: fill.makerSignature,
       takerSignature: fill.takerSignature,
       makerMessage: fill.makerMessage,
       takerMessage: fill.takerMessage,
+      makerSessionPublicKey: fill.makerSessionPublicKey,
+      takerSessionPublicKey: fill.takerSessionPublicKey,
     };
 
     const matchIdempotencyKey = `match-${tradeId}`;
@@ -2349,6 +2372,18 @@ export class MatchingService {
               matchSize: fill.size,
               takerFee: fill.takerFee,  // Tiered fee calculated by fee.service.ts
               tradeId: trade.id,  // Pass trade ID to update with tx signature
+              buyerOrderType: fill.makerOrderType,
+              sellerOrderType: fill.takerOrderType,
+              buyerClientOrderId: fill.makerClientOrderId,
+              sellerClientOrderId: fill.takerClientOrderId,
+              buyerExpiryTs: fill.makerExpiryTs,
+              sellerExpiryTs: fill.takerExpiryTs,
+              buyerSignature: fill.makerSignature,
+              sellerSignature: fill.takerSignature,
+              buyerMessage: fill.makerMessage,
+              sellerMessage: fill.takerMessage,
+              buyerSessionPublicKey: fill.makerSessionPublicKey,
+              sellerSessionPublicKey: fill.takerSessionPublicKey,
             };
             
             const closeIdempotencyKey = `close-${trade.id}`;
@@ -2454,7 +2489,6 @@ export class MatchingService {
     fills: Fill[],
     order: DollarMarketOrder,
     market: { id: string; pubkey: string; asset?: string; timeframe?: string },
-    skipTakerPosition: boolean = false,
     feeInfo?: { dollarAmount: number; upfrontFee: number },
   ): Promise<void> {
     logger.info(`[DEBUG] processFillsInBackground: fills=${fills.length}, market=${order.marketId.slice(0,8)}, perfTestMode=${config.perfTestMode}`);
@@ -2564,7 +2598,6 @@ export class MatchingService {
       const positionUpdates = this.aggregateFillsForPositions(fills, order, feeInfo);
       
       const positionPromises = positionUpdates
-        .filter(update => !(skipTakerPosition && update.userId === order.userId))
         .map(update =>
           positionService.updateAfterTrade(
             update.userId,
@@ -2675,7 +2708,7 @@ export class MatchingService {
       // 6. UPDATE MAKER ORDERS (parallel — only for non-MM synthetic orders)
       const makerUpdatePromises = fills
         .filter(fill => {
-          const makerOrderIsSynthetic = String(fill.makerOrderId || '').startsWith('mm_synth_');
+          const makerOrderIsSynthetic = String(fill.makerOrderId || '').startsWith('mm_synth_') || String(fill.makerOrderId || '').startsWith('mm_bailout_');
           return !makerOrderIsSynthetic && !(config.disableMmOrderPersistence && this.isMarketMaker(fill.makerUserId));
         })
         .map(fill =>
@@ -2722,16 +2755,17 @@ export class MatchingService {
     
     // Taker position update (all fills aggregate to one update)
     // Aggregate shares in integer lamports to match on-chain precision exactly.
-    // On-chain does open_interest += Math.floor(fill.size * 1e6) per fill.
-    // Float aggregation (a+b then floor) can exceed integer aggregation (floor(a)+floor(b))
-    // by up to N-1 lamports for N fills, causing InvalidSettlementAmount at settlement.
+    // Canonicalize each fill to the same integer share lamports used by the
+    // client when encoding on-chain match size. Raw JS floats like 15.935484 can
+    // be represented as 15.935483999..., so flooring here loses lamports and
+    // causes settlement drift versus on-chain open_interest.
     const takerIsBuy = order.side === 'BID';
     const takerOutcomes = new Map<'YES' | 'NO', { sharesLamports: number; cost: number }>();
 
     for (const fill of fills) {
       const current = takerOutcomes.get(fill.outcome) || { sharesLamports: 0, cost: 0 };
       const notional = fill.price * fill.size;
-      current.sharesLamports += Math.floor(fill.size * 1_000_000);
+      current.sharesLamports += toShareLamports(fill.size);
       // Include takerFee in cost basis so SIZE shows full spend and PnL accounts for fees.
       // Buy: cost = notional + fee (total spent). Sell: cost = notional - fee (net proceeds).
       current.cost += takerIsBuy ? notional + fill.takerFee : notional - fill.takerFee;
@@ -2772,7 +2806,7 @@ export class MatchingService {
         const notional = fill.price * fill.size;
         current.cost += notional + fill.makerFee;
       }
-      current.sharesLamports += Math.floor(fill.size * 1_000_000);
+      current.sharesLamports += toShareLamports(fill.size);
       makerUpdates.set(key, current);
     }
     

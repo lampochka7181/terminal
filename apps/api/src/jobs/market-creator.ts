@@ -2,7 +2,6 @@ import { PublicKey } from '@solana/web3.js';
 import { marketService } from '../services/market.service.js';
 import { anchorClient, PROGRAM_ID, getMarketV2Pda, getNoMintPda } from '../lib/anchor-client.js';
 import { logger, logEvents } from '../lib/logger.js';
-import { config } from '../config.js';
 
 /**
  * Market Creator Job
@@ -97,12 +96,6 @@ async function createPendingMarkets(
     noMint?: string;   // V2 only
   }> = [];
 
-  // Use V2 PDA derivation if V2 flag is enabled
-  const useV2 = config.useV2;
-  if (useV2) {
-    logger.info(`[MarketCreator] V2 mode enabled - using tokenized shares model`);
-  }
-
   for (let i = 0; i < MARKETS_LOOK_AHEAD; i++) {
     const marketExpiry = currentIntervalStart + (i * intervalMs) + durationMs;
     const expiryMinute = Math.floor(marketExpiry / 60000);
@@ -115,9 +108,7 @@ async function createPendingMarkets(
     }
 
     const expiryTs = Math.floor(marketExpiry / 1000);
-    const marketPubkey = useV2
-      ? getMarketV2Pda(asset, timeframe, expiryTs).toBase58()
-      : deriveMarketPda(asset, timeframe, expiryTs);
+    const marketPubkey = getMarketV2Pda(asset, timeframe, expiryTs).toBase58();
 
     potentialMarkets.push({ marketExpiry, expiryTs, marketPubkey });
   }
@@ -144,29 +135,17 @@ async function createPendingMarkets(
 
     if (anchorClient.isReady()) {
       try {
-        if (useV2) {
-          // V2: Create market with YES/NO token mints
-          const result = await anchorClient.initializeMarketV2({
-            asset,
-            timeframe,
-            strikePrice: 0, // PENDING - strike price will be set at activation
-            expiryTs,
-          });
-          yesMint = result.yesMint;
-          noMint = result.noMint;
-          logger.info(`✅ Created PENDING MarketV2 on-chain: ${marketPubkey.slice(0, 8)}`);
-          logger.info(`   YES mint: ${yesMint}`);
-          logger.info(`   NO mint: ${noMint}`);
-        } else {
-          // V1: Create market with Position PDAs
-          await anchorClient.initializeMarket({
-            asset,
-            timeframe,
-            strikePrice: 0, // PENDING - strike price will be set at activation
-            expiryTs,
-          });
-          logger.info(`✅ Created PENDING market on-chain: ${marketPubkey.slice(0, 8)}`);
-        }
+        const result = await anchorClient.initializeMarketV2({
+          asset,
+          timeframe,
+          strikePrice: 0,
+          expiryTs,
+        });
+        yesMint = result.yesMint;
+        noMint = result.noMint;
+        logger.info(`✅ Created PENDING MarketV2 on-chain: ${marketPubkey.slice(0, 8)}`);
+        logger.info(`   YES mint: ${yesMint}`);
+        logger.info(`   NO mint: ${noMint}`);
       } catch (err: any) {
         const errorMsg = err.message || '';
         if (errorMsg.includes('already in use') || errorMsg.includes('0x0')) {
@@ -206,24 +185,21 @@ async function createPendingMarkets(
         continue;
       }
 
-      // V2: Verify NO mint exists (Phase 2 health check)
-      if (useV2) {
-        const noMintOk = await verifyNoMintExists(marketPubkey);
-        if (!noMintOk) {
-          logger.warn(`⚠️ NO mint missing for ${marketPubkey.slice(0, 8)} — attempting Phase 2 recovery...`);
-          try {
-            await anchorClient.completeMarketV2Phase2(new PublicKey(marketPubkey), 0);
-            // Re-verify
-            const recovered = await verifyNoMintExists(marketPubkey);
-            if (!recovered) {
-              logger.error(`❌ Phase 2 recovery failed for ${marketPubkey.slice(0, 8)} — skipping market`);
-              continue;
-            }
-            logger.info(`✅ Phase 2 recovery successful for ${marketPubkey.slice(0, 8)}`);
-          } catch (recoveryErr: any) {
-            logger.error(`❌ Phase 2 recovery threw for ${marketPubkey.slice(0, 8)}: ${recoveryErr.message}`);
+      // Verify NO mint exists (Phase 2 health check)
+      const noMintOk = await verifyNoMintExists(marketPubkey);
+      if (!noMintOk) {
+        logger.warn(`⚠️ NO mint missing for ${marketPubkey.slice(0, 8)} — attempting Phase 2 recovery...`);
+        try {
+          await anchorClient.completeMarketV2Phase2(new PublicKey(marketPubkey), 0);
+          const recovered = await verifyNoMintExists(marketPubkey);
+          if (!recovered) {
+            logger.error(`❌ Phase 2 recovery failed for ${marketPubkey.slice(0, 8)} — skipping market`);
             continue;
           }
+          logger.info(`✅ Phase 2 recovery successful for ${marketPubkey.slice(0, 8)}`);
+        } catch (recoveryErr: any) {
+          logger.error(`❌ Phase 2 recovery threw for ${marketPubkey.slice(0, 8)}: ${recoveryErr.message}`);
+          continue;
         }
       }
     } else {
@@ -302,29 +278,3 @@ async function verifyOnChainMarket(pubkey: string): Promise<boolean> {
   return false;
 }
 
-/**
- * Derive the market PDA from seeds
- * Must match on-chain: seeds = [b"market", asset.as_bytes(), timeframe.as_bytes(), expiry_ts.to_le_bytes()]
- * Note: asset and timeframe use raw bytes, NOT padded
- */
-export function deriveMarketPda(
-  asset: string,
-  timeframe: string,
-  expiryTs: number  // Unix timestamp in SECONDS
-): string {
-  // Convert expiry to i64 little-endian bytes
-  const expiryBuffer = Buffer.alloc(8);
-  expiryBuffer.writeBigInt64LE(BigInt(expiryTs), 0);
-  
-  const [pda] = PublicKey.findProgramAddressSync(
-    [
-      Buffer.from('market'),
-      Buffer.from(asset),      // Raw bytes, no padding
-      Buffer.from(timeframe),  // Raw bytes, no padding
-      expiryBuffer,
-    ],
-    PROGRAM_ID
-  );
-  
-  return pda.toBase58();
-}

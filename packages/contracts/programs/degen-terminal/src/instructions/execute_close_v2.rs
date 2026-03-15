@@ -2,17 +2,10 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use anchor_spl::token_interface::{self, Mint as MintInterface, TokenInterface, TokenAccount as TokenAccountInterface, TransferChecked as TransferCheckedInterface};
 use crate::state_v2::{MarketV2, MarketStatusV2, SHARE_TOKEN_DECIMALS};
-use crate::state::{GlobalState, Outcome, SHARE_MULTIPLIER, MIN_PRICE, MAX_PRICE, MIN_ORDER_SIZE, MAX_ORDER_SIZE, MIN_TAKER_FEE};
+use crate::state::{GlobalState, Outcome, SHARE_MULTIPLIER, MIN_PRICE, MAX_PRICE, MIN_ORDER_SIZE, MAX_ORDER_SIZE, MIN_TAKER_FEE, Side};
+use crate::instructions::PlaceOrderArgs;
 use crate::errors::DegenError;
-
-/// Arguments for execute_close_v2 instruction
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct CloseTradeArgsV2 {
-    pub outcome: Outcome,      // YES or NO being sold
-    pub price: u64,            // Execution price (6 decimals)
-    pub size: u64,             // Number of shares (6 decimals)
-    pub taker_fee: u64,        // Fee specified by relayer
-}
+use crate::security::require_order_authorization;
 
 /// Execute a closing trade in a V2 market (tokenized shares)
 ///
@@ -52,7 +45,8 @@ pub struct ExecuteCloseV2<'info> {
     /// Fee recipient's USDC account (regular Token program)
     #[account(
         mut,
-        constraint = fee_recipient.owner == global_state.fee_recipient @ DegenError::Unauthorized
+        constraint = fee_recipient.owner == global_state.fee_recipient @ DegenError::Unauthorized,
+        constraint = fee_recipient.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub fee_recipient: Box<Account<'info, TokenAccount>>,
 
@@ -63,19 +57,15 @@ pub struct ExecuteCloseV2<'info> {
     /// Buyer's USDC account (source of payment, regular Token program)
     #[account(
         mut,
-        constraint = buyer_usdc.owner == buyer.key() @ DegenError::Unauthorized
+        constraint = buyer_usdc.owner == buyer.key() @ DegenError::Unauthorized,
+        constraint = buyer_usdc.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub buyer_usdc: Box<Account<'info, TokenAccount>>,
 
-    /// Buyer's YES token account (Token-2022 ATA, must be pre-created)
-    /// CHECK: Validated manually - must be ATA for buyer+yes_mint
+    /// Buyer's token account for the outcome being purchased (Token-2022 ATA)
+    /// CHECK: Validated manually against seller_args.outcome
     #[account(mut)]
-    pub buyer_yes_ata: AccountInfo<'info>,
-
-    /// Buyer's NO token account (Token-2022 ATA, must be pre-created)
-    /// CHECK: Validated manually - must be ATA for buyer+no_mint
-    #[account(mut)]
-    pub buyer_no_ata: AccountInfo<'info>,
+    pub buyer_token_ata: AccountInfo<'info>,
 
     // Seller accounts (ASK side - sells tokens, receives USDC)
     /// CHECK: Seller wallet - validated by relayer
@@ -84,25 +74,17 @@ pub struct ExecuteCloseV2<'info> {
     /// Seller's USDC account (receives payment, regular Token program)
     #[account(
         mut,
-        constraint = seller_usdc.owner == seller.key() @ DegenError::Unauthorized
+        constraint = seller_usdc.owner == seller.key() @ DegenError::Unauthorized,
+        constraint = seller_usdc.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub seller_usdc: Box<Account<'info, TokenAccount>>,
 
-    /// Seller's YES token account (Token-2022 ATA, source if selling YES)
+    /// Seller's token account for the outcome being sold (Token-2022 ATA)
     #[account(
         mut,
-        constraint = seller_yes_ata.owner == seller.key() @ DegenError::Unauthorized,
-        constraint = seller_yes_ata.mint == yes_mint.key() @ DegenError::InvalidMarketParams
+        constraint = seller_token_ata.owner == seller.key() @ DegenError::Unauthorized
     )]
-    pub seller_yes_ata: Box<InterfaceAccount<'info, TokenAccountInterface>>,
-
-    /// Seller's NO token account (Token-2022 ATA, source if selling NO)
-    #[account(
-        mut,
-        constraint = seller_no_ata.owner == seller.key() @ DegenError::Unauthorized,
-        constraint = seller_no_ata.mint == no_mint.key() @ DegenError::InvalidMarketParams
-    )]
-    pub seller_no_ata: Box<InterfaceAccount<'info, TokenAccountInterface>>,
+    pub seller_token_ata: Box<InterfaceAccount<'info, TokenAccountInterface>>,
 
     /// Relayer that submits the tx (delegate for transfers)
     #[account(mut)]
@@ -112,52 +94,101 @@ pub struct ExecuteCloseV2<'info> {
     pub token_program: Program<'info, Token>,
     /// Token-2022 program for YES/NO share token transfers
     pub share_token_program: Interface<'info, TokenInterface>,
-    pub system_program: Program<'info, System>,
+
+    /// CHECK: Instructions sysvar for Ed25519 verification
+    pub instructions: AccountInfo<'info>,
+    /// CHECK: Session authority PDA when buyer uses a session signer, otherwise placeholder
+    pub buyer_session_authority: AccountInfo<'info>,
+    /// CHECK: Session authority PDA when seller uses a session signer, otherwise placeholder
+    pub seller_session_authority: AccountInfo<'info>,
 }
 
 pub fn execute_close_v2(
     ctx: Context<ExecuteCloseV2>,
-    args: CloseTradeArgsV2,
+    buyer_args: PlaceOrderArgs,
+    seller_args: PlaceOrderArgs,
+    match_size: u64,
+    taker_fee: u64,
+    buyer_signer: Pubkey,
+    seller_signer: Pubkey,
 ) -> Result<()> {
     let global_state = &ctx.accounts.global_state;
     let market = &mut ctx.accounts.market;
     let clock = Clock::get()?;
+    require!(ctx.accounts.relayer.key() == market.authority, DegenError::Unauthorized);
 
-    // Validate buyer ATAs exist (must be pre-created)
-    require!(
-        ctx.accounts.buyer_yes_ata.data_len() > 0,
-        DegenError::InvalidMarketParams
-    );
-    require!(
-        ctx.accounts.buyer_no_ata.data_len() > 0,
-        DegenError::InvalidMarketParams
-    );
+    // Validate buyer token ATA exists and belongs to the expected owner + mint.
+    let validate_buyer_ata = |account: &AccountInfo, expected_owner: &Pubkey, expected_mint: &Pubkey| -> Result<()> {
+        require!(account.data_len() > 0, DegenError::InvalidMarketParams);
+        require!(*account.owner == ctx.accounts.share_token_program.key(), DegenError::InvalidMarketParams);
+        let data = account.try_borrow_data()?;
+        require!(data.len() >= 72, DegenError::InvalidMarketParams);
+        let mint_bytes: [u8; 32] = data[0..32].try_into().unwrap();
+        let owner_bytes: [u8; 32] = data[32..64].try_into().unwrap();
+        require!(Pubkey::new_from_array(mint_bytes) == *expected_mint, DegenError::InvalidMarketParams);
+        require!(Pubkey::new_from_array(owner_bytes) == *expected_owner, DegenError::Unauthorized);
+        Ok(())
+    };
+
+    let expected_mint = match seller_args.outcome {
+        Outcome::Yes => ctx.accounts.yes_mint.key(),
+        Outcome::No => ctx.accounts.no_mint.key(),
+    };
+    validate_buyer_ata(&ctx.accounts.buyer_token_ata, &ctx.accounts.buyer.key(), &expected_mint)?;
+    require!(ctx.accounts.seller_token_ata.mint == expected_mint, DegenError::InvalidMarketParams);
+
+    let market_key = market.key();
+    if buyer_signer != Pubkey::default() {
+        require_order_authorization(
+            &ctx.accounts.instructions,
+            &ctx.accounts.buyer_session_authority,
+            &market_key,
+            &ctx.accounts.buyer.key(),
+            &buyer_signer,
+            &buyer_args,
+        )?;
+    }
+    if seller_signer != Pubkey::default() {
+        require_order_authorization(
+            &ctx.accounts.instructions,
+            &ctx.accounts.seller_session_authority,
+            &market_key,
+            &ctx.accounts.seller.key(),
+            &seller_signer,
+            &seller_args,
+        )?;
+    }
 
     // Validations
     require!(!global_state.paused, DegenError::ProtocolPaused);
     require!(market.status == MarketStatusV2::Open, DegenError::MarketNotOpen);
     require!(market.is_trading_open(clock.unix_timestamp), DegenError::MarketClosing);
     require!(ctx.accounts.buyer.key() != ctx.accounts.seller.key(), DegenError::SelfTrade);
-    require!(args.price >= MIN_PRICE && args.price <= MAX_PRICE, DegenError::InvalidPrice);
-    require!(args.size >= MIN_ORDER_SIZE && args.size <= MAX_ORDER_SIZE, DegenError::InvalidSize);
+    require!(buyer_args.side == Side::Bid, DegenError::SameSide);
+    require!(seller_args.side == Side::Ask, DegenError::SameSide);
+    require!(buyer_args.outcome == seller_args.outcome, DegenError::OutcomeMismatch);
+    require!(buyer_args.price == seller_args.price, DegenError::PriceMismatch);
+    require!(buyer_args.price >= MIN_PRICE && buyer_args.price <= MAX_PRICE, DegenError::InvalidPrice);
+    require!(match_size >= MIN_ORDER_SIZE && match_size <= MAX_ORDER_SIZE, DegenError::InvalidSize);
+    require!(buyer_args.expiry_ts > clock.unix_timestamp, DegenError::OrderExpired);
+    require!(seller_args.expiry_ts > clock.unix_timestamp, DegenError::OrderExpired);
+    require!(match_size <= buyer_args.size, DegenError::InvalidSize);
+    require!(match_size <= seller_args.size, DegenError::InvalidSize);
 
     // Validate seller has enough tokens
-    let seller_token_balance = match args.outcome {
-        Outcome::Yes => ctx.accounts.seller_yes_ata.amount,
-        Outcome::No => ctx.accounts.seller_no_ata.amount,
-    };
-    require!(seller_token_balance >= args.size, DegenError::InsufficientShares);
+    let seller_token_balance = ctx.accounts.seller_token_ata.amount;
+    require!(seller_token_balance >= match_size, DegenError::InsufficientShares);
 
     // Calculate transfer amount: price * size / SHARE_MULTIPLIER
-    let transfer_amount = args.price
-        .checked_mul(args.size).ok_or(DegenError::MathOverflow)?
+    let transfer_amount = buyer_args.price
+        .checked_mul(match_size).ok_or(DegenError::MathOverflow)?
         .checked_add(SHARE_MULTIPLIER - 1).ok_or(DegenError::MathOverflow)?
         .checked_div(SHARE_MULTIPLIER).ok_or(DegenError::DivisionByZero)?;
 
     // Validate minimum fee (covers relayer gas costs)
-    require!(args.taker_fee >= MIN_TAKER_FEE, DegenError::FeeTooLow);
+    require!(taker_fee >= MIN_TAKER_FEE, DegenError::FeeTooLow);
 
-    let fee = args.taker_fee;
+    let fee = taker_fee;
     let seller_receives = transfer_amount.saturating_sub(fee);
 
     // =========================================================================
@@ -210,13 +241,13 @@ pub fn execute_close_v2(
     let signer_seeds = &[&market_seeds[..]];
     let market_account_info = market.to_account_info();
 
-    match args.outcome {
+    match seller_args.outcome {
         Outcome::Yes => {
-            msg!("CloseV2: Transferring {} YES tokens from seller to buyer (Token-2022, PermanentDelegate)", args.size);
+            msg!("CloseV2: Transferring {} YES tokens from seller to buyer (Token-2022, PermanentDelegate)", match_size);
             let cpi_accounts = TransferCheckedInterface {
-                from: ctx.accounts.seller_yes_ata.to_account_info(),
+                from: ctx.accounts.seller_token_ata.to_account_info(),
                 mint: ctx.accounts.yes_mint.to_account_info(),
-                to: ctx.accounts.buyer_yes_ata.to_account_info(),
+                to: ctx.accounts.buyer_token_ata.to_account_info(),
                 authority: market_account_info.clone(),
             };
             let cpi_ctx = CpiContext::new_with_signer(
@@ -224,14 +255,14 @@ pub fn execute_close_v2(
                 cpi_accounts,
                 signer_seeds,
             );
-            token_interface::transfer_checked(cpi_ctx, args.size, SHARE_TOKEN_DECIMALS)?;
+            token_interface::transfer_checked(cpi_ctx, match_size, SHARE_TOKEN_DECIMALS)?;
         }
         Outcome::No => {
-            msg!("CloseV2: Transferring {} NO tokens from seller to buyer (Token-2022, PermanentDelegate)", args.size);
+            msg!("CloseV2: Transferring {} NO tokens from seller to buyer (Token-2022, PermanentDelegate)", match_size);
             let cpi_accounts = TransferCheckedInterface {
-                from: ctx.accounts.seller_no_ata.to_account_info(),
+                from: ctx.accounts.seller_token_ata.to_account_info(),
                 mint: ctx.accounts.no_mint.to_account_info(),
-                to: ctx.accounts.buyer_no_ata.to_account_info(),
+                to: ctx.accounts.buyer_token_ata.to_account_info(),
                 authority: market_account_info.clone(),
             };
             let cpi_ctx = CpiContext::new_with_signer(
@@ -239,7 +270,7 @@ pub fn execute_close_v2(
                 cpi_accounts,
                 signer_seeds,
             );
-            token_interface::transfer_checked(cpi_ctx, args.size, SHARE_TOKEN_DECIMALS)?;
+            token_interface::transfer_checked(cpi_ctx, match_size, SHARE_TOKEN_DECIMALS)?;
         }
     }
 
@@ -252,15 +283,15 @@ pub fn execute_close_v2(
     market.total_trades = market.total_trades.checked_add(1).ok_or(DegenError::MathOverflow)?;
 
     msg!("CloseV2 executed: {} {:?} shares @ {} (transfer={}, fee={})",
-         args.size, args.outcome, args.price, transfer_amount, fee);
+         match_size, seller_args.outcome, buyer_args.price, transfer_amount, fee);
 
     emit!(CloseExecutedV2 {
         market: market.key(),
         buyer: ctx.accounts.buyer.key(),
         seller: ctx.accounts.seller.key(),
-        outcome: args.outcome,
-        price: args.price,
-        size: args.size,
+        outcome: seller_args.outcome,
+        price: buyer_args.price,
+        size: match_size,
         transfer_amount,
         fee,
     });

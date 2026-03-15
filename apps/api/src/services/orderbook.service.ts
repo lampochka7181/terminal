@@ -33,9 +33,7 @@ export interface OrderbookOrder {
   expiresAt?: number;
   signature?: string;
   binaryMessage?: string;
-  leverage?: number;
-  marginAmount?: number;
-  loanAmount?: number;
+  sessionPublicKey?: string;
 }
 
 export interface OrderbookLevel {
@@ -275,10 +273,16 @@ export class OrderbookService {
       userId: order.userId,
       side: order.side,
       outcome: order.outcome,
+      orderType: order.orderType || 'LIMIT',
       price: order.price.toString(),
       size: order.size.toString(),
       remainingSize: order.remainingSize.toString(),
       createdAt: order.createdAt.toString(),
+      clientOrderId: order.clientOrderId?.toString() || '',
+      expiresAt: order.expiresAt?.toString() || '',
+      signature: order.signature || '',
+      binaryMessage: order.binaryMessage || '',
+      sessionPublicKey: order.sessionPublicKey || '',
     });
     pipe.expire(orderKey, 86400);
 
@@ -431,13 +435,16 @@ export class OrderbookService {
         userId: data.userId,
         side: data.side as 'BID' | 'ASK',
         outcome: data.outcome as 'YES' | 'NO',
+        orderType: data.orderType as 'LIMIT' | 'MARKET' | 'IOC' | 'FOK' | undefined,
         price: parseFloat(data.price),
         size: parseFloat(data.size),
         remainingSize: parseFloat(data.remainingSize),
         createdAt: parseInt(data.createdAt),
         clientOrderId: data.clientOrderId ? parseInt(data.clientOrderId) : undefined,
+        expiresAt: data.expiresAt ? parseInt(data.expiresAt) : undefined,
         signature: data.signature || undefined,
         binaryMessage: data.binaryMessage || undefined,
+        sessionPublicKey: data.sessionPublicKey || undefined,
       });
     }
 
@@ -539,13 +546,16 @@ export class OrderbookService {
       userId: data.userId,
       side: data.side as 'BID' | 'ASK',
       outcome: data.outcome as 'YES' | 'NO',
+      orderType: data.orderType as 'LIMIT' | 'MARKET' | 'IOC' | 'FOK' | undefined,
       price: parseFloat(data.price),
       size: parseFloat(data.size),
       remainingSize: parseFloat(data.remainingSize),
       createdAt: parseInt(data.createdAt),
       clientOrderId: data.clientOrderId ? parseInt(data.clientOrderId) : undefined,
+      expiresAt: data.expiresAt ? parseInt(data.expiresAt) : undefined,
       signature: data.signature || undefined,
       binaryMessage: data.binaryMessage || undefined,
+      sessionPublicKey: data.sessionPublicKey || undefined,
     };
   }
 

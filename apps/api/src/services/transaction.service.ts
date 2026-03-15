@@ -1,11 +1,12 @@
-import { PublicKey, Keypair } from '@solana/web3.js';
-import { BN } from '@coral-xyz/anchor';
+import { PublicKey } from '@solana/web3.js';
+import bs58 from 'bs58';
+import nacl from 'tweetnacl';
 import { config } from '../config.js';
 import { logger } from '../lib/logger.js';
-import { anchorClient, PlaceOrderArgs, getYesMintPda, getNoMintPda } from '../lib/anchor-client.js';
+import { anchorClient, getYesMintPda, getNoMintPda } from '../lib/anchor-client.js';
+import { canonicalOrderMessageToBase64 } from '../lib/order-auth.js';
 import { orderService } from './order.service.js';
 import { userService } from './user.service.js';
-import { lendingService } from './lending.service.js';
 import { db, trades } from '../db/index.js';
 import { eq } from 'drizzle-orm';
 
@@ -40,6 +41,8 @@ export interface MatchParams {
   takerFee: number;  // Fee in USD calculated by fee.service.ts
   makerSide: 'BID' | 'ASK';
   takerSide: 'BID' | 'ASK';
+  makerOrderType?: 'LIMIT' | 'MARKET' | 'IOC' | 'FOK';
+  takerOrderType?: 'LIMIT' | 'MARKET' | 'IOC' | 'FOK';
   outcome: 'YES' | 'NO';
   makerClientOrderId: number;
   takerClientOrderId: number;
@@ -53,21 +56,13 @@ export interface MatchParams {
   takerSignature?: string;  // Base58 encoded
   makerMessage?: string;    // Base64 encoded binary message
   takerMessage?: string;    // Base64 encoded binary message
-  // V2 tokenized shares (optional - only for V2 markets)
-  yesMint?: string;         // YES token mint pubkey
-  noMint?: string;          // NO token mint pubkey
-  useV2?: boolean;          // Force V2 execution
+  makerSessionPublicKey?: string;
+  takerSessionPublicKey?: string;
+  // Tokenized shares mint overrides (derived from market if not provided)
+  yesMint?: string;
+  noMint?: string;
   // Relayer pool: child wallet as fee payer
   feePayerKeypair?: import('@solana/web3.js').Keypair;
-}
-
-export interface SettlementParams {
-  marketPubkey: string;
-  userWallet: string;
-  positionId: string;
-  outcome: 'YES' | 'NO';
-  size: number;
-  payout: number;
 }
 
 export interface CloseParams {
@@ -81,40 +76,29 @@ export interface CloseParams {
   tradeId?: string;  // Optional trade ID to update with tx signature
   makerOrderId?: string;  // For updating trade by order IDs
   takerOrderId?: string;  // For updating trade by order IDs
-  // V2 tokenized shares (optional - only for V2 markets)
-  yesMint?: string;         // YES token mint pubkey
-  noMint?: string;          // NO token mint pubkey
-  useV2?: boolean;          // Force V2 execution
+  buyerOrderType?: 'LIMIT' | 'MARKET' | 'IOC' | 'FOK';
+  sellerOrderType?: 'LIMIT' | 'MARKET' | 'IOC' | 'FOK';
+  buyerClientOrderId?: number;
+  sellerClientOrderId?: number;
+  buyerExpiryTs?: number;
+  sellerExpiryTs?: number;
+  buyerSignature?: string;
+  sellerSignature?: string;
+  buyerMessage?: string;
+  sellerMessage?: string;
+  buyerSessionPublicKey?: string;
+  sellerSessionPublicKey?: string;
+  // Tokenized shares mint overrides (derived from market if not provided)
+  yesMint?: string;
+  noMint?: string;
   // Relayer pool: child wallet as fee payer
   feePayerKeypair?: import('@solana/web3.js').Keypair;
-}
-
-// Leveraged match params - Lending Pool executes on behalf of user
-export interface LeveragedMatchParams {
-  marketPubkey: string;
-  makerOrderId: string;
-  takerOrderId: string;
-  makerWallet: string;        // MM wallet (selling)
-  userWallet: string;         // User wallet (for tracking, receives position in DB)
-  price: number;
-  matchSize: number;
-  takerFee: number;
-  makerSide: 'BID' | 'ASK';
-  takerSide: 'BID' | 'ASK';
-  outcome: 'YES' | 'NO';
-  makerClientOrderId: number;
-  takerClientOrderId: number;
-  makerExpiryTs?: number;
-  takerExpiryTs?: number;
-  // Leverage info
-  leverage: number;
-  marginAmount: number;
-  loanAmount: number;
 }
 
 interface TransactionResult {
   success: boolean;
   signature?: string;
+  pendingConfirmation?: boolean;
   error?: string;
   errorCode?: string;
 }
@@ -157,69 +141,48 @@ class TransactionService {
           throw new Error(`Could not resolve user wallet addresses: maker=${makerWallet || 'null'}, taker=${takerWallet || 'null'}`);
         }
 
-        // Execute on-chain match
-        // - User orders: have Order PDAs with escrowed USDC (trustless)
-        // - MM orders: no Order PDA, uses delegation for USDC transfer
-        let signature: string;
+        const hydratedParams = this.hydrateMatchAuth(params, makerWallet, takerWallet);
 
-        // Check if V2 mode is enabled (globally or per-request)
-        const useV2 = params.useV2 ?? config.useV2;
+        // Execute on-chain match (V2: tokenized shares)
+        const marketPubkey = new PublicKey(hydratedParams.marketPubkey);
+        const yesMint = hydratedParams.yesMint || getYesMintPda(marketPubkey).toBase58();
+        const noMint = hydratedParams.noMint || getNoMintPda(marketPubkey).toBase58();
 
-        if (useV2) {
-          // V2: Tokenized shares - mint YES/NO tokens instead of creating Position PDAs
-          const marketPubkey = new PublicKey(params.marketPubkey);
-          const yesMint = params.yesMint || getYesMintPda(marketPubkey).toBase58();
-          const noMint = params.noMint || getNoMintPda(marketPubkey).toBase58();
+        logger.info(`[V2] Executing match: ${hydratedParams.matchSize} shares @ $${hydratedParams.price}`);
 
-          logger.info(`[V2] Executing match: ${params.matchSize} shares @ $${params.price}`);
+        const result = await anchorClient.executeMatchV2({
+          marketPubkey: hydratedParams.marketPubkey,
+          yesMint,
+          noMint,
+          makerWallet,
+          takerWallet,
+          makerSide: hydratedParams.makerSide,
+          takerSide: hydratedParams.takerSide,
+          makerOrderType: hydratedParams.makerOrderType || 'LIMIT',
+          takerOrderType: hydratedParams.takerOrderType || 'LIMIT',
+          outcome: hydratedParams.outcome,
+          price: hydratedParams.price,
+          matchSize: hydratedParams.matchSize,
+          takerFee: hydratedParams.takerFee,
+          makerClientOrderId: hydratedParams.makerClientOrderId,
+          takerClientOrderId: hydratedParams.takerClientOrderId,
+          makerExpiryTs: hydratedParams.makerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
+          takerExpiryTs: hydratedParams.takerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
+          makerOrderPda: hydratedParams.makerOrderPda,
+          takerOrderPda: hydratedParams.takerOrderPda,
+          makerSignature: hydratedParams.makerSignature,
+          takerSignature: hydratedParams.takerSignature,
+          makerMessage: hydratedParams.makerMessage,
+          takerMessage: hydratedParams.takerMessage,
+          makerSessionPublicKey: hydratedParams.makerSessionPublicKey,
+          takerSessionPublicKey: hydratedParams.takerSessionPublicKey,
+          feePayerKeypair: hydratedParams.feePayerKeypair,
+        });
 
-          signature = await anchorClient.executeMatchV2({
-            marketPubkey: params.marketPubkey,
-            yesMint,
-            noMint,
-            makerWallet,
-            takerWallet,
-            makerSide: params.makerSide,
-            takerSide: params.takerSide,
-            outcome: params.outcome,
-            price: params.price,
-            matchSize: params.matchSize,
-            takerFee: params.takerFee,
-            makerClientOrderId: params.makerClientOrderId,
-            takerClientOrderId: params.takerClientOrderId,
-            makerExpiryTs: params.makerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
-            takerExpiryTs: params.takerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
-            makerOrderPda: params.makerOrderPda,
-            takerOrderPda: params.takerOrderPda,
-            feePayerKeypair: params.feePayerKeypair,
-          });
-        } else {
-          // V1: Position PDAs
-          signature = await anchorClient.executeMatch({
-            marketPubkey: params.marketPubkey,
-            makerWallet,
-            takerWallet,
-            makerSide: params.makerSide,
-            takerSide: params.takerSide,
-            outcome: params.outcome,
-            price: params.price,
-            matchSize: params.matchSize,
-            takerFee: params.takerFee,  // Tiered fee from fee.service.ts
-            makerClientOrderId: params.makerClientOrderId,
-            takerClientOrderId: params.takerClientOrderId,
-            makerExpiryTs: params.makerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
-            takerExpiryTs: params.takerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
-            // Order PDAs for user orders (enables trustless escrow)
-            makerOrderPda: params.makerOrderPda,
-            takerOrderPda: params.takerOrderPda,
-            feePayerKeypair: params.feePayerKeypair,
-          });
-        }
+        // Persist the submitted signature without over-claiming confirmation.
+        await this.handleMatchSuccess(params, result.signature, result.confirmed ? 'CONFIRMED' : 'PENDING');
 
-        // Update database on success
-        await this.handleMatchSuccess(params, signature);
-
-        return { success: true, signature };
+        return { success: true, signature: result.signature, pendingConfirmation: !result.confirmed };
       } catch (err: any) {
         lastError = err;
         logger.warn(`Match tx attempt ${attempt} failed: ${err.message}`);
@@ -245,172 +208,6 @@ class TransactionService {
 
     // All retries exhausted
     await this.handleMatchFailure(params, lastError!);
-    return {
-      success: false,
-      error: lastError?.message || 'Max retries exceeded',
-      errorCode: 'MAX_RETRIES',
-    };
-  }
-
-  /**
-   * Execute a LEVERAGED match transaction on Solana
-   * 
-   * Key difference: The Lending Pool wallet executes the trade on-chain,
-   * using its own funds. The position is owned by Lending Pool on-chain,
-   * but tracked to the user in the database.
-   * 
-   * PREREQUISITE: The Lending Pool must have delegation set up to the relayer.
-   * Run: npx ts-node apps/api/src/scripts/setup-lending-delegation.ts
-   */
-  async executeLeveragedMatch(params: LeveragedMatchParams): Promise<TransactionResult> {
-    // Get lending pool wallet address
-    const lendingWalletPubkey = lendingService.getLendingWalletPubkey();
-    if (!lendingWalletPubkey) {
-      return {
-        success: false,
-        error: 'Lending pool not configured',
-        errorCode: 'LENDING_NOT_CONFIGURED',
-      };
-    }
-
-    const lendingPoolWallet = lendingWalletPubkey.toBase58();
-
-    if (!anchorClient.isReady()) {
-      if (!config.perfTestMode) {
-        logger.error(`[TX] Anchor client not ready and PERF_TEST_MODE is off — rejecting leveraged match.`);
-        return {
-          success: false,
-          error: 'On-chain client not ready — cannot execute leveraged trade',
-          errorCode: 'CLIENT_NOT_READY',
-        };
-      }
-      const simSignature = `sim_leveraged_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-      logger.warn(`[SIMULATION] Leveraged Match: LendingPool ${lendingPoolWallet.slice(0,8)} buying for user ${params.userWallet.slice(0,8)} - ${params.matchSize} @ ${params.price}`);
-
-      await this.updateTradeStatus(params.makerOrderId, params.takerOrderId, simSignature);
-
-      return {
-        success: true,
-        signature: simSignature,
-      };
-    }
-
-    // STEP 1: Collect user's margin and lock it in Lending Pool
-    // This ensures we have the user's collateral BEFORE executing the leveraged trade
-    const relayerKeypair = anchorClient.getRelayerKeypair();
-    if (!relayerKeypair) {
-      return {
-        success: false,
-        error: 'Relayer not configured',
-        errorCode: 'RELAYER_NOT_CONFIGURED',
-      };
-    }
-    
-    // Collect margin + trading fee from user
-    // The fee covers the Lending Pool's on-chain transaction fee (it's the taker)
-    const totalToCollect = params.marginAmount + params.takerFee;
-    logger.info(`[Leveraged] Step 1: Collecting $${totalToCollect.toFixed(2)} (margin: $${params.marginAmount.toFixed(2)} + fee: $${params.takerFee.toFixed(2)}) from user ${params.userWallet.slice(0,8)} → Lending Pool`);
-    
-    const marginTxSig = await lendingService.collectMarginFromUser(
-      params.userWallet,
-      totalToCollect,  // Collect margin + fee
-      relayerKeypair
-    );
-    
-    if (!marginTxSig) {
-      return {
-        success: false,
-        error: 'Failed to collect user margin - check delegation is set up',
-        errorCode: 'MARGIN_COLLECTION_FAILED',
-      };
-    }
-    
-    logger.info(`[Leveraged] Margin collected: ${marginTxSig}`);
-
-    // STEP 2: Execute the leveraged trade
-    let lastError: Error | null = null;
-
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        logger.info(`[Leveraged] Step 2: Lending Pool ${lendingPoolWallet.slice(0,8)} executing trade for user ${params.userWallet.slice(0,8)}`);
-        logger.info(`[Leveraged] ${params.matchSize.toFixed(2)} shares @ $${params.price} (${params.leverage}x leverage, margin: $${params.marginAmount}, loan: $${params.loanAmount})`);
-
-        // Execute the leveraged match - Lending Pool wallet is the taker (buyer)
-        // The relayer has delegation authority over Lending Pool's USDC (same as MM)
-        const signature = await anchorClient.executeLeveragedMatch({
-          marketPubkey: params.marketPubkey,
-          makerWallet: params.makerWallet,
-          lendingPoolWallet: lendingPoolWallet,
-          userWallet: params.userWallet,
-          makerSide: params.makerSide,
-          takerSide: params.takerSide,
-          outcome: params.outcome,
-          price: params.price,
-          matchSize: params.matchSize,
-          takerFee: params.takerFee,
-          makerClientOrderId: params.makerClientOrderId,
-          takerClientOrderId: params.takerClientOrderId,
-          makerExpiryTs: params.makerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
-          takerExpiryTs: params.takerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
-        });
-
-        // Update database on success
-        await this.updateTradeStatus(params.makerOrderId, params.takerOrderId, signature);
-        
-        logger.info(`[Leveraged] Match success: ${signature}`);
-
-        return { success: true, signature };
-      } catch (err: any) {
-        lastError = err;
-        logger.warn(`Leveraged match tx attempt ${attempt} failed: ${err.message}`);
-
-        // Check if this is a permanent failure
-        const permanentError = this.isPermanentError(err);
-        if (permanentError) {
-          // ROLLBACK: Trade permanently failed - return margin + fee to user
-          logger.warn(`[Leveraged] Permanent error after margin collection. Rolling back: returning $${totalToCollect.toFixed(2)} to user ${params.userWallet.slice(0,8)}`);
-          
-          try {
-            const rollbackSig = await lendingService.transferToUser(params.userWallet, totalToCollect);
-            if (rollbackSig) {
-              logger.info(`[Leveraged] Rollback successful: Tx ${rollbackSig}`);
-            } else {
-              logger.error(`[Leveraged] CRITICAL: Rollback failed for permanent error! User ${params.userWallet} has $${totalToCollect.toFixed(2)} stuck.`);
-            }
-          } catch (rollbackErr: any) {
-            logger.error(`[Leveraged] CRITICAL: Rollback exception! ${rollbackErr.message}`);
-          }
-          
-          return {
-            success: false,
-            error: err.message,
-            errorCode: permanentError,
-          };
-        }
-
-        // Wait before retry
-        if (attempt < MAX_RETRIES) {
-          const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-          await this.sleep(delay);
-        }
-      }
-    }
-
-    // ROLLBACK: Trade failed after margin was collected - return margin + fee to user
-    logger.warn(`[Leveraged] Trade failed after margin collection. Rolling back: returning $${totalToCollect.toFixed(2)} to user ${params.userWallet.slice(0,8)}`);
-    
-    try {
-      const rollbackSig = await lendingService.transferToUser(params.userWallet, totalToCollect);
-      if (rollbackSig) {
-        logger.info(`[Leveraged] Rollback successful: $${totalToCollect.toFixed(2)} returned to user. Tx: ${rollbackSig}`);
-      } else {
-        // Critical: margin stuck in lending pool
-        logger.error(`[Leveraged] CRITICAL: Rollback failed! User ${params.userWallet} has $${totalToCollect.toFixed(2)} stuck in lending pool. Manual intervention required.`);
-      }
-    } catch (rollbackErr: any) {
-      logger.error(`[Leveraged] CRITICAL: Rollback exception! User ${params.userWallet} has $${totalToCollect.toFixed(2)} stuck. Error: ${rollbackErr.message}`);
-    }
-
     return {
       success: false,
       error: lastError?.message || 'Max retries exceeded',
@@ -446,53 +243,46 @@ class TransactionService {
 
     let lastError: Error | null = null;
 
-    // Check if V2 mode is enabled (globally or per-request)
-    const useV2 = params.useV2 ?? config.useV2;
-
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        let signature: string;
+        const hydratedParams = this.hydrateCloseAuth(params);
+        const marketPubkey = new PublicKey(hydratedParams.marketPubkey);
+        const yesMint = hydratedParams.yesMint || getYesMintPda(marketPubkey).toBase58();
+        const noMint = hydratedParams.noMint || getNoMintPda(marketPubkey).toBase58();
 
-        if (useV2) {
-          // V2: Tokenized shares - transfer tokens between wallets
-          const marketPubkey = new PublicKey(params.marketPubkey);
-          const yesMint = params.yesMint || getYesMintPda(marketPubkey).toBase58();
-          const noMint = params.noMint || getNoMintPda(marketPubkey).toBase58();
+        logger.info(`[V2] Executing close: ${hydratedParams.matchSize} shares @ $${hydratedParams.price}`);
 
-          logger.info(`[V2] Executing close: ${params.matchSize} shares @ $${params.price}`);
+        const result = await anchorClient.executeCloseV2({
+          marketPubkey: hydratedParams.marketPubkey,
+          yesMint,
+          noMint,
+          buyerWallet: hydratedParams.buyerWallet,
+          sellerWallet: hydratedParams.sellerWallet,
+          outcome: hydratedParams.outcome,
+          price: hydratedParams.price,
+          matchSize: hydratedParams.matchSize,
+          takerFee: hydratedParams.takerFee,
+          buyerOrderType: hydratedParams.buyerOrderType || 'LIMIT',
+          sellerOrderType: hydratedParams.sellerOrderType || 'LIMIT',
+          buyerClientOrderId: hydratedParams.buyerClientOrderId || Date.now(),
+          sellerClientOrderId: hydratedParams.sellerClientOrderId || Date.now(),
+          buyerExpiryTs: hydratedParams.buyerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
+          sellerExpiryTs: hydratedParams.sellerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
+          buyerSignature: hydratedParams.buyerSignature,
+          sellerSignature: hydratedParams.sellerSignature,
+          buyerMessage: hydratedParams.buyerMessage,
+          sellerMessage: hydratedParams.sellerMessage,
+          buyerSessionPublicKey: hydratedParams.buyerSessionPublicKey,
+          sellerSessionPublicKey: hydratedParams.sellerSessionPublicKey,
+          feePayerKeypair: hydratedParams.feePayerKeypair,
+        });
 
-          signature = await anchorClient.executeCloseV2({
-            marketPubkey: params.marketPubkey,
-            yesMint,
-            noMint,
-            buyerWallet: params.buyerWallet,
-            sellerWallet: params.sellerWallet,
-            outcome: params.outcome,
-            price: params.price,
-            matchSize: params.matchSize,
-            takerFee: params.takerFee,
-            feePayerKeypair: params.feePayerKeypair,
-          });
-        } else {
-          // V1: Position PDAs
-          signature = await anchorClient.executeClose({
-            marketPubkey: params.marketPubkey,
-            buyerWallet: params.buyerWallet,
-            sellerWallet: params.sellerWallet,
-            outcome: params.outcome,
-            price: params.price,
-            matchSize: params.matchSize,
-            takerFee: params.takerFee,  // Tiered fee from fee.service.ts
-            feePayerKeypair: params.feePayerKeypair,
-          });
-        }
-
-        logger.debug(`Close trade executed on-chain: ${signature}`);
+        logger.debug(`Close trade executed on-chain: ${result.signature} (confirmed=${result.confirmed})`);
         
-        // Update trade with tx signature
-        await this.updateCloseTradeSignature(params, signature);
+        // Persist the submitted signature without over-claiming confirmation.
+        await this.updateCloseTradeSignature(params, result.signature, result.confirmed ? 'CONFIRMED' : 'PENDING');
         
-        return { success: true, signature };
+        return { success: true, signature: result.signature, pendingConfirmation: !result.confirmed };
       } catch (err: any) {
         lastError = err;
         logger.warn(`Close tx attempt ${attempt} failed: ${err.message}`);
@@ -520,81 +310,38 @@ class TransactionService {
     };
   }
 
-  /**
-   * Execute a settlement transaction
-   */
-  async executeSettlement(params: SettlementParams): Promise<TransactionResult> {
-    if (!anchorClient.isReady()) {
-      if (!config.perfTestMode) {
-        logger.error(`[TX] Anchor client not ready and PERF_TEST_MODE is off — rejecting settlement.`);
-        return {
-          success: false,
-          error: 'On-chain client not ready — cannot execute settlement',
-          errorCode: 'CLIENT_NOT_READY',
-        };
-      }
-      logger.warn(`[SIMULATION] Settlement: ${params.positionId} → ${params.payout} USDC`);
-      return {
-        success: true,
-        signature: `sim_settle_${Date.now()}`,
-      };
-    }
-
-    let lastError: Error | null = null;
-
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        const signature = await anchorClient.settlePosition({
-          marketPubkey: params.marketPubkey,
-          userWallet: params.userWallet,
-        });
-
-        return { success: true, signature };
-      } catch (err: any) {
-        lastError = err;
-        
-        // PositionAlreadySettled (0x178b = 6027) means another process settled it - treat as success
-        if (err.message?.includes('PositionAlreadySettled') || err.message?.includes('0x178b')) {
-          logger.debug(`Position ${params.positionId} already settled on-chain, treating as success`);
-          return { success: true, signature: 'already_settled' };
-        }
-        
-        logger.warn(`Settlement tx attempt ${attempt} failed: ${err.message}`);
-
-        if (attempt < MAX_RETRIES) {
-          const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-          await this.sleep(delay);
-        }
-      }
-    }
-
-    return {
-      success: false,
-      error: lastError?.message || 'Settlement failed',
-      errorCode: 'MAX_RETRIES',
-    };
-  }
 
   /**
    * Handle successful match - update database
    */
-  private async handleMatchSuccess(params: MatchParams, signature: string): Promise<void> {
-    await this.updateTradeStatus(params.makerOrderId, params.takerOrderId, signature);
-    logger.info(`Match success: market=${params.marketPubkey.slice(0,8)}, size=${params.matchSize}, tx=${signature}`);
+  private async handleMatchSuccess(
+    params: MatchParams,
+    signature: string,
+    status: 'PENDING' | 'CONFIRMED'
+  ): Promise<void> {
+    await this.updateTradeStatus(params.makerOrderId, params.takerOrderId, signature, status);
+    logger.info(
+      `Match success: market=${params.marketPubkey.slice(0,8)}, size=${params.matchSize}, tx=${signature}, status=${status}`
+    );
   }
 
   /**
    * Update trade transaction status
    */
-  private async updateTradeStatus(makerOrderId: string, takerOrderId: string, signature: string): Promise<void> {
+  private async updateTradeStatus(
+    makerOrderId: string,
+    takerOrderId: string,
+    signature: string,
+    status: 'PENDING' | 'CONFIRMED' = 'CONFIRMED'
+  ): Promise<void> {
     const updateData = {
       txSignature: signature,
-      txStatus: signature.startsWith('sim_') ? 'PENDING' as const : 'CONFIRMED' as const,
-      confirmedAt: signature.startsWith('sim_') ? null : new Date(),
+      txStatus: signature.startsWith('sim_') ? 'PENDING' as const : status,
+      confirmedAt: signature.startsWith('sim_') || status !== 'CONFIRMED' ? null : new Date(),
     };
 
     // Skip makerOrderId lookup for synthetic MM orders (they're stored with null makerOrderId)
-    const isSyntheticMaker = makerOrderId.startsWith('mm_synth_') || makerOrderId.startsWith('aggregated-mm-');
+    const isSyntheticMaker = makerOrderId.startsWith('mm_synth_') || makerOrderId.startsWith('mm_bailout_') || makerOrderId.startsWith('aggregated-mm-');
     
     if (!isSyntheticMaker) {
       // Update trades table by maker order ID
@@ -618,11 +365,15 @@ class TransactionService {
    * Update trade with tx signature by trade ID
    * Used for close transactions where we have the trade ID directly
    */
-  private async updateTradeSignature(tradeId: string, signature: string): Promise<void> {
+  private async updateTradeSignature(
+    tradeId: string,
+    signature: string,
+    status: 'PENDING' | 'CONFIRMED' = 'CONFIRMED'
+  ): Promise<void> {
     const updateData = {
       txSignature: signature,
-      txStatus: signature.startsWith('sim_') ? 'PENDING' as const : 'CONFIRMED' as const,
-      confirmedAt: signature.startsWith('sim_') ? null : new Date(),
+      txStatus: signature.startsWith('sim_') ? 'PENDING' as const : status,
+      confirmedAt: signature.startsWith('sim_') || status !== 'CONFIRMED' ? null : new Date(),
     };
 
     await db
@@ -637,11 +388,15 @@ class TransactionService {
    * Update close trade with tx signature
    * Uses tradeId if available, otherwise falls back to order IDs
    */
-  private async updateCloseTradeSignature(params: CloseParams, signature: string): Promise<void> {
+  private async updateCloseTradeSignature(
+    params: CloseParams,
+    signature: string,
+    status: 'PENDING' | 'CONFIRMED' = 'CONFIRMED'
+  ): Promise<void> {
     if (params.tradeId) {
-      await this.updateTradeSignature(params.tradeId, signature);
+      await this.updateTradeSignature(params.tradeId, signature, status);
     } else if (params.makerOrderId && params.takerOrderId) {
-      await this.updateTradeStatus(params.makerOrderId, params.takerOrderId, signature);
+      await this.updateTradeStatus(params.makerOrderId, params.takerOrderId, signature, status);
     }
     // If neither is provided, signature won't be saved (legacy code path)
   }
@@ -667,13 +422,19 @@ class TransactionService {
    * Check if error is permanent (shouldn't retry)
    */
   private isPermanentError(error: Error): string | null {
-    const message = error.message.toLowerCase();
+    const message = String(error?.message || '').toLowerCase();
 
     if (message.includes('insufficient funds') || message.includes('insufficient balance')
         || message.includes('"custom":1}')) {  // SPL Token error 0x1 = insufficient funds
       return 'INSUFFICIENT_FUNDS';
     }
     if (message.includes('insufficientshares') || message.includes('insufficient shares') || message.includes('0x178d')) {
+      return 'INSUFFICIENT_SHARES';
+    }
+    if (message.includes('no_sellable_balance')) {
+      return 'INSUFFICIENT_SHARES';
+    }
+    if (message.includes('pending_position_sync')) {
       return 'INSUFFICIENT_SHARES';
     }
     if (message.includes('feetoolow') || message.includes('fee too low') || message.includes('0x1773')) {
@@ -718,6 +479,85 @@ class TransactionService {
    */
   private getErrorCode(error: Error): string {
     return this.isPermanentError(error) || 'TRANSACTION_FAILED';
+  }
+
+  private hydrateMatchAuth(params: MatchParams, makerWallet: string, takerWallet: string): MatchParams {
+    const mmKeypair = anchorClient.getMmKeypair();
+    const mmWallet = mmKeypair?.publicKey.toBase58();
+    if (!mmKeypair || !mmWallet) {
+      return params;
+    }
+
+    const next = { ...params, makerWallet, takerWallet };
+
+    if (makerWallet === mmWallet && !next.makerOrderPda && (!next.makerSignature || !next.makerMessage)) {
+      logger.warn('[TX] Rebuilt missing MM auth proof for maker order');
+      const message = canonicalOrderMessageToBase64({
+        marketAddress: next.marketPubkey,
+        walletAddress: makerWallet,
+        signerPublicKey: makerWallet,
+        side: next.makerSide,
+        outcome: next.outcome,
+        orderType: next.makerOrderType || 'LIMIT',
+        price: next.price,
+        size: next.matchSize,
+        expiryTs: next.makerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
+        clientOrderId: next.makerClientOrderId,
+      });
+      next.makerMessage = message;
+      next.makerSignature = bs58.encode(
+        nacl.sign.detached(Buffer.from(message, 'base64'), mmKeypair.secretKey)
+      );
+    }
+
+    if (takerWallet === mmWallet && !next.takerOrderPda && (!next.takerSignature || !next.takerMessage)) {
+      logger.warn('[TX] Rebuilt missing MM auth proof for taker order');
+      const message = canonicalOrderMessageToBase64({
+        marketAddress: next.marketPubkey,
+        walletAddress: takerWallet,
+        signerPublicKey: takerWallet,
+        side: next.takerSide,
+        outcome: next.outcome,
+        orderType: next.takerOrderType || 'LIMIT',
+        price: next.price,
+        size: next.matchSize,
+        expiryTs: next.takerExpiryTs || Math.floor(Date.now() / 1000) + 3600,
+        clientOrderId: next.takerClientOrderId,
+      });
+      next.takerMessage = message;
+      next.takerSignature = bs58.encode(
+        nacl.sign.detached(Buffer.from(message, 'base64'), mmKeypair.secretKey)
+      );
+    }
+
+    return next;
+  }
+
+  private hydrateCloseAuth(params: CloseParams): CloseParams {
+    const mmKeypair = anchorClient.getMmKeypair();
+    const mmWallet = mmKeypair?.publicKey.toBase58();
+    if (!mmKeypair || !mmWallet) {
+      return params;
+    }
+
+    const next = { ...params };
+
+    // MM orders are authorized out-of-band and should not carry Ed25519 auth
+    // in close txs; otherwise the extra verify ix can push relayed closes over
+    // Solana's 1232-byte limit during fast repeated trading.
+    if (next.buyerWallet === mmWallet) {
+      next.buyerMessage = undefined;
+      next.buyerSignature = undefined;
+      next.buyerSessionPublicKey = undefined;
+    }
+
+    if (next.sellerWallet === mmWallet) {
+      next.sellerMessage = undefined;
+      next.sellerSignature = undefined;
+      next.sellerSessionPublicKey = undefined;
+    }
+
+    return next;
   }
 
   /**

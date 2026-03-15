@@ -1,11 +1,14 @@
 pub mod initialize_global;
 pub mod initialize_market;
 pub mod activate_market;
+pub mod create_session_authority;
+pub mod create_session_authority_by_sig;
 pub mod place_order;
 pub mod cancel_order;
 pub mod cancel_order_by_relayer;
 pub mod execute_match;
 pub mod execute_close;
+pub mod revoke_session_authority;
 pub mod resolve_market;
 pub mod settle_positions;
 pub mod close_market;
@@ -21,6 +24,7 @@ pub mod resolve_market_v2;
 
 // V2 merkle settlement instructions
 pub mod post_merkle_root;
+pub mod init_settlement_bitmap;
 pub mod resolve_and_post_merkle_root_v2;
 pub mod batch_settle_v2;
 pub mod batch_settle_v3;
@@ -31,11 +35,14 @@ pub mod close_market_v2;
 pub use initialize_global::*;
 pub use initialize_market::*;
 pub use activate_market::*;
+pub use create_session_authority::*;
+pub use create_session_authority_by_sig::*;
 pub use place_order::*;
 pub use cancel_order::*;
 pub use cancel_order_by_relayer::*;
 pub use execute_match::*;
 pub use execute_close::*;
+pub use revoke_session_authority::*;
 pub use resolve_market::*;
 pub use settle_positions::*;
 pub use close_market::*;
@@ -51,6 +58,7 @@ pub use resolve_market_v2::*;
 
 // V2 merkle settlement exports
 pub use post_merkle_root::*;
+pub use init_settlement_bitmap::*;
 pub use resolve_and_post_merkle_root_v2::*;
 pub use batch_settle_v2::*;
 pub use batch_settle_v3::*;

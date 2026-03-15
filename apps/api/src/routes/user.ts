@@ -1,14 +1,13 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
-import { or, eq, desc, sql } from 'drizzle-orm';
+import { or, eq, desc } from 'drizzle-orm';
 import { requireAuth, getCurrentUserId, getCurrentWallet } from '../lib/auth.js';
 import { positionService } from '../services/position.service.js';
 import { orderService } from '../services/order.service.js';
 import { userService } from '../services/user.service.js';
 import { marketService } from '../services/market.service.js';
-import { marginService } from '../services/margin.service.js';
 import { anchorClient } from '../lib/anchor-client.js';
-import { db, trades, settlements, markets, positions, liquidations, marginAccounts, orders } from '../db/index.js';
+import { db, trades, settlements, markets, positions } from '../db/index.js';
 import { logger } from '../lib/logger.js';
 
 // Validation schemas
@@ -117,22 +116,12 @@ export async function userRoutes(app: FastifyInstance) {
         logger.warn(`[User Positions] High concurrent requests: ${concurrentPositionRequests}`);
       }
       
-    const [positions, marginAccountsList] = await Promise.all([
-      positionService.getUserPositions(userId, status),
-      marginService.getUserMarginAccounts(userId),
-    ]);
+    const positions = await positionService.getUserPositions(userId, status);
       
       const duration = Date.now() - startTime;
       if (duration > 200) {
         logger.debug(`[User Positions] Query took ${duration}ms (${positions.length} positions, concurrent=${concurrentPositionRequests})`);
       }
-
-    // Create a map of market+outcome -> margin account for quick lookup
-    const marginAccountMap = new Map<string, typeof marginAccountsList[0]>();
-    for (const ma of marginAccountsList) {
-      const key = `${ma.marketId}-${ma.side}`;
-      marginAccountMap.set(key, ma);
-    }
 
     // Truncate to 6 decimals to match on-chain precision
     const truncate6 = (n: number) => Math.floor(n * 1_000_000) / 1_000_000;
@@ -149,11 +138,7 @@ export async function userRoutes(app: FastifyInstance) {
       const shares = yesShares > 0 ? yesShares : noShares;
       const unrealizedPnL = shares * (currentPrice - avgEntry);
 
-      // Look up margin account for this position (use p.marketId, not p.market.id)
-      const side = yesShares > 0 ? 'YES' : 'NO';
-      const marginAccount = marginAccountMap.get(`${p.marketId}-${side}`);
-
-      const basePosition = {
+      return {
         marketAddress: p.market?.pubkey || '',
         market: p.market 
           ? `${p.market.asset}-${p.market.timeframe}` 
@@ -170,20 +155,6 @@ export async function userRoutes(app: FastifyInstance) {
         totalCost: parseFloat(p.totalCost || '0'),
         status: p.status?.toLowerCase() || 'open',
       };
-
-      // Add leverage fields if margin account exists
-      if (marginAccount) {
-        return {
-          ...basePosition,
-          leverage: marginAccount.leverage,
-          marginDeposited: parseFloat(marginAccount.marginDeposited),
-          loanAmount: parseFloat(marginAccount.loanAmount),
-          liquidationPrice: parseFloat(marginAccount.liquidationPrice),
-          marginAccountId: marginAccount.id,
-        };
-      }
-
-      return basePosition;
     });
     } finally {
       concurrentPositionRequests--;
@@ -294,11 +265,7 @@ export async function userRoutes(app: FastifyInstance) {
     });
 
     return {
-      orders: orders.map((o) => {
-        const leverage = o.leverage ? parseFloat(o.leverage) : 1;
-        const marginAmount = o.marginAmount ? parseFloat(o.marginAmount) : undefined;
-        
-        return {
+      orders: orders.map((o) => ({
           id: o.id,
           marketAddress: o.market?.pubkey || '',
           market: o.market 
@@ -317,11 +284,7 @@ export async function userRoutes(app: FastifyInstance) {
           dollarAmount: o.dollarAmount ? parseFloat(o.dollarAmount) : undefined,
           createdAt: o.createdAt?.getTime(),
           updatedAt: o.updatedAt?.getTime(),
-          // Leverage fields (available before margin account exists)
-          leverage: leverage > 1 ? leverage : undefined,
-          marginAmount: leverage > 1 ? marginAmount : undefined,
-        };
-      }),
+      })),
       total,
       limit,
       offset,
@@ -394,45 +357,6 @@ export async function userRoutes(app: FastifyInstance) {
       )
       .orderBy(desc(trades.executedAt));
     
-    // Get leverage info for all orders involved in these trades
-    const orderIds = new Set<string>();
-    for (const t of userTrades) {
-      if (t.takerUserId === userId && t.takerOrderId) orderIds.add(t.takerOrderId);
-      if (t.makerUserId === userId && t.makerOrderId) orderIds.add(t.makerOrderId);
-    }
-    
-    const orderLeverageMap = new Map<string, number>();
-    if (orderIds.size > 0) {
-      const orderLeverageData = await db
-        .select({ id: orders.id, leverage: orders.leverage })
-        .from(orders)
-        .where(sql`${orders.id} IN (${sql.join(Array.from(orderIds).map(id => sql`${id}::uuid`), sql`, `)})`);
-      
-      for (const o of orderLeverageData) {
-        const lev = parseFloat(o.leverage || '1');
-        if (lev > 1) orderLeverageMap.set(o.id, lev);
-      }
-    }
-    
-    // Also get leverage info from margin accounts (for closing trades)
-    // Margin accounts store leverage on the POSITION, so when user closes, we look up by market+side
-    const marginAccountLeverageMap = new Map<string, number>(); // key: `${marketId}-${side}`
-    const userMarginAccounts = await db
-      .select({
-        marketId: marginAccounts.marketId,
-        side: marginAccounts.side,
-        leverage: marginAccounts.leverage,
-      })
-      .from(marginAccounts)
-      .where(eq(marginAccounts.userId, userId));
-    
-    for (const ma of userMarginAccounts) {
-      const lev = parseFloat(ma.leverage || '1');
-      if (lev > 1) {
-        marginAccountLeverageMap.set(`${ma.marketId}-${ma.side}`, lev);
-      }
-    }
-    
     // 3. Compute correct avgEntry at time of each sell from trade history.
     // Using the current position avgEntry is WRONG — it gets overwritten when
     // user sells all shares and re-buys at a different price.
@@ -460,6 +384,7 @@ export async function userRoutes(app: FastifyInstance) {
 
         let shares = 0;
         let avgEntry = 0;
+        let totalCostBasis = 0;
 
         for (const t of sorted) {
           const isTaker = t.takerUserId === userId;
@@ -468,24 +393,33 @@ export async function userRoutes(app: FastifyInstance) {
           const userPrice = isTaker
             ? parseFloat(t.takerPrice || '0')
             : parseFloat(t.makerPrice || '0');
+          const userFee = isTaker
+            ? parseFloat(t.takerFee || '0')
+            : parseFloat(t.makerFee || '0');
 
           // Is this user buying or selling?
           const isBuying = isTaker ? takerSide === 'BID' : takerSide === 'ASK';
 
           if (isBuying) {
-            // Update weighted average entry price
+            // Track cost basis including fees
+            const fillCost = size * userPrice + userFee;
+            totalCostBasis += fillCost;
             avgEntry = shares > 0
               ? (shares * avgEntry + size * userPrice) / (shares + size)
               : userPrice;
             shares += size;
           } else {
             // Selling — record the avgEntry at this point for PnL calc
+            // Use cost basis per share (including buy fees) for accurate PnL
+            const costBasisPerShare = shares > 0 ? totalCostBasis / shares : avgEntry;
             const orderId = isTaker ? t.takerOrderId : t.makerOrderId;
             if (orderId && !sellAvgEntryMap.has(orderId)) {
-              sellAvgEntryMap.set(orderId, avgEntry);
+              sellAvgEntryMap.set(orderId, costBasisPerShare);
             }
+            // Reduce cost basis proportionally for sold shares
+            const soldFraction = Math.min(size, shares) / Math.max(shares, 0.000001);
+            totalCostBasis = totalCostBasis * (1 - soldFraction);
             shares = Math.max(0, shares - size);
-            // avgEntry stays the same for remaining shares
           }
         }
       }
@@ -511,7 +445,6 @@ export async function userRoutes(app: FastifyInstance) {
       timestamp: number; // First execution timestamp
       fills: number; // Number of fills
       avgEntryPrice?: number; // For closing trades, the avg entry to calculate P&L
-      leverage?: number; // Leverage used for this order (if > 1)
       errorCode?: string; // Error code for failed trades
     }
     
@@ -541,16 +474,6 @@ export async function userRoutes(app: FastifyInstance) {
       let avgEntryPrice: number | undefined;
       if (!isOpening && orderId) {
         avgEntryPrice = sellAvgEntryMap.get(orderId);
-      }
-      
-      // Get leverage for this order
-      // For opening trades: look up from orders table
-      // For closing trades: also check margin accounts (since sell order won't have leverage)
-      let orderLeverage = orderLeverageMap.get(orderId);
-      if (!orderLeverage && !isOpening && t.marketId && userOutcome) {
-        // Try to get leverage from margin account for this position
-        const maKey = `${t.marketId}-${userOutcome}`;
-        orderLeverage = marginAccountLeverageMap.get(maKey);
       }
       
       const existing = orderMap.get(orderId);
@@ -594,7 +517,6 @@ export async function userRoutes(app: FastifyInstance) {
           timestamp: t.executedAt?.getTime() || 0,
           fills: 1,
           avgEntryPrice,
-          leverage: orderLeverage,
         });
       }
     }
@@ -630,8 +552,7 @@ export async function userRoutes(app: FastifyInstance) {
           size: o.totalSize,
           notional: o.totalNotional,
           fee: o.totalFee,
-          pnl, // P&L for closing trades
-          leverage: o.leverage, // Leverage if > 1
+          pnl,
           txSignature: o.txSignature,
           txStatus: o.txStatus,
           errorCode: o.errorCode,
@@ -640,7 +561,7 @@ export async function userRoutes(app: FastifyInstance) {
         };
       });
     
-    // 3. Get settlements for this user (with leverage from margin accounts + position shares)
+    // 3. Get settlements for this user (with position shares)
     const userSettlements = await db
       .select({
         id: settlements.id,
@@ -660,13 +581,10 @@ export async function userRoutes(app: FastifyInstance) {
         // Position shares (for accurate size on losses)
         posYesShares: positions.yesShares,
         posNoShares: positions.noShares,
-        // Margin account info (if leveraged)
-        marginLeverage: marginAccounts.leverage,
       })
       .from(settlements)
       .leftJoin(markets, eq(settlements.marketId, markets.id))
       .leftJoin(positions, eq(settlements.positionId, positions.id))
-      .leftJoin(marginAccounts, eq(settlements.positionId, marginAccounts.positionId))
       .where(eq(settlements.userId, userId))
       .orderBy(desc(settlements.createdAt));
 
@@ -677,7 +595,6 @@ export async function userRoutes(app: FastifyInstance) {
         const profit = parseFloat(s.profit || '0');
         const winShares = parseFloat(s.winningShares || '0');
         const isWin = payout > 0;
-        const leverage = s.marginLeverage ? parseFloat(s.marginLeverage) : undefined;
         // For losses, use actual position shares (yes+no) instead of cost
         const posYes = parseFloat(s.posYesShares || '0');
         const posNo = parseFloat(s.posNoShares || '0');
@@ -701,85 +618,13 @@ export async function userRoutes(app: FastifyInstance) {
           notional: payout,
           fee: 0,
           pnl: profit,
-          leverage: leverage && leverage > 1 ? leverage : undefined,
           txSignature: s.txSignature || '',
           timestamp: s.createdAt?.getTime() || 0,
         };
       });
     
-    // 4. Get liquidations for this user
-    const userLiquidations = await db
-      .select({
-        id: liquidations.id,
-        marginAccountId: liquidations.marginAccountId,
-        marketId: liquidations.marketId,
-        triggerPrice: liquidations.triggerPrice,
-        executionPrice: liquidations.executionPrice,
-        sharesLiquidated: liquidations.sharesLiquidated,
-        proceeds: liquidations.proceeds,
-        loanRepaid: liquidations.loanRepaid,
-        penalty: liquidations.penalty,
-        returnedToUser: liquidations.returnedToUser,
-        txSignature: liquidations.txSignature,
-        createdAt: liquidations.createdAt,
-        // Market info
-        marketPubkey: markets.pubkey,
-        marketAsset: markets.asset,
-        marketTimeframe: markets.timeframe,
-        marketExpiryAt: markets.expiryAt,
-        // Margin account info for entry price & outcome
-        marginOutcome: marginAccounts.side,
-        marginEntryPrice: marginAccounts.entryPrice,
-        marginLeverage: marginAccounts.leverage,
-      })
-      .from(liquidations)
-      .leftJoin(markets, eq(liquidations.marketId, markets.id))
-      .leftJoin(marginAccounts, eq(liquidations.marginAccountId, marginAccounts.id))
-      .where(eq(liquidations.userId, userId))
-      .orderBy(desc(liquidations.createdAt));
-    
-    // Transform liquidations into unified format
-    const liquidationTransactions = userLiquidations.map((l) => {
-      const shares = parseFloat(l.sharesLiquidated || '0');
-      const executionPrice = parseFloat(l.executionPrice || '0');
-      const entryPrice = parseFloat(l.marginEntryPrice || '0');
-      const returnedToUser = parseFloat(l.returnedToUser || '0');
-      const penalty = parseFloat(l.penalty || '0');
-      const loanRepaid = parseFloat(l.loanRepaid || '0');
-      const leverage = parseFloat(l.marginLeverage || '1');
-      
-      // P&L for liquidation = what user got back - their initial margin
-      // Initial margin = entry cost / leverage = (shares * entryPrice) / leverage
-      const initialMargin = (shares * entryPrice) / leverage;
-      const pnl = returnedToUser - initialMargin; // Should be negative (loss)
-      
-      return {
-        id: l.id,
-        type: 'liquidation' as const,
-        transactionType: 'close' as const,
-        marketAddress: l.marketPubkey || '',
-        market: l.marketAsset && l.marketTimeframe 
-          ? `${l.marketAsset}-${l.marketTimeframe}` 
-          : '',
-        asset: l.marketAsset || '',
-        expiryAt: l.marketExpiryAt?.getTime() || 0,
-        outcome: l.marginOutcome?.toLowerCase() || '',
-        side: 'liquidation' as const,
-        price: executionPrice,
-        entryPrice, // Include entry price for display
-        size: shares,
-        notional: returnedToUser,
-        fee: penalty,
-        pnl,
-        leverage,
-        loanRepaid,
-        txSignature: l.txSignature || '',
-        timestamp: l.createdAt?.getTime() || 0,
-      };
-    });
-    
     // Combine and sort by timestamp descending
-    const allTransactions = [...orderTransactions, ...settlementTransactions, ...liquidationTransactions]
+    const allTransactions = [...orderTransactions, ...settlementTransactions]
       .sort((a, b) => b.timestamp - a.timestamp);
     
     // Apply pagination

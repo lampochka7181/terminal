@@ -5,6 +5,7 @@ use crate::state_v2::{MarketV2, MarketStatusV2};
 use crate::state::{GlobalState, Order, OrderStatus, Side, Outcome, TradeType, USDC_MULTIPLIER, SHARE_MULTIPLIER, MIN_PRICE, MAX_PRICE, MIN_ORDER_SIZE, MAX_ORDER_SIZE, MIN_TAKER_FEE};
 use crate::instructions::PlaceOrderArgs;
 use crate::errors::DegenError;
+use crate::security::{require_market_v2_vault, require_order_authorization};
 
 /// Execute a match in a V2 market (tokenized shares)
 ///
@@ -46,14 +47,17 @@ pub struct ExecuteMatchV2<'info> {
     /// Market's USDC vault (regular Token program)
     #[account(
         mut,
-        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams
+        constraint = market.vault == vault.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub vault: Box<Account<'info, TokenAccount>>,
 
     /// Fee recipient's USDC account (regular Token program)
     #[account(
         mut,
-        constraint = fee_recipient.owner == global_state.fee_recipient @ DegenError::Unauthorized
+        constraint = fee_recipient.owner == global_state.fee_recipient @ DegenError::Unauthorized,
+        constraint = fee_recipient.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub fee_recipient: Box<Account<'info, TokenAccount>>,
 
@@ -64,7 +68,8 @@ pub struct ExecuteMatchV2<'info> {
     /// Maker's USDC account (must exist, regular Token program)
     #[account(
         mut,
-        constraint = maker_usdc.owner == maker.key() @ DegenError::Unauthorized
+        constraint = maker_usdc.owner == maker.key() @ DegenError::Unauthorized,
+        constraint = maker_usdc.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub maker_usdc: Box<Account<'info, TokenAccount>>,
 
@@ -89,7 +94,8 @@ pub struct ExecuteMatchV2<'info> {
     /// Taker's USDC account (must exist, regular Token program)
     #[account(
         mut,
-        constraint = taker_usdc.owner == taker.key() @ DegenError::Unauthorized
+        constraint = taker_usdc.owner == taker.key() @ DegenError::Unauthorized,
+        constraint = taker_usdc.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub taker_usdc: Box<Account<'info, TokenAccount>>,
 
@@ -115,7 +121,15 @@ pub struct ExecuteMatchV2<'info> {
     pub token_program: Program<'info, Token>,
     /// Token-2022 program for YES/NO share token operations (mint_to)
     pub share_token_program: Interface<'info, TokenInterface>,
-    pub system_program: Program<'info, System>,
+
+    /// CHECK: Instructions sysvar for Ed25519 verification
+    pub instructions: AccountInfo<'info>,
+
+    /// CHECK: Session authority PDA when maker uses a session signer, otherwise placeholder
+    pub maker_session_authority: AccountInfo<'info>,
+
+    /// CHECK: Session authority PDA when taker uses a session signer, otherwise placeholder
+    pub taker_session_authority: AccountInfo<'info>,
 }
 
 pub fn execute_match_v2(
@@ -124,9 +138,12 @@ pub fn execute_match_v2(
     taker_args: PlaceOrderArgs,
     match_size: u64,
     taker_fee: u64,
+    maker_signer: Pubkey,
+    taker_signer: Pubkey,
 ) -> Result<()> {
     let global_state = &ctx.accounts.global_state;
     let clock = Clock::get()?;
+    require_market_v2_vault(&ctx.accounts.market, &ctx.accounts.market.key(), &ctx.accounts.vault.key(), &ctx.accounts.vault)?;
 
     // Validate ATAs exist and belong to the correct owner+mint
     // (They must be pre-created by relayer before calling this instruction)
@@ -169,6 +186,7 @@ pub fn execute_match_v2(
     let taker_has_order = ctx.accounts.taker_order.is_some();
     let maker_has_escrow = maker_has_order;
     let taker_has_escrow = taker_has_order;
+    require!(ctx.accounts.relayer.key() == ctx.accounts.market.authority, DegenError::Unauthorized);
 
     // Capture immutable market data BEFORE taking mutable borrow
     let market_key = ctx.accounts.market.key();
@@ -203,6 +221,28 @@ pub fn execute_match_v2(
     } else {
         (taker_args.side, taker_args.outcome, taker_args.price, taker_args.size, taker_args.expiry_ts)
     };
+
+    if !maker_has_order && maker_signer != Pubkey::default() {
+        require_order_authorization(
+            &ctx.accounts.instructions,
+            &ctx.accounts.maker_session_authority,
+            &market_key,
+            &ctx.accounts.maker.key(),
+            &maker_signer,
+            &maker_args,
+        )?;
+    }
+
+    if !taker_has_order && taker_signer != Pubkey::default() {
+        require_order_authorization(
+            &ctx.accounts.instructions,
+            &ctx.accounts.taker_session_authority,
+            &market_key,
+            &ctx.accounts.taker.key(),
+            &taker_signer,
+            &taker_args,
+        )?;
+    }
 
     msg!("ExecuteMatchV2: maker_has_order={}, taker_has_order={}", maker_has_order, taker_has_order);
 

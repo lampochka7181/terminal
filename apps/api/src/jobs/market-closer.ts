@@ -4,7 +4,6 @@ import { db, markets } from '../db/index.js';
 import { marketService } from '../services/market.service.js';
 import { anchorClient, getYesMintPda, getNoMintPda, fetchMarketV2OnChainState } from '../lib/anchor-client.js';
 import { logger } from '../lib/logger.js';
-import { config } from '../config.js';
 
 /**
  * Market Closer Job
@@ -59,9 +58,7 @@ export async function marketCloserJob(): Promise<void> {
 
   for (const market of marketsToClose) {
     try {
-      const chainState = config.useV2
-        ? await fetchMarketV2OnChainState(connection, new PublicKey(market.pubkey))
-        : null;
+      const chainState = await fetchMarketV2OnChainState(connection, new PublicKey(market.pubkey));
 
       if (!chainState) {
         // Account already gone (finalized) — just archive in DB
@@ -91,18 +88,14 @@ export async function marketCloserJob(): Promise<void> {
     batch.forEach(m => closingMarkets.add(m.id));
 
     try {
-      const isV2 = config.useV2;
       const instructions = await Promise.all(
         batch.map(m => {
-          if (isV2) {
-            const marketPubkey = new PublicKey(m.pubkey);
-            return anchorClient.buildCloseMarketV2Instruction({
-              marketPubkey: m.pubkey,
-              yesMint: getYesMintPda(marketPubkey).toBase58(),
-              noMint: getNoMintPda(marketPubkey).toBase58(),
-            });
-          }
-          return anchorClient.buildCloseMarketInstruction({ marketPubkey: m.pubkey });
+          const marketPubkey = new PublicKey(m.pubkey);
+          return anchorClient.buildCloseMarketV2Instruction({
+            marketPubkey: m.pubkey,
+            yesMint: getYesMintPda(marketPubkey).toBase58(),
+            noMint: getNoMintPda(marketPubkey).toBase58(),
+          });
         })
       );
 
@@ -153,15 +146,12 @@ export async function marketCloserJob(): Promise<void> {
 }
 
 async function closeMarketOnChainWithSignature(market: { id: string; pubkey: string; asset: string; timeframe: string }): Promise<string> {
-  if (config.useV2) {
-    const marketPubkey = new PublicKey(market.pubkey);
-    return anchorClient.closeMarketV2({
-      marketPubkey: market.pubkey,
-      yesMint: getYesMintPda(marketPubkey).toBase58(),
-      noMint: getNoMintPda(marketPubkey).toBase58(),
-    });
-  }
-  return anchorClient.closeMarket({ marketPubkey: market.pubkey });
+  const marketPubkey = new PublicKey(market.pubkey);
+  return anchorClient.closeMarketV2({
+    marketPubkey: market.pubkey,
+    yesMint: getYesMintPda(marketPubkey).toBase58(),
+    noMint: getNoMintPda(marketPubkey).toBase58(),
+  });
 }
 
 async function handleCloseMarketError(
@@ -200,28 +190,9 @@ async function handleCloseMarketError(
   }
 
   if (msg.includes('AccountDiscriminatorMismatch') || msg.includes('0xbba')) {
-    try {
-      let sig: string;
-      if (config.useV2) {
-        sig = await anchorClient.closeMarket({ marketPubkey: market.pubkey });
-      } else {
-        const marketPubkey = new PublicKey(market.pubkey);
-        sig = await anchorClient.closeMarketV2({
-          marketPubkey: market.pubkey,
-          yesMint: getYesMintPda(marketPubkey).toBase58(),
-          noMint: getNoMintPda(marketPubkey).toBase58(),
-        });
-      }
-      await marketService.markArchived(market.id);
-      logger.info(`Market closure tx (fallback): ${sig} (${market.asset}-${market.timeframe})`);
-    } catch (fallbackErr: any) {
-      const fallbackMsg = fallbackErr.message || '';
-      if (fallbackMsg.includes('AccountNotFound') || fallbackMsg.includes('0x1')) {
-        await marketService.markArchived(market.id);
-      } else {
-        logger.error(`Failed to close market ${market.asset}-${market.timeframe} (fallback): ${fallbackMsg}`);
-      }
-    }
+    // Legacy V1 market — can't close with V2 instruction. Archive in DB.
+    logger.debug(`Market ${market.asset}-${market.timeframe} (${market.pubkey.slice(0, 8)}) discriminator mismatch (legacy V1), archiving`);
+    await marketService.markArchived(market.id);
     return;
   }
 

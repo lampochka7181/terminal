@@ -82,6 +82,8 @@ CREATE TABLE orders (
     signature TEXT,
     encoded_instruction TEXT,
     binary_message TEXT,
+    session_public_key VARCHAR(44),
+    auth_version VARCHAR(20) DEFAULT 'DT_ORDER_V1',
     is_mm_order BOOLEAN DEFAULT FALSE NOT NULL,
     is_agent_order BOOLEAN DEFAULT FALSE NOT NULL,
     -- Dollar-based market orders: original USD amount requested (e.g., $25)

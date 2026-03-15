@@ -5,6 +5,8 @@ export * from './position.js';
 export * from './user.js';
 export * from './api.js';
 export * from './websocket.js';
+export * from './sessionAuth.js';
+export * from './sessionGrant.js';
 
 
 

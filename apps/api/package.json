@@ -16,10 +16,8 @@
     "db:indexes": "tsx src/scripts/apply-db-indexes.ts",
     "db:seed": "tsx src/scripts/seed.ts",
     "init-protocol": "tsx src/scripts/init-protocol.ts",
-    "init-markets": "tsx src/scripts/init-markets.ts",
     "setup-fee-recipient": "tsx src/scripts/setup-fee-recipient.ts",
     "setup-mm-delegation": "tsx src/scripts/setup-mm-delegation.ts",
-    "setup-lending-delegation": "tsx src/scripts/setup-lending-delegation.ts",
     "query-fee-revenue": "tsx src/scripts/query-fee-revenue.ts"
   },
   "dependencies": {

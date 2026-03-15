@@ -63,17 +63,19 @@ pub fn post_merkle_root(
     require!(args.merkle_root != [0u8; 32], DegenError::InvalidMerkleRoot);
     require!(args.total_settlements > 0, DegenError::InvalidMerkleRoot);
 
-    // Validate total amount matches expected based on open interest
-    // Winners get $1.00 per share, so max payout = open_interest * 1_000_000
-    let max_payout = market.open_interest;
-    require!(args.total_amount <= max_payout, DegenError::InvalidSettlementAmount);
+    // Exact payout must match open interest after fees have already been removed from the vault.
+    require!(args.total_amount == market.open_interest, DegenError::InvalidSettlementAmount);
+    let chunk_count = ((args.total_settlements + 8191) / 8192) as u16;
+    require!(chunk_count > 0, DegenError::InvalidSettlementAmount);
 
     // Update market with merkle settlement data
     market.settlement_merkle_root = args.merkle_root;
     market.has_merkle_root = true;
     market.total_settlement_amount = args.total_amount;
+    market.settlement_amount_paid = 0;
     market.settlements_total = args.total_settlements;
     market.settlements_processed = 0;
+    market.settlement_bitmap_chunks = chunk_count;
     market.status = MarketStatusV2::Settling;
 
     // Initialize the bitmap

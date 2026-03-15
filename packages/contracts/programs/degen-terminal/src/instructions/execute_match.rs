@@ -3,6 +3,7 @@ use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use crate::state::{GlobalState, Market, UserPosition, Order, OrderStatus, Side, Outcome, MarketStatus, TradeType, USDC_MULTIPLIER, SHARE_MULTIPLIER, MAX_POSITION_SIZE, MIN_PRICE, MAX_PRICE, MIN_ORDER_SIZE, MAX_ORDER_SIZE, MIN_TAKER_FEE};
 use crate::instructions::PlaceOrderArgs;
 use crate::errors::DegenError;
+use crate::security::require_market_vault;
 
 #[derive(Accounts)]
 pub struct ExecuteMatch<'info> {
@@ -19,14 +20,17 @@ pub struct ExecuteMatch<'info> {
     /// Market's USDC vault - validated to be owned by market PDA
     #[account(
         mut,
-        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams
+        constraint = market.vault == vault.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub vault: Box<Account<'info, TokenAccount>>,
     
     /// Fee recipient's USDC account - validated against global state
     #[account(
         mut,
-        constraint = fee_recipient.owner == global_state.fee_recipient @ DegenError::Unauthorized
+        constraint = fee_recipient.owner == global_state.fee_recipient @ DegenError::Unauthorized,
+        constraint = fee_recipient.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub fee_recipient: Box<Account<'info, TokenAccount>>,
     
@@ -46,7 +50,8 @@ pub struct ExecuteMatch<'info> {
     /// Maker's USDC account - validated to be owned by maker
     #[account(
         mut,
-        constraint = maker_usdc.owner == maker.key() @ DegenError::Unauthorized
+        constraint = maker_usdc.owner == maker.key() @ DegenError::Unauthorized,
+        constraint = maker_usdc.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub maker_usdc: Box<Account<'info, TokenAccount>>,
     
@@ -71,7 +76,8 @@ pub struct ExecuteMatch<'info> {
     /// Taker's USDC account - validated to be owned by taker
     #[account(
         mut,
-        constraint = taker_usdc.owner == taker.key() @ DegenError::Unauthorized
+        constraint = taker_usdc.owner == taker.key() @ DegenError::Unauthorized,
+        constraint = taker_usdc.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub taker_usdc: Box<Account<'info, TokenAccount>>,
     
@@ -105,12 +111,14 @@ pub fn execute_match(
     let market_info = ctx.accounts.market.to_account_info();
     let market = &mut ctx.accounts.market;
     let clock = Clock::get()?;
+    require_market_vault(market, &market.key(), &ctx.accounts.vault.key(), &ctx.accounts.vault)?;
     
     // Get order data - prefer Order PDA if available, otherwise use args
     let maker_has_order = ctx.accounts.maker_order.is_some();
     let taker_has_order = ctx.accounts.taker_order.is_some();
     let maker_has_escrow = maker_has_order;
     let taker_has_escrow = taker_has_order;
+    require!(ctx.accounts.relayer.key() == market.authority, DegenError::Unauthorized);
     
     // Extract order parameters
     let (maker_side, maker_outcome, maker_price, maker_size, maker_expiry) = if let Some(ref order) = ctx.accounts.maker_order {

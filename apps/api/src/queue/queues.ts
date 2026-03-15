@@ -97,7 +97,7 @@ export interface DbSyncJobData {
   makerOrderId?: string;
   takerOrderId?: string;
   txSignature: string;
-  status: 'CONFIRMED' | 'FAILED';
+  status: 'PENDING' | 'CONFIRMED' | 'FAILED';
   errorCode?: string;
 }
 

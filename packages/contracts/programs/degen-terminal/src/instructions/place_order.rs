@@ -55,14 +55,17 @@ pub struct PlaceOrder<'info> {
     /// Market's USDC vault - holds escrowed funds
     #[account(
         mut,
-        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams
+        constraint = market.vault == vault.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub vault: Account<'info, TokenAccount>,
     
     /// User's USDC token account
     #[account(
         mut,
-        constraint = user_usdc.owner == user.key() @ DegenError::Unauthorized
+        constraint = user_usdc.owner == user.key() @ DegenError::Unauthorized,
+        constraint = user_usdc.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub user_usdc: Account<'info, TokenAccount>,
     

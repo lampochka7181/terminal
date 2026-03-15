@@ -63,8 +63,11 @@ async function reversePositionForFailedTrade(
     }
 
     for (const trade of tradeRecords) {
-      // Skip if already reversed (txStatus was already FAILED before this run)
-      if (trade.txStatus === 'FAILED') {
+      // Skip if already reversed by a prior db-sync failure pass.
+      // Some earlier failure paths stamp txStatus=FAILED before db-sync runs;
+      // those trades still need one reversal pass, so only skip when an
+      // errorCode is already present.
+      if (trade.txStatus === 'FAILED' && trade.errorCode) {
         logger.debug(`[QUEUE:db-sync] Trade ${trade.id} already FAILED, skipping reversal`);
         continue;
       }
@@ -209,6 +212,9 @@ async function processJob(job: Job<DbSyncJobData>): Promise<void> {
   if (status === 'CONFIRMED' && txSignature) {
     updateData.txSignature = txSignature;
     updateData.confirmedAt = new Date();
+  } else if (status === 'PENDING' && txSignature) {
+    updateData.txSignature = txSignature;
+    updateData.confirmedAt = null;
   } else if (status === 'FAILED') {
     updateData.txSignature = null;
     if (errorCode) {
@@ -226,7 +232,7 @@ async function processJob(job: Job<DbSyncJobData>): Promise<void> {
     }
 
     // Also update by order IDs (for matching trades)
-    if (makerOrderId && !makerOrderId.startsWith('mm_synth_') && !makerOrderId.startsWith('aggregated-mm-')) {
+    if (makerOrderId && !makerOrderId.startsWith('mm_synth_') && !makerOrderId.startsWith('mm_bailout_') && !makerOrderId.startsWith('aggregated-mm-')) {
       await db.update(trades).set(updateData).where(eq(trades.makerOrderId, makerOrderId));
       updated = true;
     }

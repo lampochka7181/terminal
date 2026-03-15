@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
-use crate::state::{GlobalState, Market, UserPosition, Side, Outcome, MarketStatus, TradeType, USDC_MULTIPLIER, SHARE_MULTIPLIER, MAX_POSITION_SIZE, MIN_PRICE, MAX_PRICE, MIN_ORDER_SIZE, MAX_ORDER_SIZE, MIN_TAKER_FEE};
+use crate::state::{GlobalState, Market, UserPosition, Outcome, MarketStatus, SHARE_MULTIPLIER, MAX_POSITION_SIZE, MIN_PRICE, MAX_PRICE, MIN_ORDER_SIZE, MAX_ORDER_SIZE, MIN_TAKER_FEE};
 use crate::errors::DegenError;
 
 /// Arguments for execute_close instruction
@@ -26,7 +26,8 @@ pub struct ExecuteClose<'info> {
     /// Fee recipient's USDC account
     #[account(
         mut,
-        constraint = fee_recipient.owner == global_state.fee_recipient @ DegenError::Unauthorized
+        constraint = fee_recipient.owner == global_state.fee_recipient @ DegenError::Unauthorized,
+        constraint = fee_recipient.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub fee_recipient: Box<Account<'info, TokenAccount>>,
     
@@ -45,7 +46,8 @@ pub struct ExecuteClose<'info> {
     /// Buyer's USDC account (source of payment)
     #[account(
         mut,
-        constraint = buyer_usdc.owner == buyer.key() @ DegenError::Unauthorized
+        constraint = buyer_usdc.owner == buyer.key() @ DegenError::Unauthorized,
+        constraint = buyer_usdc.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub buyer_usdc: Box<Account<'info, TokenAccount>>,
     
@@ -64,7 +66,8 @@ pub struct ExecuteClose<'info> {
     /// Seller's USDC account (receives payment)
     #[account(
         mut,
-        constraint = seller_usdc.owner == seller.key() @ DegenError::Unauthorized
+        constraint = seller_usdc.owner == seller.key() @ DegenError::Unauthorized,
+        constraint = seller_usdc.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub seller_usdc: Box<Account<'info, TokenAccount>>,
     
@@ -87,6 +90,7 @@ pub fn execute_close(
     require!(!global_state.paused, DegenError::ProtocolPaused);
     require!(market.status == MarketStatus::Open, DegenError::MarketNotOpen);
     require!(market.is_trading_open(clock.unix_timestamp), DegenError::MarketClosing);
+    require!(ctx.accounts.relayer.key() == market.authority, DegenError::Unauthorized);
     require!(ctx.accounts.buyer.key() != ctx.accounts.seller.key(), DegenError::SelfTrade);
     require!(args.price >= MIN_PRICE && args.price <= MAX_PRICE, DegenError::InvalidPrice);
     require!(args.size >= MIN_ORDER_SIZE && args.size <= MAX_ORDER_SIZE, DegenError::InvalidSize);

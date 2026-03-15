@@ -1,8 +1,10 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, CloseAccount, Transfer};
 use anchor_spl::token_interface::{self, TokenInterface, CloseAccount as CloseAccountInterface};
+use anchor_lang::system_program;
 use crate::state_v2::{MarketV2, MarketStatusV2, SettlementBitmap};
 use crate::errors::DegenError;
+use crate::security::require_market_v2_vault;
 
 /// Read the supply field from a Token/Token-2022 mint account.
 /// Supply is a little-endian u64 at byte offset 36 in the base mint layout.
@@ -11,6 +13,18 @@ fn read_mint_supply(mint_data: &[u8]) -> Result<u64> {
         return Err(DegenError::InvalidMarketParams.into());
     }
     Ok(u64::from_le_bytes(mint_data[36..44].try_into().unwrap()))
+}
+
+fn close_bitmap_account(bitmap: &AccountInfo, destination: &AccountInfo) -> Result<()> {
+    let lamports = bitmap.lamports();
+    **destination.try_borrow_mut_lamports()? = destination
+        .lamports()
+        .checked_add(lamports)
+        .ok_or(DegenError::MathOverflow)?;
+    **bitmap.try_borrow_mut_lamports()? = 0;
+    bitmap.assign(&system_program::ID);
+    bitmap.realloc(0, false)?;
+    Ok(())
 }
 
 /// Finalize a V2 market after all settlements are complete
@@ -54,7 +68,9 @@ pub struct FinalizeMarketV2<'info> {
     /// Market's USDC vault (should be empty or near-empty)
     #[account(
         mut,
-        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams
+        constraint = market.vault == vault.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.owner == market.key() @ DegenError::InvalidMarketParams,
+        constraint = vault.mint == market.usdc_mint @ DegenError::InvalidMarketParams
     )]
     pub vault: Box<Account<'info, TokenAccount>>,
 
@@ -66,7 +82,10 @@ pub struct FinalizeMarketV2<'info> {
     pub authority: Signer<'info>,
 
     /// Authority's USDC ATA to receive vault dust
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = authority_ata.mint == market.usdc_mint @ DegenError::InvalidMarketParams
+    )]
     pub authority_ata: Box<Account<'info, TokenAccount>>,
 
     /// Settlement bitmap (chunk 0) — closed to recover rent (~0.008 SOL)
@@ -95,9 +114,12 @@ pub struct FinalizeMarketV2<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn finalize_market_v2(ctx: Context<FinalizeMarketV2>) -> Result<()> {
+pub fn finalize_market_v2<'info>(
+    ctx: Context<'_, '_, 'info, 'info, FinalizeMarketV2<'info>>,
+) -> Result<()> {
     let market = &ctx.accounts.market;
     let clock = Clock::get()?;
+    require_market_v2_vault(market, &market.key(), &ctx.accounts.vault.key(), &ctx.accounts.vault)?;
 
     // Pre-compute market seeds for PDA signing
     let asset_len = market.asset.iter().position(|&x| x == 0).unwrap_or(market.asset.len());
@@ -119,23 +141,46 @@ pub fn finalize_market_v2(ctx: Context<FinalizeMarketV2>) -> Result<()> {
     let signer_seeds = &[&market_seeds[..]];
     let market_account_info = ctx.accounts.market.to_account_info();
 
-    // =========================================================================
-    // Transfer vault dust if any (USDC, regular Token program)
-    // =========================================================================
     let vault_balance = ctx.accounts.vault.amount;
+
+    // Close any additional bitmap chunks passed as remaining accounts before
+    // Anchor closes chunk 0 via the account constraint.
+    let mut extra_chunks_closed = 0u16;
+    for bitmap_info in ctx.remaining_accounts.iter() {
+        let bitmap: Account<SettlementBitmap> = Account::try_from(bitmap_info)?;
+        require!(bitmap.market == market.key(), DegenError::InvalidMarketParams);
+        require!(bitmap.chunk_index > 0, DegenError::WrongBitmapChunk);
+        require!(bitmap.chunk_index < market.settlement_bitmap_chunks, DegenError::WrongBitmapChunk);
+        close_bitmap_account(bitmap_info, &ctx.accounts.rent_recipient.to_account_info())?;
+        extra_chunks_closed = extra_chunks_closed.checked_add(1).ok_or(DegenError::MathOverflow)?;
+    }
+    if market.settlement_bitmap_chunks > 1 && extra_chunks_closed + 1 != market.settlement_bitmap_chunks {
+        msg!(
+            "FinalizeMarketV2: {} bitmap chunks expected, {} closed in this call",
+            market.settlement_bitmap_chunks,
+            extra_chunks_closed + 1
+        );
+    }
+
+    // =========================================================================
+    // Sweep any leftover USDC dust, then close the vault.
+    // execute_match_v2 rounds YES/NO leg collateral independently, so the vault
+    // can retain a tiny remainder even when total settlement amount matches
+    // open_interest exactly.
+    // =========================================================================
     if vault_balance > 0 {
-        msg!("Warning: vault has {} remaining (dust), transferring to authority", vault_balance);
-        let cpi_accounts = Transfer {
+        let sweep_dust_accounts = Transfer {
             from: ctx.accounts.vault.to_account_info(),
             to: ctx.accounts.authority_ata.to_account_info(),
             authority: market_account_info.clone(),
         };
-        let cpi_ctx = CpiContext::new_with_signer(
+        let sweep_dust_ctx = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-            signer_seeds,
+            sweep_dust_accounts,
+            signer_seeds
         );
-        token::transfer(cpi_ctx, vault_balance)?;
+        token::transfer(sweep_dust_ctx, vault_balance)?;
+        msg!("Swept {} microUSDC dust from vault to authority ATA", vault_balance);
     }
 
     // =========================================================================

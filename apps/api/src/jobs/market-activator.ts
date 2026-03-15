@@ -1,10 +1,11 @@
 import { marketService } from '../services/market.service.js';
 import { priceFeedService } from '../services/price-feed.service.js';
-import { anchorClient } from '../lib/anchor-client.js';
+import { anchorClient, fetchMarketV2OnChainState } from '../lib/anchor-client.js';
 import { logger, logEvents } from '../lib/logger.js';
 import { broadcastMarketActivated } from '../lib/broadcasts.js';
 import { mmBotV2 } from '../bot/mm-bot.js';
-import { config } from '../config.js';
+import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
+import { PublicKey } from '@solana/web3.js';
 
 /**
  * Market Activator Job
@@ -55,6 +56,7 @@ export async function marketActivatorJob(): Promise<void> {
  */
 async function activateMarketEntry(market: Awaited<ReturnType<typeof marketService.getPendingMarketsToActivate>>[0]): Promise<void> {
   const { id, pubkey, asset, timeframe, expiryAt } = market;
+  let activationStrikePrice: number;
   
   // 1. Get current price from WebSocket feed
   const priceStart = Date.now();
@@ -63,6 +65,7 @@ async function activateMarketEntry(market: Awaited<ReturnType<typeof marketServi
     logger.error(`Cannot activate market ${pubkey}: no price available for ${asset}`);
     return;
   }
+  activationStrikePrice = currentPrice;
 
   // Log how far before round start we are activating
   const roundDurations: Record<string, number> = { '1m': 60000, '5m': 300000, '15m': 900000, '1h': 3600000, '4h': 14400000, '24h': 86400000 };
@@ -73,26 +76,36 @@ async function activateMarketEntry(market: Awaited<ReturnType<typeof marketServi
   // 2. Activate on-chain (idempotent — MarketNotPending error handled below)
   if (anchorClient.isReady()) {
     try {
-      if (config.useV2) {
-        await anchorClient.activateMarketV2({
-          marketPubkey: pubkey,
-          strikePrice: currentPrice,
-        });
-        logger.info(`✅ Activated on-chain MarketV2 ${asset}-${timeframe} with strike $${currentPrice.toLocaleString()}`);
-      } else {
-        await anchorClient.activateMarket({
-          marketPubkey: pubkey,
-          strikePrice: currentPrice,
-        });
-        logger.info(`✅ Activated on-chain market ${asset}-${timeframe} with strike $${currentPrice.toLocaleString()}`);
-      }
+      await anchorClient.activateMarketV2({
+        marketPubkey: pubkey,
+        strikePrice: currentPrice,
+      });
+      logger.info(`✅ Activated on-chain MarketV2 ${asset}-${timeframe} with strike $${currentPrice.toLocaleString()}`);
     } catch (err: any) {
       const errorMsg = String(err.message || err);
       const errorLogs = err.logs ? err.logs.join(' ') : '';
       const fullError = errorMsg + ' ' + errorLogs;
       
       if (fullError.includes('MarketNotPending') || fullError.includes('0x1776') || fullError.includes('6006')) {
-        logger.debug(`Market ${pubkey.slice(0, 8)} already activated on-chain, updating DB only`);
+        const chainState = await fetchMarketV2OnChainState(anchorClient.getConnection(), new PublicKey(pubkey)).catch(() => null);
+        if (!chainState) {
+          logger.warn(`[MarketActivator] Market ${pubkey.slice(0, 8)} returned MarketNotPending, but chain state could not be read. Skipping DB activation.`);
+          return;
+        }
+
+        if (chainState.statusRaw === 1 && chainState.strikePriceRaw > 0n) {
+          activationStrikePrice = chainState.strikePrice;
+          logger.debug(`Market ${pubkey.slice(0, 8)} already OPEN on-chain at strike ${activationStrikePrice}, syncing DB`);
+        } else if (chainState.statusRaw === 0) {
+          logger.warn(`[MarketActivator] Market ${pubkey.slice(0, 8)} still pending on-chain after MarketNotPending response, retrying next cycle`);
+          return;
+        } else {
+          logger.warn(
+            `[MarketActivator] Market ${pubkey.slice(0, 8)} is not pending on-chain (statusRaw=${chainState.statusRaw}, dbStatus=${market.status}). Syncing DB from chain instead of activating.`
+          );
+          await syncMarketStatusFromChain(id, pubkey, market.status || 'OPEN');
+          return;
+        }
       } else {
         logger.error(`❌ Failed to activate market ${pubkey} on-chain: ${errorMsg}`);
         return;
@@ -103,14 +116,14 @@ async function activateMarketEntry(market: Awaited<ReturnType<typeof marketServi
   }
   
   // 3. Update DB (skip chain sync — TX just confirmed, we know the state)
-  await marketService.activateMarket(id, currentPrice.toString());
+  await marketService.activateMarket(id, activationStrikePrice.toString());
   
   // 4. Broadcast activation to all connected clients for instant UI update
   broadcastMarketActivated(pubkey, {
     marketId: id,
     asset,
     timeframe,
-    strikePrice: currentPrice,
+    strikePrice: activationStrikePrice,
     expiryAt: expiryAt.getTime(),
   });
 
@@ -120,21 +133,22 @@ async function activateMarketEntry(market: Awaited<ReturnType<typeof marketServi
     pubkey,
     asset,
     timeframe,
-    strikePrice: currentPrice,
+    strikePrice: activationStrikePrice,
     expiryAt: expiryAt.getTime(),
   }).catch(err => {
     logger.warn(`[MarketActivator] MM bot notification failed: ${err.message}`);
   });
 
-  logger.info(`🚀 Activated market ${asset}-${timeframe} | Strike: $${currentPrice.toLocaleString()} | Expires: ${expiryAt.toISOString()}`);
+  logger.info(`🚀 Activated market ${asset}-${timeframe} | Strike: $${activationStrikePrice.toLocaleString()} | Expires: ${expiryAt.toISOString()}`);
   
-  logEvents.marketCreated({
+  logEvents.marketActivated({
     marketId: id,
     pubkey,
     asset: asset as any,
     timeframe: timeframe as any,
-    strikePrice: currentPrice,
+    strikePrice: activationStrikePrice,
     expiryAt,
+    activationLatencyMs: Math.abs(leadMs),
   });
 }
 
