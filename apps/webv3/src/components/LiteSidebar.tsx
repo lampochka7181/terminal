@@ -275,7 +275,7 @@ export default function LiteSidebar() {
   }
   const liveShares = firstEntry?.shares ?? 0;
   const liteCostBasis = firstEntry?.costBasis ?? 0;
-  const livePnL = firstEntry
+  const _livePnL = firstEntry
     ? ((liteHasLiquidity || liteFallback) ? (liveMark * liveShares) - liteCostBasis : -liteCostBasis)
     : 0;
 

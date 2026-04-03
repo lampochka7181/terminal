@@ -17,7 +17,7 @@ interface SettlementAnim {
   phase: 'enter' | 'hold' | 'exit' | 'done';
 }
 
-function PnLSettlementOverlay() {
+function _PnLSettlementOverlay() {
   const [anim, setAnim] = useState<SettlementAnim | null>(null);
   const { isAuthenticated } = useAuth();
   const idCounter = useRef(0);

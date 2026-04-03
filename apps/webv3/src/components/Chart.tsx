@@ -3,7 +3,7 @@ import { createChart, CandlestickSeries, LineSeries, ColorType } from 'lightweig
 import type { IChartApi, ISeriesApi } from 'lightweight-charts';
 import { useSelectedMarket } from '@/stores/marketStore';
 import { useMarketStore } from '@/stores/marketStore';
-import { api, type Candle } from '@/lib/api';
+import { api } from '@/lib/api';
 import { getWebSocket } from '@/lib/websocket';
 import { useChartToolbarStore } from './ChartToolbar';
 import { chartCoordsRef } from '@/lib/chartCoords';
@@ -29,7 +29,7 @@ interface ChartProps {
   mode?: 'pro' | 'lite';
 }
 
-export default function Chart({ mode = 'pro' }: ChartProps) {
+export default function Chart({ mode: _mode = 'pro' }: ChartProps) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const overlayClipRef = useRef<HTMLDivElement>(null);

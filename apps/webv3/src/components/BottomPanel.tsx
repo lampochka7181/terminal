@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Share2, Copy } from 'lucide-react';
+import { Share2 } from 'lucide-react';
 import { V3Prompt } from './V3Modal';
 import { useUser } from '@/hooks/useUser';
 import { useOrder } from '@/hooks/useOrder';
@@ -381,8 +381,6 @@ export default function BottomPanel({ height }: { height?: number }) {
     }
     return true;
   });
-  const allItems = [...openPositions, ...openOrders];
-
   // Split positions with both YES and NO shares into separate display rows
   type PosEntry = { pos: typeof openPositions[0]; isYes: boolean; shares: number; costBasis: number; entryPrice: number };
   const posEntries: PosEntry[] = [];

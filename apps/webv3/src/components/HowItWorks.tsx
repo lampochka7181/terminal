@@ -4,8 +4,6 @@ interface Props {
   onClose: () => void;
 }
 
-const dim = 'rgba(238,238,238,0.33)';
-
 function SectionTitle({ children }: { children: string }) {
   return (
     <h2 style={{
