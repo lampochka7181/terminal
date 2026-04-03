@@ -13,7 +13,13 @@ export function setApiUrl(url: string) {
 
 export function setAuthToken(token: string, expiresAt: number) {
   authToken = token;
-  tokenExpiresAt = expiresAt;
+  // API returns expiresAt as unix seconds; normalize to milliseconds for Date.now() comparison
+  tokenExpiresAt = expiresAt < 1e12 ? expiresAt * 1000 : expiresAt;
+}
+
+export function clearAuthToken() {
+  authToken = null;
+  tokenExpiresAt = 0;
 }
 
 export function isAuthenticated(): boolean {

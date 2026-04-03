@@ -2,4 +2,15 @@ packages:
   - "apps/*"
   - "packages/*"
 
+supportedArchitectures:
+  os:
+    - current
+    - win32
+    - linux
+  cpu:
+    - x64
+  libc:
+    - current
+    - glibc
+
 

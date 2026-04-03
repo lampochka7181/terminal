@@ -21,24 +21,24 @@ export function registerMarketTools(server: McpServer) {
       if (status) params.status = status;
       if (timeframe) params.timeframe = timeframe;
 
-      const markets = await api.get('/markets', params);
+      const raw = await api.get('/markets', params);
 
-      if (!markets || (Array.isArray(markets) && markets.length === 0)) {
+      const marketArray: any[] = Array.isArray(raw) ? raw : (raw?.markets || []);
+
+      if (marketArray.length === 0) {
         return { content: [{ type: 'text', text: 'No markets found matching your filters.' }] };
       }
 
-      // Format for agent readability
-      const list = (Array.isArray(markets) ? markets : markets.markets || []).map((m: any) => ({
-        address: m.pubkey,
+      const list = marketArray.map((m: any) => ({
+        address: m.address || m.pubkey,
         asset: m.asset,
         timeframe: m.timeframe,
-        strikePrice: m.strikePrice,
+        strikePrice: m.strike || m.strikePrice,
         yesPrice: m.yesPrice,
         noPrice: m.noPrice,
         status: m.status,
-        expiresAt: m.expiryAt,
-        volume: m.totalVolume,
-        trades: m.totalTrades,
+        expiresAt: m.expiry || m.expiryAt,
+        volume: m.volume24h || m.totalVolume,
       }));
 
       return {

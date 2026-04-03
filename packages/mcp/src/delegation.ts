@@ -149,6 +149,6 @@ export async function ensureDelegation(requiredAmount?: number): Promise<{
   };
 }
 
-export function isDelegationChecked(): boolean {
-  return delegationChecked;
+export function resetDelegationCache(): void {
+  delegationChecked = false;
 }

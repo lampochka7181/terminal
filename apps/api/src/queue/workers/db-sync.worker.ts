@@ -97,13 +97,19 @@ async function reversePositionForFailedTrade(
 
       // Reverse for maker
       if (trade.makerUserId && trade.marketId) {
-        const makerIsBuying = takerSide === 'ASK'; // maker buys when taker sells
+        // Maker always acquires makerOutcome tokens, in both opening and closing trades:
+        //   - Opening trade (taker BID): taker buys takerOutcome, maker acquires complementOutcome
+        //   - Closing trade (taker ASK): taker sells, maker buys takerOutcome (same outcome)
+        // In both cases the maker's position was incremented, so reversal must subtract.
+        // Bug was: makerIsBuying = takerSide === 'ASK' treated opening-trade makers as sellers,
+        // causing reversal to ADD shares instead of subtract → double phantom position.
+        const makerIsBuying = true;
         await reverseUserPosition(
           trade.makerUserId,
           trade.marketId,
           makerOutcome,
           size,
-          makerIsBuying ? size * makerPrice : size * makerPrice,
+          size * makerPrice,
           makerIsBuying
         );
         result.affectedUserIds.push(trade.makerUserId);

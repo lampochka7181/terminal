@@ -10,6 +10,7 @@ import { api, setAuthToken, isAuthenticated } from './api-client.js';
 
 let keypair: Keypair | null = null;
 let walletAddress: string = '';
+let agentName: string = '';
 
 /**
  * Initialize the auth module with a wallet private key.
@@ -25,49 +26,54 @@ export function getWalletAddress(): string {
   return walletAddress;
 }
 
+export function getAgentName(): string {
+  return agentName;
+}
+
 export function getKeypair(): Keypair | null {
   return keypair;
 }
 
+export function isAuthInitialized(): boolean {
+  return !!keypair;
+}
+
 /**
  * Authenticate with the API using the wallet private key.
- * Calls POST /auth/agent → signs nonce → POST /auth/agent/verify → stores JWT.
+ * Uses the standard SIWS flow: GET /auth/nonce → sign → POST /auth/verify → store JWT.
+ * This is the normal user auth path (not the /auth/agent path which is blocked for orders).
  */
-export async function authenticate(agentName?: string): Promise<void> {
+export async function authenticate(name?: string): Promise<void> {
   if (!keypair) {
     throw new Error('Auth not initialized. Call initAuth() first.');
   }
 
+  if (name) agentName = name;
+
   if (isAuthenticated()) {
-    return; // Already authenticated
+    return;
   }
 
-  // Step 1: Get nonce
-  const nonceResult = await api.post<{ nonce: string; expiresAt: string }>(
-    '/auth/agent',
+  const nonceResult = await api.get<{ nonce: string }>(
+    '/auth/nonce',
     { address: walletAddress },
   );
 
-  // Step 2: Sign the nonce message
   const messageBytes = new TextEncoder().encode(nonceResult.nonce);
   const signatureBytes = nacl.sign.detached(messageBytes, keypair.secretKey);
   const signature = bs58.encode(signatureBytes);
 
-  // Step 3: Verify and get JWT
-  const verifyResult = await api.post<{
-    token: string;
-    expiresAt: number;
-    isNewAgent: boolean;
-    agent: { address: string; name: string | null; feeDiscountPct: number };
-  }>('/auth/agent/verify', {
-    address: walletAddress,
-    signature,
-    message: nonceResult.nonce,
-    agentName,
-  });
+  const verifyResult = await api.post<{ token: string; expiresAt: number }>(
+    '/auth/verify',
+    {
+      address: walletAddress,
+      signature,
+      message: nonceResult.nonce,
+    },
+  );
 
-  // Store the JWT for subsequent API calls
   setAuthToken(verifyResult.token, verifyResult.expiresAt);
+  console.error(`[degen-terminal] Authenticated${agentName ? ` as "${agentName}"` : ''} (wallet: ${walletAddress})`);
 }
 
 /**

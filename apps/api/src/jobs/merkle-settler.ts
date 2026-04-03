@@ -705,7 +705,14 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
                 leaf.amount = BigInt(Math.floor(Number(leaf.amount) * scale));
               }
               rebuilt.totalAmount = rebuilt.leaves.reduce((s, l) => s + l.amount, 0n);
-              // Rebuild merkle tree with adjusted amounts
+              // Math.floor rounds each leaf down, so the sum may be a few lamports below
+              // onChainOI. postMerkleRoot requires total_amount == open_interest (exact),
+              // not just <=. Reconcile the rounding remainder into the largest leaf so the
+              // tree total equals the on-chain vault balance exactly.
+              if (rebuilt.totalAmount !== onChainOI) {
+                reconcileSmallSettlementDrift(rebuilt, onChainOI);
+              }
+              // Rebuild merkle tree with final adjusted amounts
               const treeLeaves: SettlementLeaf[] = rebuilt.leaves.map(l => ({ recipient: l.recipient, amount: l.amount }));
               rebuilt.tree = buildMerkleTree(treeLeaves);
               logger.info(`[MerkleSettler] Capped totalAmount to ${rebuilt.totalAmount} (scale=${scale.toFixed(8)}, drift was ${drift} lamports)`);
@@ -1146,6 +1153,57 @@ async function buildSettlementState(
   const openPositions = await positionService.getPositionsForSettlement(market.id);
   if (openPositions.length === 0) return null;
 
+  // Fetch FAILED trades to subtract phantom shares from position aggregation.
+  //
+  // When an on-chain tx fails, db-sync reverses the optimistic position update. But
+  // if that reversal itself fails silently, or if the historical makerIsBuying bug
+  // caused the reversal to ADD shares instead of subtract (for opening trades), the
+  // position retains phantom shares. Subtracting here prevents totalAmount from
+  // exceeding on-chain open_interest and causing error 6059.
+  //
+  // Phantom share sources per trade:
+  //   - Opening trade (takerSide='BID'): both taker (takerOutcome) and maker (makerOutcome)
+  //     received phantom shares from optimistic update.
+  //   - Closing trade (takerSide='ASK'): db-sync reversal is correct for this path;
+  //     any phantom from closing FAILED trades reduces taker position (no inflation risk).
+  const failedTrades = await db
+    .select({
+      takerUserId: trades.takerUserId,
+      makerUserId: trades.makerUserId,
+      takerSide: trades.takerSide,
+      takerOutcome: trades.takerOutcome,
+      makerOutcome: trades.makerOutcome,
+      size: trades.size,
+    })
+    .from(trades)
+    .where(and(eq(trades.marketId, market.id), eq(trades.txStatus, 'FAILED')));
+
+  // Build per-user phantom share map for the winning outcome.
+  // Only opening trades (takerSide='BID') can inflate the winning-side position.
+  const phantomMicroByUser = new Map<string, bigint>();
+  for (const trade of failedTrades) {
+    if (trade.takerSide !== 'BID') continue; // closing-trade failures don't inflate positions
+    const size = parseFloat(trade.size || '0');
+    if (size <= 0) continue;
+    const sizeMicro = BigInt(Math.round(size * 1_000_000));
+
+    if (trade.takerUserId && trade.takerOutcome === outcome) {
+      const prev = phantomMicroByUser.get(trade.takerUserId) ?? 0n;
+      phantomMicroByUser.set(trade.takerUserId, prev + sizeMicro);
+    }
+    if (trade.makerUserId && trade.makerOutcome === outcome) {
+      const prev = phantomMicroByUser.get(trade.makerUserId) ?? 0n;
+      phantomMicroByUser.set(trade.makerUserId, prev + sizeMicro);
+    }
+  }
+
+  if (phantomMicroByUser.size > 0) {
+    logger.warn(
+      `[MerkleSettler] Subtracting phantom ${outcome} shares from ${phantomMicroByUser.size} ` +
+      `position(s) (${failedTrades.length} FAILED trade(s) in market ${market.id})`
+    );
+  }
+
   const userIds = [...new Set(openPositions.map(p => p.userId).filter(Boolean) as string[])];
   const userWallets = userIds.length > 0
     ? await db.select({ id: users.id, walletAddress: users.walletAddress })
@@ -1161,7 +1219,13 @@ async function buildSettlementState(
       : (position.noShares || '0');
 
     // M-05: Use integer arithmetic instead of parseFloat to avoid precision loss
-    const amount = decimalToMicroUsdc(winningSharesStr);
+    const rawAmount = decimalToMicroUsdc(winningSharesStr);
+
+    // Subtract phantom shares from FAILED opening trades. Math.max(0n,...) prevents
+    // going negative if db-sync already correctly reversed some or all phantom shares.
+    const phantomMicro = position.userId ? (phantomMicroByUser.get(position.userId) ?? 0n) : 0n;
+    const amount = rawAmount > phantomMicro ? rawAmount - phantomMicro : 0n;
+
     if (amount <= 0n) continue;
 
     const wallet = position.userId ? walletMap.get(position.userId) : null;

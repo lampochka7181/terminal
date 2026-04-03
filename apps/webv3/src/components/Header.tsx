@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect } from 'react';
-import { Gift, Key, LogOut, Copy, Check } from 'lucide-react';
+import { Gift, Key, LogOut, Copy, Check, Bot } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { useSessionKey, SESSION_DURATIONS } from '@/hooks/useSessionKey';
 import { useWalletModal } from '@solana/wallet-adapter-react-ui';
 import V3Modal from './V3Modal';
+import AgentLeaderboard from './AgentLeaderboard';
 import { walletAvatar } from '@/lib/utils';
 
 const dim = 'rgba(238,238,238,0.33)';
@@ -25,6 +26,7 @@ export default function Header({ onHowItWorks }: HeaderProps) {
   const [rememberSession, setRememberSession] = useState(true);
   const [walletMenuOpen, setWalletMenuOpen] = useState(false);
   const [addressCopied, setAddressCopied] = useState(false);
+  const [leaderboardOpen, setLeaderboardOpen] = useState(false);
   const walletMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -96,6 +98,18 @@ export default function Header({ onHowItWorks }: HeaderProps) {
             }}
           >
             How it Works
+          </button>
+          <button
+            onClick={() => setLeaderboardOpen(true)}
+            style={{
+              fontSize: 16, fontWeight: 500, color: dim,
+              background: '#1e1e1e', border: '1px solid rgba(255,255,255,0.11)',
+              borderRadius: 8, padding: '6px 14px', cursor: 'pointer',
+              display: 'flex', alignItems: 'center', gap: 6,
+            }}
+          >
+            <Bot size={16} />
+            Agents
           </button>
           <button style={{
             display: 'flex', alignItems: 'center', gap: 6, padding: '6px 15px',
@@ -308,6 +322,8 @@ export default function Header({ onHowItWorks }: HeaderProps) {
           )}
         </div>
       </V3Modal>
+
+      <AgentLeaderboard open={leaderboardOpen} onClose={() => setLeaderboardOpen(false)} />
     </>
   );
 }

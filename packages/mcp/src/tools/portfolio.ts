@@ -11,7 +11,7 @@ import { checkDelegation } from '../delegation.js';
 export function registerPortfolioTools(server: McpServer) {
   server.tool(
     'get_positions',
-    'Get all your open positions across all markets. Shows shares held, entry prices, and P&L.',
+    'Get all your open positions across all markets. Shows YES/NO share counts, average entry prices, and unrealized P&L.',
     {},
     async () => {
       await ensureAuthenticated();
@@ -99,7 +99,9 @@ export function registerPortfolioTools(server: McpServer) {
 
   server.tool(
     'get_account_status',
-    'Get overall account status including wallet address, delegation status, and USDC balance.',
+    `Call this first when starting a trading session.
+Returns wallet address, on-chain USDC balance, delegation status, and platform balance.
+If isDelegated=false, call setup_delegation before placing any orders.`,
     {},
     async () => {
       await ensureAuthenticated();

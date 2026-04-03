@@ -446,6 +446,29 @@ export async function getFees(): Promise<FeeSchedule> {
   return apiFetch<FeeSchedule>('/fees');
 }
 
+// Agent Leaderboard
+export interface AgentLeaderboardEntry {
+  rank: number;
+  wallet: string;
+  name: string;
+  volume: number;
+  trades: number;
+  lifetimePnl: number;
+  settlements: number;
+  winRate: number;
+  memberSince: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentLeaderboardResponse {
+  agents: AgentLeaderboardEntry[];
+  updatedAt: number;
+}
+
+export async function getAgentLeaderboard(): Promise<AgentLeaderboardResponse> {
+  return apiFetch<AgentLeaderboardResponse>('/agents/leaderboard');
+}
+
 // ===================
 // Global Trades
 // ===================

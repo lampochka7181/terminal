@@ -152,9 +152,11 @@ export async function orderRoutes(app: FastifyInstance) {
     // ========================================
     // AGENT ORDER DEFAULTS
     // ========================================
-    if (isAgent) {
+    // Agents may place orders if they provide a valid wallet signature (on-chain authorization).
+    // Unsigned agent orders are still rejected.
+    if (isAgent && (!data.signature || !data.binaryMessage)) {
       return reply.code(403).send({
-        error: { code: 'AGENT_ORDERS_DISABLED', message: 'Agent/API-key trading is disabled until secure on-chain authorization is implemented.' },
+        error: { code: 'AGENT_ORDERS_DISABLED', message: 'Agent orders require a wallet signature. Sign the canonical order message with your private key and include signature + binaryMessage.' },
       });
     }
     if (!data.signature) {
