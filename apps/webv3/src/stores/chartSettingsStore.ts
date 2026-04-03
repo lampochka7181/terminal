@@ -56,7 +56,7 @@ const DEFAULT_SETTINGS = {
 
 export const useChartSettingsStore = create<ChartSettings>()(
   persist(
-    (set, get) => ({
+    (set) => ({
       ...DEFAULT_SETTINGS,
       
       setChartType: (type) => set({ chartType: type }),

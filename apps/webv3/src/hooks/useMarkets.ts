@@ -128,7 +128,7 @@ export function useMarkets(params?: GetMarketsParams) {
   }, []);
   
   // Refetch when a market expires (instant refresh to get the pre-created next market)
-  const onMarketExpired = useCallback((timeframe: Timeframe, count: number) => {
+  const onMarketExpired = useCallback((timeframe: Timeframe, _count: number) => {
     console.log(`[useMarkets] Market expired (${timeframe}), fetching pre-created replacement...`);
     fetchMarkets(false);
   }, [fetchMarkets]);

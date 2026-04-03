@@ -4,9 +4,9 @@
  */
 
 import { useEffect, useCallback, useRef, useState } from 'react';
-import { useOrderbookStore, type Trade } from '@/stores/orderbookStore';
+import { useOrderbookStore } from '@/stores/orderbookStore';
 import { api, ApiError } from '@/lib/api';
-import { getWebSocket, type TradeUpdate } from '@/lib/websocket';
+import { getWebSocket } from '@/lib/websocket';
 
 export function useTrades(marketAddress: string | null, limit = 50) {
   const { trades, addTrade, reset } = useOrderbookStore();

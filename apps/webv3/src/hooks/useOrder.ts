@@ -129,51 +129,7 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
       const clientOrderId = Date.now();
       const isSellOrder = params.side === 'ask';
       const isMarketOrder = params.orderType === 'market';
-      const outcomeLabel = params.outcome.toUpperCase();
-      
-      // Build order data
-      let orderData: Record<string, unknown>;
       const isLeveraged = params.leverage && params.leverage > 1;
-      
-      if (isSellOrder) {
-        orderData = {
-          action: 'sell_order',
-          market: params.marketAddress,
-          side: params.side,
-          outcome: params.outcome,
-          size: truncatedSize,
-          minPrice: params.price,
-          expiry: expiryTimestamp,
-          clientOrderId,
-          timestamp: Date.now(),
-        };
-      } else if (isMarketOrder && params.dollarAmount) {
-        orderData = {
-          action: 'market_order',
-          market: params.marketAddress,
-          side: params.side,
-          outcome: params.outcome,
-          dollarAmount: params.dollarAmount,
-          maxPrice: params.maxPrice,
-          expiry: expiryTimestamp,
-          clientOrderId,
-          timestamp: Date.now(),
-          ...(isLeveraged && { leverage: params.leverage, marginAmount: params.marginAmount }),
-        };
-      } else {
-        orderData = {
-          action: 'limit_order',
-          market: params.marketAddress,
-          side: params.side,
-          outcome: params.outcome,
-          size: truncatedSize,
-          price: params.price,
-          expiry: expiryTimestamp,
-          clientOrderId,
-          timestamp: Date.now(),
-          ...(isLeveraged && { leverage: params.leverage, marginAmount: params.marginAmount }),
-        };
-      }
 
       let signature: string = '';
       let binaryMessage: string = '';

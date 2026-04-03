@@ -10,7 +10,6 @@ import {
   useOrderbookStore, 
   useYesOrderbook, 
   useNoOrderbook,
-  type OrderLevel 
 } from '@/stores/orderbookStore';
 import { api, ApiError } from '@/lib/api';
 import { getWebSocket } from '@/lib/websocket';

@@ -123,7 +123,6 @@ export const useAuthStore = create<AuthState>()(
           const messageBytes = new TextEncoder().encode(message);
           
           let signatureBytes: Uint8Array | null = null;
-          let lastError: any = null;
           const MAX_RETRIES = 2;
           
           for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -131,7 +130,6 @@ export const useAuthStore = create<AuthState>()(
               signatureBytes = await signMessage(messageBytes);
               break; // Success, exit retry loop
             } catch (walletError: any) {
-              lastError = walletError;
               const errorMsg = walletError?.message || String(walletError);
               
               // User rejected or closed popup - not a retry-able error
@@ -292,7 +290,7 @@ export const useAuthStore = create<AuthState>()(
 
       checkSession: () => {
         const storedToken = getAuthToken();
-        const { tokenExpiresAt, walletAddress } = get();
+        const { tokenExpiresAt } = get();
 
         if (!storedToken) {
           set({ isAuthenticated: false, token: null });

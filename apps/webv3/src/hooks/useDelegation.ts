@@ -9,12 +9,11 @@ import { useWallet, useConnection } from '@solana/wallet-adapter-react';
 import { PublicKey, Transaction } from '@solana/web3.js';
 import {
   createApproveInstruction,
-  createAssociatedTokenAccountInstruction,
   getAccount,
   TokenAccountNotFoundError,
 } from '@solana/spl-token';
 import { api } from '@/lib/api';
-import { USDC_MINT, getUserUsdcAta } from '@/lib/solana';
+import { getUserUsdcAta } from '@/lib/solana';
 
 // Default delegation amount: 10,000 USDC (in smallest units)
 const DEFAULT_DELEGATION_AMOUNT = 10_000 * 1_000_000;

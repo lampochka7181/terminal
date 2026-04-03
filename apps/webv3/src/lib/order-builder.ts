@@ -11,13 +11,10 @@ import {
   TransactionInstruction,
   Transaction,
   Connection,
-  SystemProgram,
 } from '@solana/web3.js';
-import bs58 from 'bs58';
 import {
   PROGRAM_ID,
   TOKEN_PROGRAM_ID,
-  ASSOCIATED_TOKEN_PROGRAM_ID,
   getUserUsdcAta,
   getMarketVaultAta,
 } from './solana';

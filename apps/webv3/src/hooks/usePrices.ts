@@ -6,7 +6,7 @@
 import { useEffect, useCallback, useRef } from 'react';
 import { usePriceStore } from '@/stores/priceStore';
 import { api, ApiError } from '@/lib/api';
-import { getWebSocket, type PriceUpdate } from '@/lib/websocket';
+import { getWebSocket } from '@/lib/websocket';
 import type { Asset } from '@degen/types';
 
 export function usePrices() {

@@ -8,7 +8,7 @@
  */
 
 import { useEffect, useCallback, useRef } from 'react';
-import { getWebSocket, type UserLiquidationUpdate } from '@/lib/websocket';
+import { getWebSocket } from '@/lib/websocket';
 import { useUserStore } from '@/stores/userStore';
 import { useAuthStore } from '@/stores/authStore';
 

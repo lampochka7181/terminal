@@ -418,7 +418,7 @@ export const useUserStore = create<UserState>((set, get) => ({
     get().fetchAllImmediate();
   },
 
-  handleSettlement: (settlement) => {
+  handleSettlement: (_settlement) => {
     if (delayedRefetchTimer) {
       clearTimeout(delayedRefetchTimer);
     }

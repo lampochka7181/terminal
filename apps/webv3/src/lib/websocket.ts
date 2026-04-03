@@ -184,7 +184,6 @@ export class WebSocketService {
   private ws: WebSocket | null = null;
   private url: string;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = Infinity;  // Never give up reconnecting
   private reconnectDelay = 1000;
   private maxReconnectDelay = 30000;       // Cap backoff at 30s
   private pingInterval: NodeJS.Timeout | null = null;

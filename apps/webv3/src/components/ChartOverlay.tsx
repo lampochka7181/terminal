@@ -1,21 +1,9 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { getCurrentRound, formatTime, timeframeSec } from '@/lib/timeframe';
 import { Eye } from 'lucide-react';
 import { useSelectedMarket, useMarketStore } from '@/stores/marketStore';
 import { useBestPrices } from '@/hooks/useOrderbook';
-import { getWebSocket } from '@/lib/websocket';
-import { useAuth } from '@/hooks/useAuth';
-import { useUserStore } from '@/stores/userStore';
 import TradeBubbles from './TradeBubbles';
-
-interface SettlementAnim {
-  id: number;
-  profit: number;
-  payout: number;
-  outcome: 'yes' | 'no';
-  shares: number;
-  phase: 'enter' | 'hold' | 'exit' | 'done';
-}
 
 /* PnLSettlementOverlay — parked; will be wired when settlement toasts ship.
 function PnLSettlementOverlay() {

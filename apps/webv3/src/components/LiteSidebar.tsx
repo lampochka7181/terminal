@@ -254,8 +254,6 @@ export default function LiteSidebar() {
       displayEntries.push({ pos, isYes: false, shares: pos.noShares, costBasis: pos.totalCost ?? pos.noShares * noEntry, entryPrice: noEntry });
     }
   }
-  const firstEntry = displayEntries[0];
-
   return (
     <>
       <div style={{
