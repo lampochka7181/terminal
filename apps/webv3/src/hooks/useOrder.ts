@@ -129,7 +129,6 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
       const clientOrderId = Date.now();
       const isSellOrder = params.side === 'ask';
       const isMarketOrder = params.orderType === 'market';
-      const isLeveraged = params.leverage && params.leverage > 1;
 
       let signature: string = '';
       let binaryMessage: string = '';
