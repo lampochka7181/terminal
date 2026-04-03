@@ -7,7 +7,6 @@ import { useCallback, useEffect } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useAuthStore, startTokenRefresh, stopTokenRefresh } from '@/stores/authStore';
 import { useUserStore } from '@/stores/userStore';
-import { getWebSocket } from '@/lib/websocket';
 
 export function useAuth() {
   const wallet = useWallet();

@@ -256,29 +256,6 @@ export default function LiteSidebar() {
   }
   const firstEntry = displayEntries[0];
 
-  const liteBestBid = firstEntry
-    ? (firstEntry.isYes ? yesPrices.bestBid : noPrices.bestBid)
-    : 0;
-  const liteHasLiquidity = liteBestBid > 0 && liteBestBid < 1;
-  let liveMark = firstEntry
-    ? (liteHasLiquidity ? liteBestBid : 0)
-    : 0;
-  let liteFallback = false;
-  if (firstEntry && !liteHasLiquidity && strikePrice > 0 && assetPrice) {
-    if (assetPrice > strikePrice) {
-      liveMark = firstEntry.isYes ? 0.999 : 0.001;
-      liteFallback = true;
-    } else if (assetPrice < strikePrice) {
-      liveMark = firstEntry.isYes ? 0.001 : 0.999;
-      liteFallback = true;
-    }
-  }
-  const liveShares = firstEntry?.shares ?? 0;
-  const liteCostBasis = firstEntry?.costBasis ?? 0;
-  const _livePnL = firstEntry
-    ? ((liteHasLiquidity || liteFallback) ? (liveMark * liveShares) - liteCostBasis : -liteCostBasis)
-    : 0;
-
   return (
     <>
       <div style={{

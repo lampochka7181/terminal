@@ -17,7 +17,8 @@ interface SettlementAnim {
   phase: 'enter' | 'hold' | 'exit' | 'done';
 }
 
-function _PnLSettlementOverlay() {
+/* PnLSettlementOverlay — parked; will be wired when settlement toasts ship.
+function PnLSettlementOverlay() {
   const [anim, setAnim] = useState<SettlementAnim | null>(null);
   const { isAuthenticated } = useAuth();
   const idCounter = useRef(0);
@@ -172,6 +173,7 @@ function _PnLSettlementOverlay() {
     </div>
   );
 }
+*/
 
 function ToolbarInfoDot({ text }: { text: string }) {
   const [open, setOpen] = useState(false);

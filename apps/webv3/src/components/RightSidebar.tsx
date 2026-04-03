@@ -9,7 +9,7 @@ import { useUser } from '@/hooks/useUser';
 import { useOrder } from '@/hooks/useOrder';
 import { useSessionKey } from '@/hooks/useSessionKey';
 import { useDelegation } from '@/hooks/useDelegation';
-import { useMarketStore, useSelectedMarket } from '@/stores/marketStore';
+import { useSelectedMarket } from '@/stores/marketStore';
 import { useBestPrices } from '@/hooks/useOrderbook';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useWalletModal } from '@solana/wallet-adapter-react-ui';
@@ -34,8 +34,7 @@ export default function RightSidebar({ width }: { width?: number }) {
   const [orderType, setOrderType] = useState<'market' | 'limit'>(defaultOrderType);
   const [amount, setAmount] = useState(25);
   const [limitPrice, setLimitPrice] = useState('0.50');
-  const [leverage, setLeverage] = useState(1);
-  const [tradeType, setTradeType] = useState<'direction' | 'volatility'>('direction');
+  const [leverage] = useState(1);
   const [obView, setObView] = useState<'book' | 'market'>('book');
   const [chatOpen, setChatOpen] = useState(false);
   const [delegationModalOpen, setDelegationModalOpen] = useState(false);
@@ -119,105 +118,6 @@ export default function RightSidebar({ width }: { width?: number }) {
 
     await executePlaceOrder(outcome, side);
   }, [wallet.connected, isAuthenticated, market, executePlaceOrder, showPrompt, signIn, delegation]);
-
-  const handleVolatilityOrder = useCallback(async (type: 'volatile' | 'stable') => {
-    if (!wallet.connected) {
-      setWalletModalVisible(true);
-      return;
-    }
-    if (!isAuthenticated) {
-      try { await signIn(); } catch { return; }
-    }
-    const volApproved = await delegation.checkApproval();
-    if (!volApproved) {
-      showPrompt('Delegation Required', 'Please delegate USDC to start trading.', 'warning');
-      setDelegationModalOpen(true);
-      return;
-    }
-    if (!market) {
-      showPrompt('No Market', 'No active market available.', 'error');
-      return;
-    }
-
-    // Check liquidity before volatility orders
-    if (orderType === 'market' && type === 'volatile') {
-      if (yesPrices.bestAskSize === 0 || noPrices.bestAskSize === 0) {
-        showPrompt('No Liquidity', 'No liquidity available in the orderbook. Try placing a limit order instead.', 'warning');
-        return;
-      }
-    }
-    if (type === 'stable') {
-      if (yesPrices.bestBidSize === 0 || noPrices.bestBidSize === 0) {
-        showPrompt('No Liquidity', 'No liquidity available to close your position. It will settle automatically at market expiry.', 'warning');
-        return;
-      }
-    }
-
-    const isLeveraged = leverage > 1;
-    const leverageParams = isLeveraged ? { leverage, marginAmount: amount / leverage / 2 } : {};
-
-    if (type === 'volatile') {
-      const halfAmount = amount / 2;
-      const yesPrice = yesPrices.bestAsk || 0.50;
-      const noPrice = noPrices.bestAsk || 0.50;
-
-      await placeOrder({
-        marketAddress: market.address,
-        side: 'bid',
-        outcome: 'yes',
-        orderType,
-        price: yesPrice,
-        size: halfAmount / yesPrice,
-        dollarAmount: orderType === 'market' ? halfAmount : undefined,
-        maxPrice: orderType === 'market' ? 0.99 : undefined,
-        ...leverageParams,
-      });
-
-      await placeOrder({
-        marketAddress: market.address,
-        side: 'bid',
-        outcome: 'no',
-        orderType,
-        price: noPrice,
-        size: halfAmount / noPrice,
-        dollarAmount: orderType === 'market' ? halfAmount : undefined,
-        maxPrice: orderType === 'market' ? 0.99 : undefined,
-        ...leverageParams,
-      });
-
-      setTimeout(() => delegation.checkApproval(), 500);
-    } else {
-      const halfAmount = amount / 2;
-      const yesPrice = yesPrices.bestBid || 0.50;
-      const noPrice = noPrices.bestBid || 0.50;
-
-      const r1 = await placeOrder({
-        marketAddress: market.address,
-        side: 'ask',
-        outcome: 'yes',
-        orderType: 'market',
-        price: yesPrice,
-        size: halfAmount / yesPrice,
-        dollarAmount: halfAmount,
-      });
-
-      const r2 = await placeOrder({
-        marketAddress: market.address,
-        side: 'ask',
-        outcome: 'no',
-        orderType: 'market',
-        price: noPrice,
-        size: halfAmount / noPrice,
-        dollarAmount: halfAmount,
-      });
-
-      if ((r1 && r1.filledSize === 0) || (r2 && r2.filledSize === 0)) {
-        showPrompt('No Liquidity', 'No liquidity available to close your position. It will settle automatically at market expiry.', 'warning');
-      }
-
-      setTimeout(() => delegation.checkApproval(), 500);
-    }
-  }, [wallet.connected, isAuthenticated, delegation.isApproved, market, orderType, amount, yesPrices, noPrices, placeOrder, showPrompt, delegation]);
 
   const balanceDisplay = balance ? `$${balance.available.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}` : '$0';
   const delegatedDisplay = delegation.delegatedAmount > 0

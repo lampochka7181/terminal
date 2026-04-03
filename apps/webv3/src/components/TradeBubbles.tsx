@@ -59,7 +59,7 @@ const anchorCache = new Map<string, { time: number; price: number }>();
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
-export default function TradeBubbles({ mode }: TradeBubblesProps) {
+export default function TradeBubbles(_props: TradeBubblesProps) {
   const { isAuthenticated } = useAuth();
   const market = useSelectedMarket();
   const { selectedAsset } = useMarketStore();
@@ -401,9 +401,6 @@ export default function TradeBubbles({ mode }: TradeBubblesProps) {
     const isYes = bubble.outcome === 'yes';
     const isExpanded = expandedBubble === bubble.outcome;
     const color = isYes ? '#95ff94' : '#f55252';
-    const bgColor = isYes ? 'rgba(149,255,148,0.15)' : 'rgba(245,82,82,0.15)';
-    const borderColor = isYes ? 'rgba(149,255,148,0.4)' : 'rgba(245,82,82,0.4)';
-    const label = isYes ? 'Above' : 'Below';
     const dollarStr = `$${bubble.totalDollars < 1000
       ? bubble.totalDollars.toFixed(0)
       : (bubble.totalDollars / 1000).toFixed(1) + 'k'}`;
