@@ -156,28 +156,6 @@ export const config = {
   // Set to max allowed (500 bps = 5%) since relayer is trusted
   takerFeeBps: 500,   // 5% max fee cap for on-chain validation
   minNotionalValue: 10.0, // Legacy - use minBuyNotional/minSellNotional instead
-  
-  // ============================================================================
-  // LEVERAGE CONFIGURATION
-  // ============================================================================
-  
-  // Lending Pool Wallet - provides USDC loans for leveraged positions
-  lendingWalletPrivateKey: process.env.LENDING_WALLET_PRIVATE_KEY || process.env.LENDING_WALLET || '',
-  
-  // Insurance Fund Wallet - receives liquidation penalties, covers bad debt
-  insuranceWalletPrivateKey: process.env.INSURANCE_WALLET_PRIVATE_KEY || process.env.INSURANCE_WALLET || '',
-  
-  // Leverage Settings
-  leverage: {
-    maxLeverage: parseFloat(process.env.MAX_LEVERAGE || '10'),           // Maximum 10x leverage
-    minLeverage: 1.0,                                                     // Minimum (no leverage)
-    maintenanceMarginPct: parseFloat(process.env.MAINTENANCE_MARGIN_PCT || '3') / 100,  // 3% = 0.03 (liquidate later, ~30% returned with new penalty calc)
-    liquidationPenaltyPct: parseFloat(process.env.LIQUIDATION_PENALTY_PCT || '2') / 100, // 2% = 0.02
-    minMarginUsd: parseFloat(process.env.MIN_MARGIN_USD || '5'),          // Minimum $5 margin
-    maxSingleLoanPct: parseFloat(process.env.MAX_SINGLE_LOAN_PCT || '10') / 100,  // Max 10% of pool per loan
-    maxUserExposurePct: parseFloat(process.env.MAX_USER_EXPOSURE_PCT || '20') / 100, // Max 20% of pool per user
-    minPoolReservePct: parseFloat(process.env.MIN_POOL_RESERVE_PCT || '10') / 100,   // Keep 10% always available
-  },
 
   // ============================================================================
   // V2 TOKENIZED SHARES (Feature Flag)

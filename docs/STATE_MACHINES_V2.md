@@ -6,7 +6,6 @@ This document describes all state machines in the Degen Terminal V2 system with 
 > - Market lifecycle includes SETTLING state for merkle settlement
 > - Position lifecycle replaced by token holdings
 > - Settlement uses merkle proofs and parallel relayers
-> - Leverage flow updated for token model
 
 ---
 
@@ -79,16 +78,39 @@ TRIGGERS & ACTORS (V2):
 
 ### Market Status Values (V2 On-Chain)
 
+Defined in `packages/contracts/programs/degen-terminal/src/state_v2.rs` as
+`MarketStatusV2` (the V1 `MarketStatus` in `state.rs` still exists for legacy
+markets and has only 5 variants — no `Settling`).
+
 ```rust
-pub enum MarketStatus {
+pub enum MarketStatusV2 {
     Pending = 0,    // Pre-created, awaiting activation
     Open = 1,       // Trading active, YES/NO tokens being minted/transferred
     Closed = 2,     // Trading stopped, awaiting resolution
     Resolved = 3,   // Outcome determined (YES or NO)
-    Settling = 4,   // NEW: Merkle root posted, batches processing
+    Settling = 4,   // Merkle root posted, batches processing
     Settled = 5,    // All payouts distributed
 }
 ```
+
+### DB Representation (differs from on-chain)
+
+The Postgres enum is deliberately narrower than the on-chain enum because the
+Supabase connection pooler caches enum values and will not pick up new variants
+on a live deployment. See `apps/api/src/db/schema.ts`:
+
+```ts
+pgEnum('market_status', ['OPEN', 'CLOSED', 'RESOLVED', 'SETTLED', 'SETTLEMENT_FAILED'])
+```
+
+- `PENDING` is **not** a DB enum value — pending markets are stored with
+  `status = 'OPEN'` and `strike_price = '0'` (the activator job scans for this).
+- `SETTLING` is **not** a DB enum value — it is transient. DB rows stay at
+  `RESOLVED` during batch settlement; the merkle settler reads the on-chain
+  `Settling` status directly when it needs to.
+- `SETTLEMENT_FAILED` is added for markets that exceed the
+  `MAX_SETTLEMENT_FAILURES` (10) threshold in the merkle settler and need
+  manual review.
 
 ### Market Account Fields (V2)
 
@@ -124,47 +146,186 @@ pub struct MarketV2 {
 
 ## 2. Order Lifecycle State Machine
 
-Orders remain unchanged from V1 - they can be filled, partially filled, cancelled, or expire.
+Orders can be filled, partially filled, cancelled (by the user OR the
+backend), or — once the market they belong to resolves — settled.
+
+Two things to be aware of when reading the diagram:
+
+- **`EXPIRED` is on-chain only.** The DB `order_status` enum is
+  `'OPEN' | 'PARTIAL' | 'FILLED' | 'CANCELLED'`. The Order Expirer keeper
+  and on-chain tx-failure handlers write `CANCELLED` in the DB and record
+  the real reason in `cancel_reason` (`'EXPIRED'`, `'MARKET_CLOSING'`,
+  `'INSUFFICIENT_FUNDS'`, etc).
+- **`SETTLED` / `SETTLEMENT_FAILED` are logical states, not DB enum values.**
+  After a FILLED (or partially-filled) order's market reaches
+  `markets.status = 'SETTLED'` or `'SETTLEMENT_FAILED'`, the order is
+  logically in that terminal state too — but the `orders.status` column
+  itself does not change. These terminal states are derived by joining on
+  the market status when needed.
+
+```
+┌───────────────────────────────────────────────────────────────────────────────────────────┐
+│                                    ORDER LIFECYCLE                                         │
+├───────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                           │
+│                          ┌─────────────────────────────────────┐                          │
+│                          │           User places order         │                          │
+│                          │        (place_order instruction)    │                          │
+│                          └────────────────────┬────────────────┘                          │
+│                                               │                                           │
+│                                               ▼                                           │
+│                                          ┌─────────┐                                      │
+│                         ┌───────────────│  OPEN   │───────────────┐                       │
+│                         │                └────┬────┘                │                      │
+│                         │                     │                     │                      │
+│                partial  │             full    │                     │   cancel            │
+│                fill     │             fill    │                     │   (any reason)      │
+│                         ▼                     │                     ▼                      │
+│                    ┌─────────┐                │               ┌───────────┐                │
+│            ┌──────│ PARTIAL │───────┐        │               │ CANCELLED │                │
+│            │       └────┬────┘       │        │               │           │                │
+│            │            │            │        │               │ cancel_   │                │
+│            │ rest fills │ cancel     │        │               │ reason    │                │
+│            │            │ (any)      │        │               │ recorded  │                │
+│            │            ▼            │        │               └─────┬─────┘                │
+│            │       ┌─────────┐       │        │                     ▲                      │
+│            │       │CANCELLED│       │        │                     │                      │
+│            │       └─────────┘       │        │                     │                      │
+│            │                         ▼        ▼                     │                      │
+│            │                    ┌─────────────────┐                 │                      │
+│            │                    │     FILLED      │                 │                      │
+│            │                    │                 │                 │                      │
+│            │                    │ remaining_size  │                 │                      │
+│            │                    │      = 0        │                 │                      │
+│            │                    └────────┬────────┘                 │                      │
+│            │                             │                          │                      │
+│            └─────────────────┐           │     Market reaches       │                      │
+│                              │           │     SETTLED or           │                      │
+│              Market reaches  │           │     SETTLEMENT_FAILED    │                      │
+│              SETTLED or      │           │                          │                      │
+│              SETTLEMENT_     │           │                          │                      │
+│              FAILED          │           │                          │                      │
+│                              ▼           ▼                          │                      │
+│                    ┌──────────────────────────────┐                 │                      │
+│                    │  (logical)    SETTLED  /     │                 │                      │
+│                    │         SETTLEMENT_FAILED    │                 │                      │
+│                    │                              │                 │                      │
+│                    │ Derived from markets.status. │                 │                      │
+│                    │ orders.status stays FILLED   │                 │                      │
+│                    │ (or CANCELLED w/ fills).     │                 │                      │
+│                    └──────────────────────────────┘                 │                      │
+│                                                                     │                      │
+│                                                                     │                      │
+│               Cancel reasons (orders.cancel_reason):                │                      │
+│                                                                     │                      │
+│               User-initiated           Backend / system-initiated   │                      │
+│               ─────────────            ──────────────────────────   │                      │
+│               • USER                   • EXPIRED (GTT past exp_ts)  │                      │
+│               • USER_CANCEL_ALL        • MARKET_CLOSED              │                      │
+│                                        • MARKET_CLOSING (pre-close) │                      │
+│               MM / agent               • INSUFFICIENT_FUNDS         │                      │
+│               ─────────                • INSUFFICIENT_SHARES        │                      │
+│               • MM_CANCEL              • INSUFFICIENT_LAMPORTS      │                      │
+│                                        • FEE_TOO_LOW                │                      │
+│                                        • SELF_TRADE                 │                      │
+│                                        • POSITION_LIMIT             │                      │
+│                                        • INVALID_SIGNATURE          │                      │
+│                                        • ACCOUNT_NOT_FOUND          │                      │
+│                                        • ACCOUNT_DESERIALIZATION    │                      │
+│                                        • MAX_RETRIES                │                      │
+│                                                                     │                      │
+│               RPC backpressure (see §2.1 below)                     │                      │
+│               ──────────────────────────────────                    │                      │
+│                                        • RPC_RATE_LIMITED (HTTP 429)│                      │
+│                                        • RPC_TIMEOUT (ETIMEDOUT,    │                      │
+│                                          socket hang up, blockhash  │                      │
+│                                          not found, fetch failed)   │                      │
+│                                                                                           │
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The backend-error reasons are emitted by the on-chain submit worker
+(`apps/api/src/queue/workers/onchain-submit.worker.ts` — see the
+`permanentCodes` list) and the trade error classifier in
+`apps/api/src/services/transaction.service.ts`. A rejected taker order is
+cancelled with its error code as the `cancel_reason`.
+
+`FILLED → SETTLED / SETTLEMENT_FAILED` only applies to orders that produced
+any fills. A `CANCELLED` order with `filled_size > 0` (e.g. a partial fill
+killed at `MARKET_CLOSING`) is subject to the same logical settlement
+transition for the filled portion.
+
+### 2.1 RPC Backpressure Sub-State Machine
+
+HTTP 429 / timeout errors from the Solana RPC are transient — the right
+response is to back off, not to cancel the order. The match and close paths
+in `transaction.service.ts` run a dedicated retry loop for these so a brief
+provider rate-limit spike doesn't instantly burn the 3-attempt
+`MAX_RETRIES` budget and cancel the user's order.
+
+Detected by `isRpcBackpressureError()`:
+
+- `RPC_RATE_LIMITED` — any error message matching `429`,
+  `Too Many Requests`, `rate limit`, `Connection rate limits exceeded`.
+- `RPC_TIMEOUT` — `ETIMEDOUT`, `ESOCKETTIMEDOUT`, `socket hang up`,
+  `ECONNRESET`, `ECONNREFUSED`, `fetch failed`, `blockhash not found`,
+  `request timed out`.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                             ORDER LIFECYCLE                                      │
+│                  RPC BACKPRESSURE RETRY FLOW (match / close)                     │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
-│                        ┌─────────────────────────────────────┐                  │
-│                        │            User places order        │                  │
-│                        │         (place_order instruction)   │                  │
-│                        └─────────────────┬───────────────────┘                  │
-│                                          │                                      │
-│                                          ▼                                      │
-│                                     ┌─────────┐                                │
-│                              ┌──────│  OPEN   │──────┐                         │
-│                              │      └────┬────┘      │                         │
-│                              │           │           │                         │
-│                    partial   │           │           │   user cancels          │
-│                    fill      │           │           │   (cancel_order)        │
-│                              ▼           │           ▼                         │
-│                        ┌─────────┐       │     ┌───────────┐                   │
-│                        │ PARTIAL │       │     │ CANCELLED │                   │
-│                        │         │       │     │           │                   │
-│                        └────┬────┘       │     └───────────┘                   │
-│                             │            │           ▲                         │
-│             remaining fill  │            │           │                         │
-│             completes       │            │           │ market closes           │
-│                             │            │           │ (MARKET_CLOSED)         │
-│                             ▼            │           │                         │
-│                        ┌─────────┐       │           │ order expires           │
-│                        │ FILLED  │◀──────┘           │ (EXPIRED)               │
-│                        │         │    full fill      │                         │
-│                        └─────────┘                   │                         │
-│                                                      │                         │
-│                             ┌─────────┐              │                         │
-│                             │ EXPIRED │◀─────────────┘                         │
-│                             │         │  (GTT order past expiry_ts)            │
-│                             └─────────┘                                        │
+│    anchorClient.executeMatchV2() throws                                         │
+│                 │                                                               │
+│                 ▼                                                               │
+│         isPermanentError(err)? ──── yes ───▶ cancel order with the              │
+│                 │ no                         permanent code and return          │
+│                 ▼                                                               │
+│         isRpcBackpressureError(err)?                                            │
+│                 │                                                               │
+│         ┌───────┴────────┐                                                      │
+│         │                │                                                      │
+│         ▼ yes            ▼ no                                                   │
+│   ┌──────────────┐  ┌──────────────────┐                                        │
+│   │ BACKPRESSURE │  │ TRANSIENT        │                                        │
+│   │              │  │                  │                                        │
+│   │ retries ≤ 5  │  │ attempts ≤ 3     │                                        │
+│   │ 1.5s → 3s →  │  │ 0.5s → 1s → 2s   │                                        │
+│   │ 6s → 12s →   │  │ (no jitter)      │                                        │
+│   │ 15s (cap)    │  │                  │                                        │
+│   │ + 0–500ms    │  │                  │                                        │
+│   │ jitter       │  │                  │                                        │
+│   └──────┬───────┘  └────────┬─────────┘                                        │
+│          │                   │                                                  │
+│          ▼                   ▼                                                  │
+│   budget exhausted?    budget exhausted?                                        │
+│          │ yes              │ yes                                               │
+│          ▼                   ▼                                                  │
+│   cancel order with    cancel order with                                        │
+│   RPC_RATE_LIMITED     MAX_RETRIES                                              │
+│   or RPC_TIMEOUT       (or last backpressure                                    │
+│                         code seen, if any)                                      │
+│                                                                                 │
+│   The two budgets are independent: a match can survive up to 5 × backpressure   │
+│   retries + 3 × generic-transient retries before the order is cancelled.        │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**User-facing surface.** On exhaustion the order is cancelled with
+`cancel_reason = 'RPC_RATE_LIMITED' | 'RPC_TIMEOUT'` and a `trade_failed`
+WebSocket event is pushed to the affected users with the same `errorCode`.
+The webv3 activity panel renders these as `Failed (Network Busy)` /
+`Failed (Network Timeout)` instead of the generic `Failed`, so the user
+knows to retry rather than suspect their order was malformed.
+
+**Note on the queue layer.** `RPC_RATE_LIMITED` / `RPC_TIMEOUT` are added to
+the `onchain-submit` worker's `permanentCodes` list. That looks paradoxical
+(rate-limits *are* transient) but is deliberate: by the time a code bubbles
+out of the transaction service it has already exhausted the backpressure
+retry budget, so letting BullMQ retry would just pile more load onto a
+provider that is explicitly asking us to slow down.
 
 ---
 
@@ -260,7 +421,9 @@ User Wallet: Alice (7xK...)
 
 ## 4. Settlement Batch State Machine (V2 - NEW)
 
-Individual settlement batches progress through states.
+Individual settlement batches progress through states. Status transitions are
+written to the `settlement_jobs` table by the `onchain-submit` BullMQ worker
+(`apps/api/src/queue/workers/onchain-submit.worker.ts`), not by a keeper job.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -269,7 +432,7 @@ Individual settlement batches progress through states.
 │                                                                                 │
 │                          Merkle root posted on-chain                            │
 │                          Settlement jobs created in DB                          │
-│                                      │                                          │
+│                          Enqueued on BullMQ `onchain-submit`                    │
 │                                      │                                          │
 │                                      ▼                                          │
 │                                ┌──────────┐                                    │
@@ -278,33 +441,40 @@ Individual settlement batches progress through states.
 │                                │ In queue │                                    │
 │                                └────┬─────┘                                    │
 │                                     │                                          │
-│                                     │ Relayer claims job                       │
+│                                     │ Worker acquires fee payer, submits TX    │
 │                                     ▼                                          │
 │                               ┌───────────┐                                    │
-│                               │PROCESSING │                                    │
+│                               │ SUBMITTED │                                    │
 │                               │           │                                    │
-│                               │ Building  │                                    │
-│                               │ TX...     │                                    │
+│                               │ attempts++│                                    │
+│                               │ awaiting  │                                    │
+│                               │ confirm   │                                    │
 │                               └─────┬─────┘                                    │
 │                                     │                                          │
 │                    ┌────────────────┴────────────────┐                         │
 │                    │                                 │                         │
-│                    │ TX confirmed                    │ TX failed               │
+│                    │ TX confirmed OR                 │ TX failed / exhausted   │
+│                    │ already-claimed                 │ retries                 │
 │                    ▼                                 ▼                         │
 │              ┌───────────┐                     ┌──────────┐                    │
-│              │ CONFIRMED │                     │  FAILED  │                    │
+│              │ COMPLETED │                     │  FAILED  │                    │
 │              │           │                     │          │                    │
-│              │ tx_sig    │                     │ error    │                    │
-│              │ recorded  │                     │ logged   │                    │
+│              │ tx_sig,   │                     │ error_   │                    │
+│              │ completed │                     │ message  │                    │
+│              │ _at set   │                     │ logged   │                    │
 │              └───────────┘                     └────┬─────┘                    │
 │                                                     │                          │
-│                                                     │ Retry (up to 3)          │
+│                                                     │ BullMQ retry (bounded)   │
 │                                                     ▼                          │
-│                                               ┌──────────┐                     │
-│                                               │ PENDING  │ (re-queued)         │
-│                                               └──────────┘                     │
+│                                               ┌───────────┐                    │
+│                                               │ SUBMITTED │ (re-submitted)     │
+│                                               └───────────┘                    │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
+
+Raw states (settlement_jobs.status): 'PENDING' | 'SUBMITTED' | 'COMPLETED' | 'FAILED'.
+There is no separate 'PROCESSING'/'CONFIRMED' pair — transient work lives
+entirely within BullMQ job attempts.
 
 BATCH STRUCTURE:
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -321,7 +491,7 @@ BATCH STRUCTURE:
 │  │    ... (up to 15 entries)                                               │ │
 │  │  ]                                                                      │ │
 │  │                                                                         │ │
-│  │  status: PENDING | PROCESSING | CONFIRMED | FAILED                      │ │
+│  │  status: PENDING | SUBMITTED | COMPLETED | FAILED                       │ │
 │  │  relayer_pubkey: "Relayer3..."                                          │ │
 │  │  tx_signature: "5xK7..."                                                │ │
 │  │  attempts: 1                                                            │ │
@@ -388,133 +558,11 @@ Trade types remain the same, but mechanics differ for tokens.
 
 ---
 
-## 6. Margin Account Lifecycle (V2 - Leverage)
+## 6. Relayer Pool State Machine (V2 - NEW)
 
-Margin accounts work the same conceptually, but the Lending Pool holds tokens instead of a Position PDA.
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                     MARGIN ACCOUNT LIFECYCLE V2 (Tokenized)                          │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│                         User places leveraged order                                 │
-│                         (leverage > 1x, e.g., 5x)                                   │
-│                                      │                                              │
-│                                      │ Margin collected from user                   │
-│                                      │ Loan recorded in DB                          │
-│                                      │ Lending Pool executes trade                  │
-│                                      ▼                                              │
-│                                 ┌─────────┐                                        │
-│    ┌───────────────────────────│  OPEN   │───────────────────────────┐            │
-│    │                           └────┬────┘                           │            │
-│    │                                │                                │            │
-│    │ Price moves toward             │                                │ Price drops │
-│    │ liquidation price              │ User sells position            │ below liq   │
-│    │                                │ (manual close)                 │ price       │
-│    │                                │                                │            │
-│    │    ┌───────────────────────────┼───────────────────────────┐    │            │
-│    │    │                           │                           │    │            │
-│    │    │        ┌──────────────────┴──────────────────┐        │    │            │
-│    │    │        │       Market Resolves               │        │    │            │
-│    │    │        │ (LP included in merkle settlement)  │        │    │            │
-│    │    │        └──────────────────┬──────────────────┘        │    │            │
-│    │    │                           │                           │    │            │
-│    │    ▼                           ▼                           ▼    │            │
-│    │  ┌─────────────────┐    ┌─────────────────┐    ┌──────────────────┐         │
-│    │  │ MANUAL CLOSE    │    │ SETTLEMENT      │    │  LIQUIDATED      │         │
-│    │  │                 │    │                 │    │                  │         │
-│    │  │ • LP sells      │    │ • LP receives   │    │ • Keeper sells   │         │
-│    │  │   tokens        │    │   payout        │    │   LP's tokens    │         │
-│    │  │ • Loan repaid   │    │ • Loan repaid   │    │ • Loan repaid    │         │
-│    │  │ • Equity→user   │    │ • Profit→user   │    │ • Penalty→Ins.   │         │
-│    │  │                 │    │ • Loss→Ins.     │    │ • Remaining→user │         │
-│    │  └────────┬────────┘    └────────┬────────┘    └────────┬─────────┘         │
-│    │           │                      │                      │                   │
-│    │           └──────────────────────┼──────────────────────┘                   │
-│    │                                  │                                          │
-│    │                                  ▼                                          │
-│    │                            ┌──────────┐                                     │
-│    └───────────────────────────▶│  CLOSED  │◀────────────────────────────────────┘
-│                                 │          │
-│                                 │ status = CLOSED                                │
-│                                 │ closedAt = now                                 │
-│                                 └──────────┘                                     │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-
-V2 KEY DIFFERENCE - TOKEN HOLDINGS:
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                                                                              │
-│  V1 (Position PDA):                      V2 (Tokens):                        │
-│  ─────────────────                       ────────────                        │
-│  Lending Pool has Position PDA           Lending Pool has YES/NO tokens      │
-│  with yes_shares/no_shares fields        in its Associated Token Accounts    │
-│                                                                              │
-│  On-Chain State:                         On-Chain State:                     │
-│  ┌────────────────────────┐              ┌────────────────────────┐          │
-│  │ Position PDA           │              │ Lending Pool Wallet    │          │
-│  │   owner: Lending Pool  │              │   YES ATA: 250 tokens  │          │
-│  │   yes_shares: 250      │              │   NO ATA: 0 tokens     │          │
-│  │   no_shares: 0         │              │                        │          │
-│  └────────────────────────┘              └────────────────────────┘          │
-│                                                                              │
-│  Database (unchanged):                                                       │
-│  ┌─────────────────────────────────────────────────────────────────────────┐ │
-│  │  margin_accounts:                                                       │ │
-│  │    user_id: alice                                                       │ │
-│  │    side: YES                                                            │ │
-│  │    shares: 250  (beneficial ownership of LP's tokens)                   │ │
-│  │    loan_amount: $200                                                    │ │
-│  │    leverage: 5x                                                         │ │
-│  └─────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
-### V2 Leveraged Settlement Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                    LEVERAGED SETTLEMENT FLOW (V2)                                │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  1. Market reaches RESOLVED status                                              │
-│                                                                                 │
-│  2. Merkle tree builder snapshots token balances:                               │
-│     - Lending Pool has 500 YES tokens (across all leveraged positions)          │
-│     - Regular users have their own token balances                               │
-│                                                                                 │
-│  3. Merkle tree includes Lending Pool:                                          │
-│     leaf = hash(lending_pool_pubkey, $500_payout)                               │
-│                                                                                 │
-│  4. batch_settle_with_proof transfers $500 to Lending Pool                      │
-│                                                                                 │
-│  5. Lending Pool Distribution Job (runs after settlement):                      │
-│                                                                                 │
-│     For each margin_account linked to this market:                              │
-│     ┌─────────────────────────────────────────────────────────────────────────┐│
-│     │  Alice's account: 250 shares @ 5x                                       ││
-│     │    payout_share = 250 × $1.00 = $250                                    ││
-│     │    loan_repaid = $200                                                   ││
-│     │    user_profit = $250 - $200 = $50 → Transfer to Alice                  ││
-│     │                                                                         ││
-│     │  Bob's account: 250 shares @ 3x                                         ││
-│     │    payout_share = 250 × $1.00 = $250                                    ││
-│     │    loan_repaid = $167                                                   ││
-│     │    user_profit = $250 - $167 = $83 → Transfer to Bob                    ││
-│     └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                                 │
-│  6. On-chain transfers from Lending Pool to users                               │
-│     (can be batched or individual)                                              │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 7. Relayer Pool State Machine (V2 - NEW)
-
-Individual relayers in the pool have states.
+Child relayer wallets live in the `relayer_wallets` table (raw SQL —
+`relayer_wallets` is managed outside the Drizzle schema). State transitions are
+driven by `apps/api/src/services/relayer-pool.service.ts`.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -522,49 +570,59 @@ Individual relayers in the pool have states.
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
 │                            ┌──────────────────┐                                │
-│                            │      IDLE        │                                │
+│                            │      active      │                                │
 │                            │                  │                                │
-│                            │ Waiting for jobs │                                │
+│                            │ Eligible for     │                                │
+│                            │ acquireFeePayer  │                                │
 │                            └────────┬─────────┘                                │
 │                                     │                                          │
-│                                     │ Job claimed from queue                   │
+│                                     │ releaseFeePayer(success=false)           │
+│                                     │ consecutive_failures >= threshold        │
 │                                     ▼                                          │
 │                            ┌──────────────────┐                                │
-│                            │     ACTIVE       │                                │
+│                            │     cooldown     │                                │
 │                            │                  │                                │
-│                            │ Processing batch │                                │
-│                            │ tx_in_flight++   │                                │
+│                            │ cooldown_until   │                                │
+│                            │ timestamp set    │                                │
 │                            └────────┬─────────┘                                │
 │                                     │                                          │
-│                    ┌────────────────┴────────────────┐                         │
-│                    │                                 │                         │
-│                    │ TX confirmed                    │ TX failed               │
-│                    ▼                                 ▼                         │
-│            ┌──────────────────┐            ┌──────────────────┐                │
-│            │   IDLE           │            │   COOLDOWN       │                │
-│            │                  │            │                  │                │
-│            │ success_count++  │            │ failure_count++  │                │
-│            │ Ready for next   │            │ Brief pause      │                │
-│            └──────────────────┘            │ before retry     │                │
-│                    ▲                       └────────┬─────────┘                │
-│                    │                                │                          │
-│                    │         After cooldown         │                          │
-│                    └────────────────────────────────┘                          │
+│                                     │ cooldown_until < NOW()                   │
+│                                     │ (restored on next acquire)               │
+│                                     ▼                                          │
+│                            ┌──────────────────┐                                │
+│                            │      active      │                                │
+│                            │ failures reset   │                                │
+│                            └──────────────────┘                                │
 │                                                                                 │
-│  RELAYER POOL MANAGEMENT:                                                       │
+│                            ┌──────────────────┐                                │
+│                            │     disabled     │                                │
+│                            │                  │                                │
+│                            │ Permanently      │                                │
+│                            │ removed; skipped │                                │
+│                            │ by all selectors │                                │
+│                            └──────────────────┘                                │
+│                                                                                 │
+│  RELAYER ACQUISITION (acquireFeePayer):                                         │
 │  ┌─────────────────────────────────────────────────────────────────────────┐   │
 │  │                                                                         │   │
-│  │  Relayer Selection (for job assignment):                                │   │
-│  │  1. Filter: status == IDLE && balance > MIN_SOL                         │   │
-│  │  2. Sort by: success_rate DESC, last_used ASC                           │   │
-│  │  3. Assign to highest-ranked available relayer                          │   │
+│  │  1. Promote any `cooldown` wallet whose `cooldown_until < NOW()`        │   │
+│  │     back to `active` (with consecutive_failures reset).                 │   │
+│  │  2. Pick the child wallet with status='active' and                      │   │
+│  │     balance_lamports >= MIN_BALANCE_SOL, ordered by                     │   │
+│  │     active_jobs ASC, last_used_at ASC NULLS FIRST. LIMIT 1.             │   │
+│  │  3. Fallback chain if no child is eligible:                             │   │
+│  │       child pool → master1 → master2                                    │   │
+│  │  4. Master wallets are not state-tracked; they are always eligible      │   │
+│  │     if on-chain balance is above MIN_BALANCE_SOL.                       │   │
 │  │                                                                         │   │
-│  │  Auto-Funding:                                                          │   │
-│  │  If relayer.balance < 0.1 SOL → Fund from master wallet                 │   │
+│  │  Auto-Funding (Relayer Pool Funder keeper, every 30s):                  │   │
+│  │  For every non-disabled child with balance < MIN_BALANCE_SOL,           │   │
+│  │  transfer FUND_AMOUNT_SOL from master1 (fallback master2).              │   │
 │  │                                                                         │   │
 │  │  Circuit Breaker:                                                       │   │
-│  │  If relayer.failure_rate > 50% in last 10 jobs → Mark as UNHEALTHY      │   │
-│  │  UNHEALTHY relayers skipped until manual review                         │   │
+│  │  `disabled` is a terminal state set manually (no automatic promotion    │   │
+│  │  from `cooldown` → `disabled` today). The cooldown path is the only    │   │
+│  │  automatic backoff; persistent failures just keep bouncing through it. │   │
 │  │                                                                         │   │
 │  └─────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │
@@ -573,9 +631,17 @@ Individual relayers in the pool have states.
 
 ---
 
-## 8. Keeper Jobs Schedule (V2)
+## 7. Keeper Jobs Schedule (V2)
 
-Updated job schedule with new V2 jobs.
+Source of truth: `apps/api/src/jobs/index.ts`. Intervals have two columns —
+the default runtime and the value used when `PERF_TEST_MODE=true` (disables
+some jobs entirely to avoid load during benchmarks). All jobs add 0–500ms
+random jitter per tick to avoid lock-step scheduling, and each job can be
+skipped when the DB pool's `waitingCount` is too high.
+
+Batch settlement is **not** a keeper job — batches are enqueued to the
+BullMQ `onchain-submit` queue by the Merkle Settler and consumed by
+`apps/api/src/queue/workers/onchain-submit.worker.ts`.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -584,33 +650,41 @@ Updated job schedule with new V2 jobs.
 │                                                                                 │
 │  TIMELINE (per market lifecycle):                                               │
 │                                                                                 │
-│  T-5min     T-0s      T+0s      T+2s        T+5s         T+30s      T+60s       │
-│     │         │         │         │           │             │          │        │
-│     ▼         ▼         ▼         ▼           ▼             ▼          ▼        │
+│  T-30s    T-0s       T+0s      T+3s      T+3s       (via queue)    T+30s        │
+│    │       │          │         │          │             │            │         │
+│    ▼       ▼          ▼         ▼          ▼             ▼            ▼         │
 │  ┌──────┐ ┌──────┐ ┌────────┐ ┌───────┐ ┌─────────┐ ┌──────────┐ ┌─────────┐  │
-│  │CREATE│ │ACTIV.│ │ CLOSE  │ │RESOLVE│ │ MERKLE  │ │  BATCH   │ │FINALIZE │  │
-│  │      │ │      │ │TRADING │ │       │ │  ROOT   │ │ SETTLE   │ │         │  │
-│  │Market│ │Create│ │Window  │ │Set    │ │ Build & │ │ Parallel │ │ Close   │  │
-│  │+Mints│ │Strike│ │        │ │outcome│ │ Post    │ │ relayers │ │ mints   │  │
+│  │CREATE│ │ACTIV.│ │ CLOSE  │ │RESOLVE│ │ MERKLE  │ │ onchain- │ │ CLOSE   │  │
+│  │      │ │      │ │TRADING │ │       │ │SETTLER  │ │ submit   │ │ MARKET  │  │
+│  │Market│ │Strike│ │(at     │ │Set    │ │ builds  │ │ BullMQ   │ │ Close   │  │
+│  │+Mints│ │+Acti-│ │ expiry │ │outcome│ │ tree &  │ │ worker   │ │ mints,  │  │
+│  │(DB)  │ │vate  │ │ inside │ │       │ │ posts   │ │ processes│ │ recover │  │
+│  │      │ │      │ │resolver│ │       │ │ root    │ │ batches  │ │ rent    │  │
 │  └──────┘ └──────┘ └────────┘ └───────┘ └─────────┘ └──────────┘ └─────────┘  │
 │                                                                                 │
-│  V2 JOB INTERVALS:                                                              │
-│  ┌────────────────────────┬──────────┬──────────────────────────────────────┐  │
-│  │ Job                    │ Interval │ Purpose                              │  │
-│  ├────────────────────────┼──────────┼──────────────────────────────────────┤  │
-│  │ Market Creator         │ 30s      │ Create PENDING markets + token mints │  │
-│  │ Market Activator       │ 5s       │ Set strike price, activate market    │  │
-│  │ Market Resolver        │ 2s       │ Resolve expired markets              │  │
-│  │ Merkle Builder         │ 2s       │ Build & post merkle root for RESOLVED│  │ ◀ NEW
-│  │ Batch Settler          │ 1s       │ Process settlement batches (parallel)│  │ ◀ NEW
-│  │ Market Finalizer       │ 10s      │ Finalize SETTLED markets, close mints│  │ ◀ NEW
-│  │ Order Expirer          │ 10s      │ Cancel GTT orders + market close     │  │
-│  │ Liquidation Checker    │ 1s       │ Check & liquidate underwater margin  │  │
-│  │ Lending Pool Syncer    │ 60s      │ Sync lending pool token balances     │  │
-│  │ LP Distribution        │ 5s       │ Distribute LP payouts to users       │  │ ◀ NEW
-│  │ Relayer Health Check   │ 30s      │ Monitor relayer balances & health    │  │ ◀ NEW
-│  │ Reconciliation         │ 5m       │ Fix stuck jobs, missing DB updates   │  │ ◀ NEW
-│  └────────────────────────┴──────────┴──────────────────────────────────────┘  │
+│  V2 JOB INTERVALS (default / perf-test mode):                                   │
+│  ┌────────────────────────┬──────────────────┬────────────────────────────────┐│
+│  │ Job                    │ Interval         │ Purpose                        ││
+│  ├────────────────────────┼──────────────────┼────────────────────────────────┤│
+│  │ Market Activator       │ 500ms  / 10s     │ Set strike, activate on-chain  ││
+│  │ Market Resolver        │ 3s     / 10s     │ Close + resolve expired markets││
+│  │ Market Creator         │ 30s    / 60s     │ Pre-create PENDING markets     ││
+│  │ Order Expirer          │ 10s    / off     │ Cancel GTT + pre-close orders  ││
+│  │ Merkle Settler         │ 3s     / 30s     │ Build tree, post root, enqueue ││
+│  │                        │                  │ batches, finalize market       ││
+│  │ Market Closer          │ 30s    / off     │ Close SETTLED market accounts, ││
+│  │                        │                  │ reclaim rent                   ││
+│  │ Market Reconciler      │ 60s    / off     │ Fix drift between chain ↔ DB   ││
+│  │ Trade Reconciliation   │ 60s    / off     │ Reconcile trade TX outcomes    ││
+│  │ Relayer Pool Funder    │ 30s    / off     │ Refund low child wallets from  ││
+│  │                        │                  │ masters; also refreshes        ││
+│  │                        │                  │ balance_lamports               ││
+│  └────────────────────────┴──────────────────┴────────────────────────────────┘│
+│                                                                                 │
+│  BATCH SETTLEMENT (not a keeper job):                                           │
+│    • BullMQ queue       : onchain-submit                                        │
+│    • Worker             : apps/api/src/queue/workers/onchain-submit.worker.ts   │
+│    • Triggered by       : Merkle Settler enqueueing per-batch jobs              │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -620,26 +694,28 @@ Updated job schedule with new V2 jobs.
 ## Summary: V2 Status Enums
 
 ```typescript
-// Database Enums (apps/api/src/db/schema.ts) - V2 Updates
-type MarketStatus = 'PENDING' | 'OPEN' | 'CLOSED' | 'RESOLVED' | 'SETTLING' | 'SETTLED';  // SETTLING is new
+// Database Enums (apps/api/src/db/schema.ts)
+// NOTE: PENDING is not a DB enum value — pending markets use strike_price='0'.
+// NOTE: SETTLING is not a DB enum value — it is chain-only/transient.
+type MarketStatus = 'OPEN' | 'CLOSED' | 'RESOLVED' | 'SETTLED' | 'SETTLEMENT_FAILED';
 type OrderSide = 'BID' | 'ASK';
 type OrderOutcome = 'YES' | 'NO';
 type OrderType = 'LIMIT' | 'MARKET' | 'IOC' | 'FOK';
-type OrderStatus = 'OPEN' | 'PARTIAL' | 'FILLED' | 'CANCELLED';
+type OrderStatus = 'OPEN' | 'PARTIAL' | 'FILLED' | 'CANCELLED'; // EXPIRED lives on-chain only
 type TxStatus = 'PENDING' | 'CONFIRMED' | 'FAILED';
 type LedgerType = 'DEPOSIT' | 'WITHDRAW' | 'TRADE' | 'SETTLE' | 'FEE';
 
-// V2 New Enums
-type SettlementBatchStatus = 'PENDING' | 'PROCESSING' | 'CONFIRMED' | 'FAILED';
-type RelayerStatus = 'IDLE' | 'ACTIVE' | 'COOLDOWN' | 'UNHEALTHY';
+// V2 Settlement / Relayer state (raw SQL in init-db.sql, not Drizzle)
+type SettlementJobStatus = 'PENDING' | 'SUBMITTED' | 'COMPLETED' | 'FAILED';
+type RelayerWalletStatus = 'active' | 'cooldown' | 'disabled';
 
-// Leverage Enums (unchanged)
-type MarginAccountStatus = 'OPEN' | 'CLOSED' | 'LIQUIDATED';
-type MarginTransactionType = 'MARGIN_DEPOSIT' | 'LOAN_ISSUED' | 'LOAN_REPAID' |
-                             'LIQUIDATION' | 'MARGIN_ADDED' | 'EQUITY_RETURNED';
+// On-Chain V2 Enums (packages/contracts/programs/degen-terminal/src/state_v2.rs)
+enum MarketStatusV2 { Pending, Open, Closed, Resolved, Settling, Settled }
+enum MarketOutcomeV2 { Pending, Yes, No }
 
-// On-Chain Enums (packages/contracts/programs/degen-terminal-v2/src/state.rs)
-enum MarketStatus { Pending, Open, Closed, Resolved, Settling, Settled }  // Settling is new
+// On-Chain V1 Enums still present for legacy markets
+// (packages/contracts/programs/degen-terminal/src/state.rs)
+enum MarketStatus { Pending, Open, Closed, Resolved, Settled }  // no Settling in V1
 enum MarketOutcome { Pending, Yes, No }
 enum OrderStatus { Open, PartialFill, Filled, Cancelled, Expired }
 enum Side { Bid, Ask }
@@ -668,4 +744,4 @@ During migration:
 
 ---
 
-*Last updated: January 2026*
+*Last updated: April 2026*

@@ -132,7 +132,6 @@ pnpm format
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, data flows, collateral model |
 | [API_SPEC.md](docs/API_SPEC.md) | REST & WebSocket API specification |
 | [MARKET_MAKER.md](docs/MARKET_MAKER.md) | Market maker bot architecture |
-| [LEVERAGE.md](docs/LEVERAGE.md) | Leverage trading mechanics & liquidation |
 | [PERFORMANCE_SCALING.md](docs/PERFORMANCE_SCALING.md) | Scaling to 50K+ users, performance optimization |
 | [KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | Bug tracker & limitations |
 | [MCP_SETUP.md](docs/MCP_SETUP.md) | Supabase MCP configuration for Cursor |

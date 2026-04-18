@@ -13,13 +13,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_markets_active_created
 ON markets (status, created_at DESC)
 WHERE status != 'SETTLED';
 
--- 3. Index for margin accounts liquidation checker (runs every 2s)
--- Optimizes: SELECT * FROM margin_accounts WHERE status = 'OPEN' AND on_chain_confirmed_at IS NOT NULL
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_margin_accounts_open_confirmed
-ON margin_accounts (status, on_chain_confirmed_at)
-WHERE status = 'OPEN';
-
--- 4. Index for pending market activation query
+-- 3. Index for pending market activation query
 -- Optimizes: SELECT * FROM markets WHERE status = 'OPEN' AND strike_price = '0'
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_markets_pending_activation
 ON markets (status)
@@ -30,6 +24,6 @@ SELECT
     indexname,
     indexdef
 FROM pg_indexes
-WHERE tablename IN ('markets', 'margin_accounts')
+WHERE tablename = 'markets'
 AND indexname LIKE 'idx_%'
-ORDER BY tablename, indexname;
+ORDER BY indexname;

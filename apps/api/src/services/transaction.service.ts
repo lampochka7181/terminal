@@ -25,6 +25,14 @@ import { eq } from 'drizzle-orm';
 const MAX_RETRIES = 3;
 const BASE_RETRY_DELAY_MS = 500;
 
+// RPC backpressure (429 / timeout) gets its own schedule: rate-limit errors
+// are transient by nature, but hammering the RPC with fast retries makes the
+// problem worse. Use a longer base delay + jitter + a higher cap so we stay
+// within the same overall budget as a normal retry burst but are much gentler.
+const RPC_BACKPRESSURE_MAX_RETRIES = 5;
+const RPC_BACKPRESSURE_BASE_DELAY_MS = 1_500;
+const RPC_BACKPRESSURE_MAX_DELAY_MS = 15_000;
+
 // Transaction types
 export interface MatchParams {
   marketPubkey: string;
@@ -130,8 +138,12 @@ class TransactionService {
     }
 
     let lastError: Error | null = null;
+    let lastBackpressureCode: 'RPC_RATE_LIMITED' | 'RPC_TIMEOUT' | null = null;
+    let rpcBackpressureRetries = 0;
 
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    // Loop bounded by MAX_RETRIES, but RPC backpressure errors can extend
+    // the loop up to RPC_BACKPRESSURE_MAX_RETRIES additional attempts.
+    for (let attempt = 1; attempt <= MAX_RETRIES + RPC_BACKPRESSURE_MAX_RETRIES; attempt++) {
       try {
         // Get user wallet addresses (prefer passed wallets, fall back to lookup)
         const makerWallet = params.makerWallet || (params.makerUserId ? await this.getUserWallet(params.makerUserId) : null);
@@ -185,11 +197,11 @@ class TransactionService {
         return { success: true, signature: result.signature, pendingConfirmation: !result.confirmed };
       } catch (err: any) {
         lastError = err;
-        logger.warn(`Match tx attempt ${attempt} failed: ${err.message}`);
 
         // Check if this is a permanent failure
         const permanentError = this.isPermanentError(err);
         if (permanentError) {
+          logger.warn(`Match tx attempt ${attempt} failed (permanent ${permanentError}): ${err.message}`);
           await this.handleMatchFailure(params, err);
           return {
             success: false,
@@ -198,20 +210,58 @@ class TransactionService {
           };
         }
 
-        // Wait before retry (exponential backoff)
-        if (attempt < MAX_RETRIES) {
-          const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-          await this.sleep(delay);
+        // RPC backpressure (429 / timeout) gets a separate, gentler retry
+        // budget so we don't burn through MAX_RETRIES in <2s during a brief
+        // rate-limit spike.
+        const backpressureCode = this.isRpcBackpressureError(err);
+        if (backpressureCode) {
+          lastBackpressureCode = backpressureCode;
+          rpcBackpressureRetries += 1;
+          logger.warn(
+            `[RPC_BACKPRESSURE] Match tx attempt ${attempt} hit ${backpressureCode} ` +
+            `(backpressure retry ${rpcBackpressureRetries}/${RPC_BACKPRESSURE_MAX_RETRIES}): ${err.message}`
+          );
+
+          if (rpcBackpressureRetries > RPC_BACKPRESSURE_MAX_RETRIES) {
+            // Exhausted backpressure budget — surface the specific code so
+            // UI can show "network congested, please try again" rather than
+            // a generic transaction failure.
+            await this.handleMatchFailure(params, err);
+            return {
+              success: false,
+              error: err.message,
+              errorCode: backpressureCode,
+            };
+          }
+
+          // Exponential backoff with jitter, capped.
+          const raw = RPC_BACKPRESSURE_BASE_DELAY_MS * Math.pow(2, rpcBackpressureRetries - 1);
+          const delay = Math.min(raw, RPC_BACKPRESSURE_MAX_DELAY_MS);
+          const jitter = Math.floor(Math.random() * 500);
+          await this.sleep(delay + jitter);
+          continue;
         }
+
+        logger.warn(`Match tx attempt ${attempt} failed: ${err.message}`);
+
+        // Non-backpressure transient error: bounded by MAX_RETRIES.
+        const nonBackpressureAttempt = attempt - rpcBackpressureRetries;
+        if (nonBackpressureAttempt >= MAX_RETRIES) {
+          break;
+        }
+        const delay = BASE_RETRY_DELAY_MS * Math.pow(2, nonBackpressureAttempt - 1);
+        await this.sleep(delay);
       }
     }
 
-    // All retries exhausted
+    // All retries exhausted. Preserve the RPC-backpressure code if the most
+    // recent failures were rate-limit / timeout related — this gives the UI
+    // the context it needs to render a useful message.
     await this.handleMatchFailure(params, lastError!);
     return {
       success: false,
       error: lastError?.message || 'Max retries exceeded',
-      errorCode: 'MAX_RETRIES',
+      errorCode: lastBackpressureCode ?? 'MAX_RETRIES',
     };
   }
 
@@ -242,8 +292,10 @@ class TransactionService {
     }
 
     let lastError: Error | null = null;
+    let lastBackpressureCode: 'RPC_RATE_LIMITED' | 'RPC_TIMEOUT' | null = null;
+    let rpcBackpressureRetries = 0;
 
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    for (let attempt = 1; attempt <= MAX_RETRIES + RPC_BACKPRESSURE_MAX_RETRIES; attempt++) {
       try {
         const hydratedParams = this.hydrateCloseAuth(params);
         const marketPubkey = new PublicKey(hydratedParams.marketPubkey);
@@ -285,10 +337,10 @@ class TransactionService {
         return { success: true, signature: result.signature, pendingConfirmation: !result.confirmed };
       } catch (err: any) {
         lastError = err;
-        logger.warn(`Close tx attempt ${attempt} failed: ${err.message}`);
 
         const permanentError = this.isPermanentError(err);
         if (permanentError) {
+          logger.warn(`Close tx attempt ${attempt} failed (permanent ${permanentError}): ${err.message}`);
           return {
             success: false,
             error: err.message,
@@ -296,17 +348,45 @@ class TransactionService {
           };
         }
 
-        if (attempt < MAX_RETRIES) {
-          const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-          await this.sleep(delay);
+        const backpressureCode = this.isRpcBackpressureError(err);
+        if (backpressureCode) {
+          lastBackpressureCode = backpressureCode;
+          rpcBackpressureRetries += 1;
+          logger.warn(
+            `[RPC_BACKPRESSURE] Close tx attempt ${attempt} hit ${backpressureCode} ` +
+            `(backpressure retry ${rpcBackpressureRetries}/${RPC_BACKPRESSURE_MAX_RETRIES}): ${err.message}`
+          );
+
+          if (rpcBackpressureRetries > RPC_BACKPRESSURE_MAX_RETRIES) {
+            return {
+              success: false,
+              error: err.message,
+              errorCode: backpressureCode,
+            };
+          }
+
+          const raw = RPC_BACKPRESSURE_BASE_DELAY_MS * Math.pow(2, rpcBackpressureRetries - 1);
+          const delay = Math.min(raw, RPC_BACKPRESSURE_MAX_DELAY_MS);
+          const jitter = Math.floor(Math.random() * 500);
+          await this.sleep(delay + jitter);
+          continue;
         }
+
+        logger.warn(`Close tx attempt ${attempt} failed: ${err.message}`);
+
+        const nonBackpressureAttempt = attempt - rpcBackpressureRetries;
+        if (nonBackpressureAttempt >= MAX_RETRIES) {
+          break;
+        }
+        const delay = BASE_RETRY_DELAY_MS * Math.pow(2, nonBackpressureAttempt - 1);
+        await this.sleep(delay);
       }
     }
 
     return {
       success: false,
       error: lastError?.message || 'Max retries exceeded',
-      errorCode: 'MAX_RETRIES',
+      errorCode: lastBackpressureCode ?? 'MAX_RETRIES',
     };
   }
 
@@ -416,6 +496,48 @@ class TransactionService {
     }
 
     logger.error(`Match failed: ${error.message}`, { params, errorCode });
+  }
+
+  /**
+   * Classify an RPC backpressure error (429 / connection rate limit /
+   * timeout). Returns a specific error code for backpressure, or null.
+   *
+   * Backpressure errors are NOT permanent — they should be retried with a
+   * longer, jittered backoff. We still surface a distinct error code on
+   * exhaustion so the frontend / WS consumer can render a helpful
+   * "network congested, try again" message instead of a generic failure.
+   */
+  private isRpcBackpressureError(error: Error): 'RPC_RATE_LIMITED' | 'RPC_TIMEOUT' | null {
+    const message = String(error?.message || '').toLowerCase();
+
+    // HTTP 429 / provider-specific rate-limit messages.
+    if (
+      message.includes('429') ||
+      message.includes('too many requests') ||
+      message.includes('connection rate limits exceeded') ||
+      message.includes('rate limit') ||
+      message.includes('rate-limited') ||
+      message.includes('rate limited')
+    ) {
+      return 'RPC_RATE_LIMITED';
+    }
+
+    // Network / timeout errors that should be retried with backoff.
+    if (
+      message.includes('etimedout') ||
+      message.includes('esockettimedout') ||
+      message.includes('socket hang up') ||
+      message.includes('econnreset') ||
+      message.includes('econnrefused') ||
+      message.includes('fetch failed') ||
+      message.includes('network error') ||
+      message.includes('request timed out') ||
+      message.includes('blockhash not found')
+    ) {
+      return 'RPC_TIMEOUT';
+    }
+
+    return null;
   }
 
   /**

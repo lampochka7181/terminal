@@ -191,7 +191,6 @@ export default function HowItWorks({ onClose }: Props) {
                     'Candlestick chart with zoom/scroll',
                     'Full orderbook with bid/ask depth',
                     'Market & Limit order types',
-                    'Leverage options (coming soon)',
                     'Positions table with detailed PnL',
                   ].map((item, i) => (
                     <li key={i} style={{ fontSize: 17, color: 'rgba(238,238,238,0.55)', lineHeight: 1.5 }}>{item}</li>

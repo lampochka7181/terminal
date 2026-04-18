@@ -10,10 +10,8 @@ import LiteSidebar from './components/LiteSidebar';
 import BottomPanel from './components/BottomPanel';
 import OnboardingOverlay from './components/OnboardingOverlay';
 import HowItWorks from './components/HowItWorks';
-import { V3Prompt } from './components/V3Modal';
 import { useMarkets } from '@/hooks/useMarkets';
 import { usePrices } from '@/hooks/usePrices';
-import { useLiquidationNotifications } from '@/hooks/useLiquidationNotifications';
 import { useSelectedMarket, useMarketStore } from '@/stores/marketStore';
 import { usePriceStore } from '@/stores/priceStore';
 import { useAuthStore } from '@/stores/authStore';
@@ -45,7 +43,6 @@ export default function App() {
   const [showOnboarding, setShowOnboarding] = useState(() => !isWalletOnboarded(walletAddress));
   const [showHowItWorks, setShowHowItWorks] = useState(false);
   const [viewMode, setViewMode] = useState<'pro' | 'lite'>('lite');
-  const [liqPrompt, setLiqPrompt] = useState({ open: false, title: '', message: '', type: 'warning' as const });
 
   // Re-evaluate onboarding when wallet changes (connect, disconnect, switch)
   useEffect(() => {
@@ -57,17 +54,6 @@ export default function App() {
       setShowOnboarding(true);
     }
   }, [walletAddress]);
-
-  useLiquidationNotifications({
-    onLiquidation: useCallback((n: any) => {
-      setLiqPrompt({
-        open: true,
-        title: 'Position Liquidated',
-        message: `Your ${n.side} position was liquidated. Returned: $${n.returnedToUser?.toFixed(2) ?? '0.00'}`,
-        type: 'warning',
-      });
-    }, []),
-  });
 
   const isPro = viewMode === 'pro';
 
@@ -281,14 +267,6 @@ export default function App() {
       {showHowItWorks && (
         <HowItWorks onClose={() => setShowHowItWorks(false)} />
       )}
-
-      <V3Prompt
-        open={liqPrompt.open}
-        onClose={() => setLiqPrompt(p => ({ ...p, open: false }))}
-        title={liqPrompt.title}
-        message={liqPrompt.message}
-        type={liqPrompt.type}
-      />
     </div>
   );
 }

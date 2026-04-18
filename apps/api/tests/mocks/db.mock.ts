@@ -8,34 +8,14 @@ import { vi } from 'vitest';
 
 // In-memory stores for mock data
 export const mockStore = {
-  marginAccounts: new Map<string, any>(),
   positions: new Map<string, any>(),
   markets: new Map<string, any>(),
-  liquidations: new Map<string, any>(),
-  lendingPool: {
-    totalDeposits: 1000000,
-    availableLiquidity: 1000000,
-    totalLoaned: 0,
-  },
-  insuranceFund: {
-    balance: 10000,
-  },
 };
 
 // Reset all stores
 export function resetMockStore() {
-  mockStore.marginAccounts.clear();
   mockStore.positions.clear();
   mockStore.markets.clear();
-  mockStore.liquidations.clear();
-  mockStore.lendingPool = {
-    totalDeposits: 1000000,
-    availableLiquidity: 1000000,
-    totalLoaned: 0,
-  };
-  mockStore.insuranceFund = {
-    balance: 10000,
-  };
 }
 
 // Mock database functions
@@ -71,31 +51,6 @@ export const mockDb = {
     where: vi.fn().mockResolvedValue([]),
   })),
 };
-
-// Helper to create test fixtures
-export function createMockMarginAccount(overrides: Partial<any> = {}) {
-  const defaults = {
-    id: `margin-${Date.now()}`,
-    userId: 'test-user-id',
-    positionId: 'test-position-id',
-    marketId: 'test-market-id',
-    side: 'YES',
-    shares: '100',
-    entryPrice: '0.50',
-    leverage: '5.00',
-    marginDeposited: '10.00',
-    loanAmount: '40.00',
-    liquidationPrice: '0.4123',
-    status: 'OPEN',
-    onChainTxSignature: 'mock-tx-sig',
-    onChainConfirmedAt: null, // Not confirmed by default
-    liquidatingAt: null,
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  };
-  
-  return { ...defaults, ...overrides };
-}
 
 export function createMockPosition(overrides: Partial<any> = {}) {
   const defaults = {

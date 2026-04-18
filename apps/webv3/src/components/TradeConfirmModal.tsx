@@ -11,7 +11,6 @@ interface TradeConfirmModalProps {
   outcome: 'yes' | 'no';
   amount: number;
   price: number;
-  leverage: number;
   orderType: 'market' | 'limit';
   isPlacing: boolean;
 }
@@ -19,7 +18,7 @@ interface TradeConfirmModalProps {
 const dim = 'rgba(238,238,238,0.33)';
 
 export default function TradeConfirmModal({
-  open, onClose, onConfirm, side, outcome, amount, price, leverage, orderType, isPlacing,
+  open, onClose, onConfirm, side, outcome, amount, price, orderType, isPlacing,
 }: TradeConfirmModalProps) {
   const [fees, setFees] = useState<FeeSchedule | null>(null);
 
@@ -32,7 +31,6 @@ export default function TradeConfirmModal({
     ? (orderType === 'limit' ? fees.trading.makerFee : fees.trading.takerFee)
     : 0.02;
   const estimatedFee = amount * feeRate;
-  const margin = leverage > 1 ? amount / leverage : amount;
   const multiplier = price > 0 ? (1 / price).toFixed(2) : '--';
   const potentialPayout = price > 0 ? (amount / price).toFixed(2) : '--';
   const direction = outcome === 'yes' ? 'Above' : 'Below';
@@ -57,12 +55,10 @@ export default function TradeConfirmModal({
           <Row label="Amount" value={`$${amount.toFixed(2)}`} />
           <Row label="Price" value={`$${price.toFixed(4)}`} />
           <Row label="Multiplier" value={`${multiplier}x`} />
-          {leverage > 1 && <Row label="Leverage" value={`${leverage}x`} highlight />}
-          {leverage > 1 && <Row label="Margin" value={`$${margin.toFixed(2)}`} />}
           <Row label="Est. Payout" value={`$${potentialPayout}`} />
           <div style={{ height: 1, background: 'rgba(255,255,255,0.11)', margin: '3px 0' }} />
           <Row label={`Fee (${(feeRate * 100).toFixed(1)}%)`} value={`$${estimatedFee.toFixed(2)}`} />
-          <Row label="Total Cost" value={`$${(margin + estimatedFee).toFixed(2)}`} bold />
+          <Row label="Total Cost" value={`$${(amount + estimatedFee).toFixed(2)}`} bold />
         </div>
 
         <div style={{ display: 'flex', gap: 12, marginTop: 6 }}>

@@ -342,10 +342,15 @@ async function processJob(job: Job<OnchainSubmitJobData>): Promise<void> {
     }
   } else {
     // Check if this is a permanent error that should not be retried
+    // Note: RPC_RATE_LIMITED / RPC_TIMEOUT are emitted by the transaction
+    // service only after it has exhausted its own, longer backpressure
+    // retry budget. At that point there's no value in BullMQ piling on
+    // another round of retries — we want to mark the trade as FAILED with
+    // a distinct code the UI can recognize.
     const permanentCodes = ['INSUFFICIENT_FUNDS', 'INSUFFICIENT_SHARES', 'FEE_TOO_LOW',
       'POSITION_LIMIT', 'MARKET_CLOSED', 'INVALID_SIGNATURE', 'SELF_TRADE', 'ACCOUNT_NOT_FOUND',
       'INSUFFICIENT_LAMPORTS', 'MAX_RETRIES', 'ACCOUNT_DESERIALIZATION', 'ACCOUNT_SERIALIZATION',
-      'CONSTRAINT_VIOLATION'];
+      'CONSTRAINT_VIOLATION', 'RPC_RATE_LIMITED', 'RPC_TIMEOUT'];
 
     if (result.errorCode && permanentCodes.includes(result.errorCode)) {
       logger.warn(`[QUEUE:onchain] Permanent failure for ${idempotencyKey}: ${result.errorCode}`);

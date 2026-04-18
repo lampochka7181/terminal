@@ -116,24 +116,6 @@ export interface UserSettlementUpdate {
   };
 }
 
-export interface UserLiquidationUpdate {
-  channel: 'user';
-  event: 'liquidation';
-  data: {
-    marketId: string;
-    marketAddress: string;
-    side: 'YES' | 'NO';
-    shares: number;
-    entryPrice: number;
-    liquidationPrice: number;
-    executionPrice: number;
-    proceeds: number;
-    returnedToUser: number;
-    leverage: number;
-    timestamp?: number;
-  };
-}
-
 export interface UserTradeFailedUpdate {
   channel: 'user';
   event: 'trade_failed';
@@ -418,12 +400,6 @@ export class WebSocketService {
           ...message,
           channel: 'user',
           event: 'settlement',
-        };
-      } else if (message.type === 'liquidation') {
-        normalizedMessage = {
-          ...message,
-          channel: 'user',
-          event: 'liquidation',
         };
       } else if (message.type === 'global_trade') {
         normalizedMessage = {

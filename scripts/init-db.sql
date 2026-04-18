@@ -88,9 +88,6 @@ CREATE TABLE orders (
     is_agent_order BOOLEAN DEFAULT FALSE NOT NULL,
     -- Dollar-based market orders: original USD amount requested (e.g., $25)
     dollar_amount DECIMAL(20,6),
-    -- Leverage fields (for displaying leverage info before margin account exists)
-    leverage DECIMAL(4,2) DEFAULT 1,
-    margin_amount DECIMAL(20,6),
     expires_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
@@ -226,109 +223,6 @@ CREATE TABLE market_snapshots (
 );
 
 CREATE INDEX idx_snapshots_market ON market_snapshots(market_id, outcome, interval, timestamp DESC);
-
--- =============================================
--- LEVERAGE TABLES
--- =============================================
-
--- Margin Account Status Enum
-CREATE TYPE margin_account_status AS ENUM ('OPEN', 'LIQUIDATED', 'CLOSED');
-
--- Margin Transaction Type Enum
-CREATE TYPE margin_tx_type AS ENUM ('DEPOSIT', 'WITHDRAW');
-
--- Lending Pool Table
-CREATE TABLE lending_pool (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    wallet_address VARCHAR(44) NOT NULL,
-    total_deposited DECIMAL(20,6) DEFAULT 0,
-    total_loaned DECIMAL(20,6) DEFAULT 0,
-    available DECIMAL(20,6) DEFAULT 0,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- Insurance Fund Table
-CREATE TABLE insurance_fund (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    wallet_address VARCHAR(44) NOT NULL,
-    balance DECIMAL(20,6) DEFAULT 0,
-    total_received DECIMAL(20,6) DEFAULT 0,
-    total_paid_out DECIMAL(20,6) DEFAULT 0,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- Margin Accounts Table (one per leveraged position)
-CREATE TABLE margin_accounts (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID NOT NULL REFERENCES users(id),
-    position_id UUID NOT NULL REFERENCES positions(id),
-    market_id UUID NOT NULL REFERENCES markets(id),
-    side VARCHAR(10) NOT NULL,
-    shares DECIMAL(20,6) NOT NULL,
-    entry_price DECIMAL(10,6) NOT NULL,
-    margin_deposited DECIMAL(20,6) NOT NULL,
-    loan_amount DECIMAL(20,6) NOT NULL,
-    leverage DECIMAL(4,2) NOT NULL,
-    liquidation_price DECIMAL(10,6) NOT NULL,
-    status margin_account_status DEFAULT 'OPEN',
-    -- On-chain tracking (for race condition prevention)
-    -- NULL on_chain_confirmed_at = position not yet confirmed on-chain
-    on_chain_tx_signature VARCHAR(88),
-    on_chain_confirmed_at TIMESTAMP,
-    -- Liquidation lock (set when liquidation starts, blocks user sells)
-    -- NULL = not being liquidated, timestamp = liquidation in progress
-    liquidating_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_margin_accounts_user ON margin_accounts(user_id);
-CREATE INDEX idx_margin_accounts_status ON margin_accounts(status);
-CREATE INDEX idx_margin_accounts_market ON margin_accounts(market_id);
-CREATE INDEX idx_margin_accounts_confirmed ON margin_accounts(on_chain_confirmed_at) WHERE status = 'OPEN';
--- Compound index for liquidation checker: WHERE status = 'OPEN' AND on_chain_confirmed_at IS NOT NULL
-CREATE INDEX idx_margin_accounts_open_confirmed ON margin_accounts(status, on_chain_confirmed_at) WHERE status = 'OPEN';
-
--- Liquidations Table
-CREATE TABLE liquidations (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    margin_account_id UUID NOT NULL REFERENCES margin_accounts(id),
-    user_id UUID NOT NULL REFERENCES users(id),
-    market_id UUID NOT NULL REFERENCES markets(id),
-    trigger_price DECIMAL(10,6) NOT NULL,
-    execution_price DECIMAL(10,6) NOT NULL,
-    shares_liquidated DECIMAL(20,6) NOT NULL,
-    proceeds DECIMAL(20,6) NOT NULL,
-    loan_repaid DECIMAL(20,6) NOT NULL,
-    penalty DECIMAL(20,6) NOT NULL,
-    returned_to_user DECIMAL(20,6) NOT NULL,
-    bad_debt DECIMAL(20,6) DEFAULT 0,
-    tx_signature VARCHAR(88),
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_liquidations_user ON liquidations(user_id);
-CREATE INDEX idx_liquidations_margin_account ON liquidations(margin_account_id);
-
--- Margin Transactions Table (deposits/withdrawals)
-CREATE TABLE margin_transactions (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    margin_account_id UUID NOT NULL REFERENCES margin_accounts(id),
-    user_id UUID NOT NULL REFERENCES users(id),
-    type margin_tx_type NOT NULL,
-    amount DECIMAL(20,6) NOT NULL,
-    loan_before DECIMAL(20,6) NOT NULL,
-    loan_after DECIMAL(20,6) NOT NULL,
-    liq_price_before DECIMAL(10,6) NOT NULL,
-    liq_price_after DECIMAL(10,6) NOT NULL,
-    tx_signature VARCHAR(88),
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_margin_transactions_account ON margin_transactions(margin_account_id);
-CREATE INDEX idx_margin_transactions_user ON margin_transactions(user_id);
 
 -- MM Market Metrics Table (tracks MM performance per market)
 CREATE TABLE mm_market_metrics (

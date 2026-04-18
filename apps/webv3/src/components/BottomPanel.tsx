@@ -599,7 +599,12 @@ export default function BottomPanel({ height }: { height?: number }) {
                     <div style={{ flex: 1 }}>
                       {tx.txStatus === 'FAILED' ? (
                         <span style={{ color: '#f55252', fontWeight: 600, fontSize: 15 }} title={tx.errorCode || 'Unknown error'}>
-                          Failed{tx.errorCode === 'INSUFFICIENT_FUNDS' ? ' (Low USDC)' : ''}
+                          Failed{
+                            tx.errorCode === 'INSUFFICIENT_FUNDS' ? ' (Low USDC)'
+                              : tx.errorCode === 'RPC_RATE_LIMITED' ? ' (Network Busy)'
+                              : tx.errorCode === 'RPC_TIMEOUT' ? ' (Network Timeout)'
+                              : ''
+                          }
                         </span>
                       ) : tx.txSignature ? (
                         <a

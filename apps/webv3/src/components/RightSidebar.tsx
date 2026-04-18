@@ -34,14 +34,11 @@ export default function RightSidebar({ width }: { width?: number }) {
   const [orderType, setOrderType] = useState<'market' | 'limit'>(defaultOrderType);
   const [amount, setAmount] = useState(25);
   const [limitPrice, setLimitPrice] = useState('0.50');
-  const [leverage] = useState(1);
   const [obView, setObView] = useState<'book' | 'market'>('book');
   const [chatOpen, setChatOpen] = useState(false);
   const [delegationModalOpen, setDelegationModalOpen] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
   const [promptMsg, setPromptMsg] = useState({ title: '', message: '', type: 'info' as 'info' | 'error' | 'success' | 'warning' });
-  
-  const leverageOptions = [1, 2, 3, 5, 10];
 
   const amountPresets = [25, 50, 100, 250];
 
@@ -65,8 +62,6 @@ export default function RightSidebar({ width }: { width?: number }) {
     }
 
     const price = orderType === 'limit' ? parseFloat(limitPrice) : (prices.bestAsk || 0.50);
-    const isLeveraged = leverage > 1;
-    const marginAmount = isLeveraged ? amount / leverage : undefined;
     const size = amount / price;
 
     const result = await placeOrder({
@@ -78,7 +73,6 @@ export default function RightSidebar({ width }: { width?: number }) {
       size,
       dollarAmount: orderType === 'market' ? amount : undefined,
       maxPrice: orderType === 'market' ? 0.99 : undefined,
-      ...(isLeveraged && { leverage, marginAmount }),
     });
 
     if (result && result.status !== 'error') {
@@ -89,7 +83,7 @@ export default function RightSidebar({ width }: { width?: number }) {
     } else if (result?.error) {
       showPrompt('Order Failed', result.error, 'error');
     }
-  }, [market, orderType, amount, leverage, limitPrice, yesPrices, noPrices, placeOrder, showPrompt, delegation]);
+  }, [market, orderType, amount, limitPrice, yesPrices, noPrices, placeOrder, showPrompt, delegation]);
 
   const handlePlaceOrder = useCallback(async (outcome: 'yes' | 'no', side: 'bid') => {
     if (!wallet.connected) {
@@ -347,24 +341,6 @@ export default function RightSidebar({ width }: { width?: number }) {
                   background: '#232323', color: dim, cursor: 'pointer',
                   display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 23, fontWeight: 600,
                 }}>+</button>
-              </div>
-            </div>
-
-            {/* Leverage */}
-            <div style={{ padding: '5px 21px 8px', flexShrink: 0, opacity: 0.45 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
-                <span style={{ fontSize: 15, color: '#eee', fontWeight: 500 }}>LEVERAGE</span>
-                <span style={{ fontSize: 12, color: dim, marginLeft: 'auto', fontStyle: 'italic' }}>Coming Soon</span>
-              </div>
-              <div style={{ display: 'flex', gap: 6, pointerEvents: 'none' }}>
-                {leverageOptions.map((l) => (
-                  <button key={l} style={{
-                    flex: 1, padding: '6px 0', borderRadius: 8, fontSize: 15, fontWeight: 600,
-                    cursor: 'default', border: 'none',
-                    background: l === 1 ? '#424242' : '#232323',
-                    color: l === 1 ? '#eee' : dim,
-                  }}>{l}x</button>
-                ))}
               </div>
             </div>
 

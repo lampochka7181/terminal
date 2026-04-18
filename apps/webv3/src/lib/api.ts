@@ -40,8 +40,6 @@ export interface OrderResponse {
   totalSpent?: number;       // Actual collateral spent (for dollar-based market orders)
   dollarAmount?: number;     // Original USD amount requested
   unfilledDollars?: number;  // Remaining unfilled USD amount
-  leverage?: number;
-  marginAccountId?: string;
   // Position data for immediate frontend update (included in response to avoid refetch)
   position?: Position | null;
 }
@@ -68,12 +66,6 @@ export interface Position {
   totalCost?: number;
   status: 'open' | 'settled';
   createdAt?: number;
-  // Leverage fields (only present if position is leveraged)
-  leverage?: number;
-  marginDeposited?: number;
-  loanAmount?: number;
-  liquidationPrice?: number;
-  marginAccountId?: string;
 }
 
 export interface MarketPosition {
@@ -109,9 +101,6 @@ export interface Order {
   dollarAmount?: number;   // Original USD amount for dollar-based market orders
   createdAt: number;
   updatedAt?: number;
-  // Leverage fields (available before margin account exists, for pending orders)
-  leverage?: number;       // 1 = no leverage, 2-10 = leveraged
-  marginAmount?: number;   // User's margin amount deposited
 }
 
 export interface Settlement {
@@ -129,25 +118,22 @@ export interface Settlement {
 // Unified transaction type for history view
 export interface UserTransaction {
   id: string;
-  type: 'trade' | 'settlement' | 'liquidation';
+  type: 'trade' | 'settlement';
   transactionType: 'open' | 'close';
   marketAddress: string;
   market: string;
   asset: string;
   expiryAt: number;
   outcome: string;
-  side: 'buy' | 'sell' | 'settlement' | 'liquidation';
+  side: 'buy' | 'sell' | 'settlement';
   price: number;
-  entryPrice?: number; // For liquidations - the original entry price
   size: number;
   notional: number;
   fee: number;
   pnl?: number;
-  leverage?: number; // For liquidations
-  loanRepaid?: number; // For liquidations
   txSignature: string;
   txStatus?: string; // 'PENDING' | 'CONFIRMED' | 'FAILED'
-  errorCode?: string; // e.g. 'INSUFFICIENT_FUNDS', 'MARKET_CLOSED'
+  errorCode?: string; // e.g. 'INSUFFICIENT_FUNDS', 'MARKET_CLOSED', 'RPC_RATE_LIMITED', 'RPC_TIMEOUT'
   timestamp: number;
 }
 
@@ -560,9 +546,6 @@ export interface NotifyOrderPlacedParams {
   signature?: string;         // User's signature for authorization
   binaryMessage?: string;     // Binary message that was signed
   sessionPublicKey?: string;  // Session key public key (for session-signed orders)
-  // Leverage (optional)
-  leverage?: number;          // 1-10, default 1 (no leverage)
-  marginAmount?: number;      // User's margin (required if leverage > 1)
 }
 
 export async function notifyOrderPlaced(
@@ -719,76 +702,6 @@ export async function getConfig(): Promise<PublicConfig> {
   return apiFetch<PublicConfig>('/config');
 }
 
-// ===================
-// Margin / Leverage
-// ===================
-
-export interface AddMarginParams {
-  marginAccountId: string;
-  amount: number;
-}
-
-export interface AddMarginResponse {
-  success: boolean;
-  marginAccountId: string;
-  amountAdded: number;
-  newLoanAmount: number;
-  newLiquidationPrice: number;
-  error?: string;
-}
-
-export async function addMargin(params: AddMarginParams): Promise<AddMarginResponse> {
-  return apiFetch<AddMarginResponse>('/margin/add', {
-    method: 'POST',
-    body: JSON.stringify(params),
-  });
-}
-
-export interface MarginConfig {
-  enabled: boolean;
-  maxLeverage: number;
-  minLeverage: number;
-  maintenanceMarginPct: number;
-  liquidationPenaltyPct: number;
-  minMarginUsd: number;
-}
-
-export async function getMarginConfig(): Promise<MarginConfig> {
-  return apiFetch<MarginConfig>('/margin/config');
-}
-
-export interface MarginAccount {
-  id: string;
-  positionId: string;
-  marketId: string;
-  market?: {
-    pubkey: string;
-    asset: string;
-    timeframe: string;
-  };
-  side: 'YES' | 'NO';
-  shares: number;
-  entryPrice: number;
-  marginDeposited: number;
-  loanAmount: number;
-  leverage: number;
-  liquidationPrice: number;
-  currentPrice: number;
-  status: string;
-  health: {
-    equity: number;
-    marginRatio: number;
-    distanceToLiq: number;
-    distanceToLiqPct: number;
-    isAtRisk: boolean;
-  };
-  createdAt: number;
-}
-
-export async function getMarginAccounts(): Promise<{ accounts: MarginAccount[]; total: number }> {
-  return apiFetch<{ accounts: MarginAccount[]; total: number }>('/margin/accounts');
-}
-
 export async function joinWaitlist(email: string): Promise<{ success: boolean }> {
   return apiFetch<{ success: boolean }>('/waitlist', {
     method: 'POST',
@@ -836,10 +749,6 @@ export const api = {
   getUserSettlements,
   // Global
   getGlobalTrades,
-  // Margin / Leverage
-  addMargin,
-  getMarginConfig,
-  getMarginAccounts,
   // Waitlist
   joinWaitlist,
 };

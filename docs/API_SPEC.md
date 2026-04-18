@@ -450,8 +450,6 @@ Place an order using delegated signing (fast mode). Supports session keys for on
 | `sessionPublicKey` | string | No | Session key for one-click trading |
 | `dollarAmount` | number | No* | Dollar amount for market orders |
 | `maxPrice` | number | No | Max price for market orders (slippage protection) |
-| `leverage` | number | No | Leverage multiplier (1-10x, default: 1) |
-| `marginAmount` | number | No | User's margin amount (required if leverage > 1) |
 
 *For market orders, use `dollarAmount` instead of `size` for dollar-based execution.
 
@@ -463,15 +461,9 @@ Place an order using delegated signing (fast mode). Supports session keys for on
   "fills": 0,
   "filledSize": 0,
   "avgPrice": null,
-  "createdAt": 1709999000,
-  "leverage": 5,
-  "marginAccountId": "uuid"
+  "createdAt": 1709999000
 }
 ```
-
-**Leverage Fields (only present for leveraged orders):**
-- `leverage`: The leverage multiplier used (2x-10x)
-- `marginAccountId`: ID of the created margin account (track liquidation risk)
 
 ### `DELETE /orders/:id`
 Cancel an open order.
@@ -686,167 +678,7 @@ Get user's trading statistics.
 ```
 
 ---
-
-## 6. Margin & Leverage (Authenticated)
-
-### `GET /margin/config`
-Get leverage configuration.
-- **Response:**
-```json
-{
-  "enabled": true,
-  "maxLeverage": 10,
-  "minLeverage": 1,
-  "maintenanceMarginPct": 10,
-  "liquidationPenaltyPct": 2,
-  "minMarginUsd": 5.00
-}
-```
-
-### `GET /margin/pool`
-Get lending pool and insurance fund status.
-- **Response:**
-```json
-{
-  "lendingPool": {
-    "totalDeposited": 100000.00,
-    "totalLoaned": 45000.00,
-    "available": 55000.00,
-    "utilizationPct": 45.0
-  },
-  "insuranceFund": {
-    "balance": 5000.00,
-    "totalReceived": 7500.00,
-    "totalPaidOut": 2500.00
-  }
-}
-```
-
-### `GET /margin/accounts`
-Get all margin accounts for the authenticated user.
-- **Headers:** `Authorization: Bearer <token>`
-- **Response:**
-```json
-{
-  "accounts": [
-    {
-      "id": "uuid",
-      "positionId": "uuid",
-      "marketId": "uuid",
-      "market": {
-        "pubkey": "So111...",
-        "asset": "BTC",
-        "timeframe": "5m"
-      },
-      "side": "YES",
-      "shares": 100,
-      "entryPrice": 0.50,
-      "marginDeposited": 10.00,
-      "loanAmount": 40.00,
-      "leverage": 5.0,
-      "liquidationPrice": 0.44,
-      "currentPrice": 0.52,
-      "status": "OPEN",
-      "health": {
-        "equity": 12.00,
-        "marginRatio": 24.0,
-        "distanceToLiq": 0.08,
-        "distanceToLiqPct": 15.38,
-        "isAtRisk": true
-      },
-      "createdAt": 1709999000
-    }
-  ],
-  "total": 1
-}
-```
-
-### `GET /margin/accounts/:id`
-Get a specific margin account.
-- **Headers:** `Authorization: Bearer <token>`
-- **Response:** Same as individual account in `/margin/accounts`
-
-### `POST /margin/add`
-Add margin to an existing leveraged position.
-- **Headers:** `Authorization: Bearer <token>`
-- **Body:**
-```json
-{
-  "marginAccountId": "uuid",
-  "amount": 5.00
-}
-```
-- **Response:**
-```json
-{
-  "success": true,
-  "marginAccountId": "uuid",
-  "amountAdded": 5.00,
-  "newLoanAmount": 35.00,
-  "newLiquidationPrice": 0.39
-}
-```
-
-### `POST /margin/calculate`
-Calculate leverage parameters before placing an order.
-- **Headers:** `Authorization: Bearer <token>`
-- **Body:**
-```json
-{
-  "side": "YES",
-  "price": 0.50,
-  "size": 100,
-  "leverage": 5
-}
-```
-- **Response:**
-```json
-{
-  "side": "YES",
-  "entryPrice": 0.50,
-  "shares": 100,
-  "leverage": 5,
-  "totalPosition": 50.00,
-  "marginRequired": 10.00,
-  "loanAmount": 40.00,
-  "liquidationPrice": 0.44,
-  "maintenanceMarginPct": 10,
-  "canBorrow": true,
-  "maxAvailableLoan": 55000.00,
-  "borrowError": null
-}
-```
-
-### `GET /margin/liquidations`
-Get liquidation history for the authenticated user.
-- **Headers:** `Authorization: Bearer <token>`
-- **Response:**
-```json
-{
-  "liquidations": [
-    {
-      "id": "uuid",
-      "marginAccountId": "uuid",
-      "marketId": "uuid",
-      "triggerPrice": 0.44,
-      "executionPrice": 0.43,
-      "sharesLiquidated": 100,
-      "proceeds": 43.00,
-      "loanRepaid": 40.00,
-      "penalty": 1.00,
-      "returnedToUser": 2.00,
-      "badDebt": 0,
-      "txSignature": "5K2x...",
-      "createdAt": 1709999000
-    }
-  ],
-  "total": 1
-}
-```
-
----
-
-## 7. Fee Schedule
+## 6. Fee Schedule
 
 ### Current Fee Structure
 
@@ -916,7 +748,7 @@ Get current fee schedule.
 
 ---
 
-## 8. Error Handling
+## 7. Error Handling
 
 ### Error Response Format
 All errors follow this structure:
@@ -973,7 +805,7 @@ All errors follow this structure:
 
 ---
 
-## 9. Rate Limits
+## 8. Rate Limits
 
 | Endpoint Type | Limit |
 |---------------|-------|

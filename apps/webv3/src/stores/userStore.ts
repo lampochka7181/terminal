@@ -5,7 +5,7 @@
 
 import { create } from 'zustand';
 import { api, type UserBalance, type Position, type Order, type Settlement, type UserTransaction, ApiError } from '@/lib/api';
-import { getWebSocket, type UserFillUpdate, type UserSettlementUpdate, type UserLiquidationUpdate, type UserTradeFailedUpdate } from '@/lib/websocket';
+import { getWebSocket, type UserFillUpdate, type UserSettlementUpdate, type UserTradeFailedUpdate } from '@/lib/websocket';
 
 // Debounce helper for fetchAll to prevent request floods
 let fetchAllDebounceTimer: NodeJS.Timeout | null = null;
@@ -41,8 +41,6 @@ export interface PendingOrderInfo {
   side: 'bid' | 'ask';
   size: number;
   price: number;
-  leverage?: number;
-  marginAmount?: number;
   expiryAt?: number;
 }
 
@@ -552,11 +550,6 @@ export function subscribeToUserUpdates(): () => void {
         }
         // Re-fetch positions, transactions, and balance to sync with DB
         store.fetchAllImmediate();
-      } else if (message.event === 'liquidation') {
-        // Position was liquidated - refresh positions to get updated state
-        const liquidationMessage = message as UserLiquidationUpdate;
-        console.log('[UserStore] Position liquidated, refreshing positions:', liquidationMessage.data);
-        store.fetchPositions('open').catch(err => console.error('[UserStore] Failed to refresh positions after liquidation:', err));
       }
       return;
     }

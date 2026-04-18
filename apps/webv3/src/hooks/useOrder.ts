@@ -27,9 +27,6 @@ export interface PlaceOrderParams {
   dollarAmount?: number;
   maxPrice?: number;
   useDelegation?: boolean;
-  // Leverage params
-  leverage?: number; // 1-10, default 1 (no leverage)
-  marginAmount?: number; // User's margin (required if leverage > 1)
 }
 
 // Session signer interface - allows session key to sign orders
@@ -178,18 +175,10 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
         console.log('[Order] Signed authorization message');
       }
 
-      // Send to backend
-      console.log('[Order] Sending with leverage:', { 
-        leverage: params.leverage, 
-        marginAmount: params.marginAmount,
-        dollarAmount: params.dollarAmount,
-        isLeveraged: params.leverage && params.leverage > 1
-      });
-      
       // TIMING: Sending API request
       const t1 = performance.now();
       console.log(`[⏱️ ORDER TIMING] T+${(t1-t0).toFixed(0)}ms: Signed, sending API request...`);
-      
+
       const response = await api.notifyOrderPlaced({
         marketAddress: params.marketAddress,
         side: params.side,
@@ -204,8 +193,6 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
         signature,
         binaryMessage,
         sessionPublicKey, // Include session key if used
-        leverage: params.leverage,
-        marginAmount: params.marginAmount,
       });
 
       // TIMING: Got API response
@@ -313,17 +300,10 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
       useUserStore.getState().setPendingOrder(null);
       
       let errorMessage = 'Failed to place order';
-      let shouldRefreshPositions = false;
-      
+
       if (err instanceof ApiError) {
         if (err.code === 'RATE_LIMITED') {
           errorMessage = 'Slow down — you are sending too many requests. Wait a moment and try again.';
-        } else if (err.code === 'POSITION_BEING_LIQUIDATED') {
-          errorMessage = '⚠️ This position is being liquidated. Please wait for the liquidation to complete.';
-          shouldRefreshPositions = true;
-        } else if (err.code === 'POSITION_ALREADY_CLOSED') {
-          errorMessage = '🔒 This position has been liquidated. Please refresh to see your updated positions.';
-          shouldRefreshPositions = true;
         } else if (err.code === 'INSUFFICIENT_DELEGATION' || err.message.includes('Insufficient delegation')) {
           // Extract amounts from error message if possible
           const match = err.message.match(/delegated \$([0-9.]+).*requires \$([0-9.]+)/);
@@ -352,13 +332,6 @@ export function useOrder(sessionSigner?: SessionSigner): UseOrderReturn {
         }
       }
       
-      // Auto-refresh positions for liquidation-related errors
-      if (shouldRefreshPositions) {
-        setTimeout(() => {
-          useUserStore.getState().fetchAllImmediate();
-        }, 500);
-      }
-
       setError(errorMessage);
       
       // Return error result object so caller can immediately access error message
