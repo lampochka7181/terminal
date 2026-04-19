@@ -4,6 +4,10 @@ import {
   PublicKey,
   Transaction,
   TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
+  AddressLookupTableProgram,
+  AddressLookupTableAccount,
   ComputeBudgetProgram,
   SystemProgram,
   SYSVAR_INSTRUCTIONS_PUBKEY,
@@ -568,6 +572,165 @@ export class AnchorClient {
     return this.relayerKeypair !== null && idl !== null;
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Address Lookup Tables (ALTs) for batch settlement
+  // ─────────────────────────────────────────────────────────────────────────
+  // ALTs let versioned transactions reference accounts by 1-byte index
+  // instead of inlining 32-byte pubkeys. Required to fit large batch settles
+  // (subtreeSize=32) under the 1232-byte TX size cap.
+  //
+  // Lifecycle: created at settlement time (not market activation — keeps the
+  // hot path free), populated with the recipient list + fixed accounts in
+  // 1–2 extension TXs, then referenced by all V3 batch settle TXs for the
+  // market. Closed by a follow-up cleanup pass after market is fully
+  // settled (deferred — leaving rent unrecovered for now).
+  //
+  // Caps:
+  //   - One ALT holds up to 256 addresses.
+  //   - We enable ALT only when settlement count ≥ ALT_RECIPIENT_THRESHOLD
+  //     (below that the setup overhead outweighs the per-batch savings).
+
+  /** Below this many holders we don't bother with an ALT — k=4/k=8 is fast enough. */
+  static readonly ALT_RECIPIENT_THRESHOLD = 64;
+  /** Each `extendLookupTable` TX can hold this many addresses without exceeding 1232 bytes. */
+  static readonly MAX_ADDRESSES_PER_EXTEND = 28;
+  /** Total addresses an ALT can hold (Solana protocol limit). */
+  static readonly MAX_ADDRESSES_PER_LUT = 256;
+
+  /**
+   * Create an Address Lookup Table for a market's batch settlement and
+   * populate it with the union of fixed accounts (program + market PDAs)
+   * and recipient USDC ATAs. Returns the ALT pubkey.
+   *
+   * The caller must wait until the ALT is observable on a slot >= the
+   * extend slot before referencing it in a versioned TX (see
+   * `waitForLookupTableActive`). On Solana, this is typically 1-2 slots
+   * after the last extend.
+   *
+   * @param marketPubkey   The MarketV2 PDA this ALT serves.
+   * @param recipientWallets  Wallet pubkeys of all settlement recipients.
+   *                           USDC ATAs will be derived and added.
+   * @returns ALT pubkey (base58 string), or null if recipients exceeds
+   *          MAX_ADDRESSES_PER_LUT minus the fixed-account count.
+   */
+  async createMarketLookupTable(
+    marketPubkey: PublicKey,
+    recipientWallets: PublicKey[],
+  ): Promise<string | null> {
+    if (!this.relayerKeypair) throw new Error('Relayer not initialized');
+
+    // Derive recipient USDC ATAs (deduplicated). Multiple settlements for the
+    // same wallet share one ATA, so dedupe before sizing.
+    const recipientAtas = await Promise.all(
+      recipientWallets.map((w) => getAssociatedTokenAddress(USDC_MINT, w)),
+    );
+    const uniqueAtaSet = new Map<string, PublicKey>();
+    for (const ata of recipientAtas) uniqueAtaSet.set(ata.toBase58(), ata);
+    const dedupedAtas = [...uniqueAtaSet.values()];
+
+    // Fixed accounts referenced by every BatchSettleV3 TX.
+    const [vault] = PublicKey.findProgramAddressSync(
+      [Buffer.from('vault'), marketPubkey.toBuffer()],
+      PROGRAM_ID,
+    );
+    const bitmapPda = getSettlementBitmapPda(marketPubkey, 0);
+    const fixedAddresses = [
+      marketPubkey,
+      vault,
+      bitmapPda,
+      this.relayerKeypair.publicKey,
+      TOKEN_PROGRAM_ID,
+      SystemProgram.programId,
+      USDC_MINT,
+    ];
+
+    const totalNeeded = fixedAddresses.length + dedupedAtas.length;
+    if (totalNeeded > AnchorClient.MAX_ADDRESSES_PER_LUT) {
+      logger.warn(
+        `[ALT] Market ${marketPubkey.toBase58().slice(0, 8)} would need ${totalNeeded} addresses ` +
+        `(>${AnchorClient.MAX_ADDRESSES_PER_LUT}). Falling back to legacy TX path for this market.`
+      );
+      return null;
+    }
+
+    // Step 1: create the ALT. The instruction takes the slot the ALT will be
+    // derived from — must be a recent finalized slot.
+    const recentSlot = await this.connection.getSlot('finalized');
+    const [createIx, lookupTablePubkey] = AddressLookupTableProgram.createLookupTable({
+      authority: this.relayerKeypair.publicKey,
+      payer: this.relayerKeypair.publicKey,
+      recentSlot,
+    });
+
+    await this.submitTransaction(
+      [createIx], [], `ALT.create ${marketPubkey.toBase58().slice(0, 8)}`,
+    );
+    logger.info(`[ALT] Created lookup table ${lookupTablePubkey.toBase58().slice(0, 8)}... for market ${marketPubkey.toBase58().slice(0, 8)}`);
+
+    // Step 2: extend the ALT in chunks. Fixed accounts go in the first chunk.
+    const allAddresses = [...fixedAddresses, ...dedupedAtas];
+    for (let i = 0; i < allAddresses.length; i += AnchorClient.MAX_ADDRESSES_PER_EXTEND) {
+      const chunk = allAddresses.slice(i, i + AnchorClient.MAX_ADDRESSES_PER_EXTEND);
+      const extendIx = AddressLookupTableProgram.extendLookupTable({
+        payer: this.relayerKeypair.publicKey,
+        authority: this.relayerKeypair.publicKey,
+        lookupTable: lookupTablePubkey,
+        addresses: chunk,
+      });
+      await this.submitTransaction(
+        [extendIx], [],
+        `ALT.extend ${lookupTablePubkey.toBase58().slice(0, 8)} +${chunk.length} (${i + chunk.length}/${allAddresses.length})`,
+      );
+    }
+
+    return lookupTablePubkey.toBase58();
+  }
+
+  /**
+   * Fetch a lookup table from chain. Returns null if it doesn't exist or
+   * isn't yet observable on the connection's commitment level.
+   */
+  async fetchLookupTable(pubkey: string): Promise<AddressLookupTableAccount | null> {
+    const lutPk = new PublicKey(pubkey);
+    const resp = await this.connection.getAddressLookupTable(lutPk);
+    return resp.value;
+  }
+
+  /**
+   * Wait for an ALT to become observable AND for its address list to have
+   * propagated past `lastExtendSlot + 1`. Without the slot wait, a freshly
+   * extended ALT can be visible on its own account but the address list
+   * hasn't yet been activated for use in versioned TXs.
+   *
+   * Returns the loaded ALT once ready, or null on timeout.
+   */
+  async waitForLookupTableActive(
+    pubkey: string,
+    expectedAddressCount: number,
+    timeoutMs: number = 8_000,
+  ): Promise<AddressLookupTableAccount | null> {
+    const deadline = Date.now() + timeoutMs;
+    let lastSeenCount = -1;
+    while (Date.now() < deadline) {
+      const lut = await this.fetchLookupTable(pubkey).catch(() => null);
+      if (lut) {
+        const count = lut.state.addresses.length;
+        if (count !== lastSeenCount) {
+          logger.debug(`[ALT] ${pubkey.slice(0, 8)} now has ${count}/${expectedAddressCount} addresses`);
+          lastSeenCount = count;
+        }
+        if (count >= expectedAddressCount) {
+          // One more slot wait so the ALT is referenceable in versioned TXs.
+          await new Promise((r) => setTimeout(r, 600));
+          return lut;
+        }
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    logger.warn(`[ALT] Timeout waiting for ${pubkey.slice(0, 8)} to reach ${expectedAddressCount} addresses (last seen ${lastSeenCount})`);
+    return null;
+  }
+
   /**
    * Get read connection (for account lookups, balance checks, etc.)
    */
@@ -863,6 +1026,7 @@ export class AnchorClient {
       skipSimulation?: boolean;
       omitComputeBudgetIxs?: boolean;
       omitJitoTip?: boolean;
+      addressLookupTableAccounts?: AddressLookupTableAccount[];
     }
   ): Promise<{ signature: string; confirmed: boolean }> {
     if (!this.relayerKeypair) {
@@ -870,37 +1034,57 @@ export class AnchorClient {
     }
 
     const feePayer = opts?.feePayerOverride || this.relayerKeypair;
-    const transaction = new Transaction();
+    const useVersionedTx = !!(opts?.addressLookupTableAccounts && opts.addressLookupTableAccounts.length > 0);
 
+    // Assemble the full instruction list (compute-budget + caller's ixs + jito tip).
+    const allInstructions: TransactionInstruction[] = [];
     if (!opts?.omitComputeBudgetIxs) {
       const computeUnits = opts?.computeUnits ?? 400000;
       const priorityFee = opts?.priorityMicroLamports ?? 10000;
-      transaction.add(
+      allInstructions.push(
         ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
       );
     }
-
-    for (const ix of instructions) {
-      transaction.add(ix);
-    }
-
+    allInstructions.push(...instructions);
     if (this.heliusSenderUrl && !opts?.omitJitoTip) {
-      transaction.add(this.getJitoTipInstruction(feePayer.publicKey));
+      allInstructions.push(this.getJitoTipInstruction(feePayer.publicKey));
     }
 
     const { blockhash, lastValidBlockHeight } = await this.getCachedBlockhash();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = feePayer.publicKey;
 
     const signers: Keypair[] = [feePayer];
     if (opts?.feePayerOverride) {
       signers.push(this.relayerKeypair);
     }
     signers.push(...additionalSigners);
-    transaction.sign(...signers);
 
-    const serializedTx = transaction.serialize();
+    // Branch on TX version. Versioned TXs let us reference accounts by 1-byte
+    // ALT index instead of inlining 32-byte pubkeys — required to fit large
+    // batch settles (k=32) under the 1232-byte TX size cap. Both branches
+    // produce a serialized byte buffer that the rest of this function (send,
+    // simulate, confirm) handles uniformly.
+    let serializedTx: Uint8Array;
+    let transaction: Transaction | VersionedTransaction;
+    if (useVersionedTx) {
+      const message = new TransactionMessage({
+        payerKey: feePayer.publicKey,
+        recentBlockhash: blockhash,
+        instructions: allInstructions,
+      }).compileToV0Message(opts!.addressLookupTableAccounts);
+      const vtx = new VersionedTransaction(message);
+      vtx.sign(signers);
+      transaction = vtx;
+      serializedTx = vtx.serialize();
+    } else {
+      const tx = new Transaction();
+      for (const ix of allInstructions) tx.add(ix);
+      tx.recentBlockhash = blockhash;
+      tx.feePayer = feePayer.publicKey;
+      tx.sign(...signers);
+      transaction = tx;
+      serializedTx = tx.serialize();
+    }
     const execConn = this.getNextExecConnection();
 
     try {
@@ -936,7 +1120,10 @@ export class AnchorClient {
       const shouldSimulate = !opts?.skipSimulation && !config.skipPreflightSimulation;
       if (shouldSimulate) {
         try {
-          const simResult = await execConn.simulateTransaction(transaction);
+          // Cast to any: web3.js's simulateTransaction has separate overloads
+          // for Transaction vs VersionedTransaction and the union here doesn't
+          // satisfy either directly. The runtime accepts both.
+          const simResult = await (execConn as any).simulateTransaction(transaction as any);
           if (simResult.value.err) {
             const simLogs = simResult.value.logs || [];
             const errJson = JSON.stringify(simResult.value.err);
@@ -2479,6 +2666,12 @@ export class AnchorClient {
       amount: bigint;      // USDC native units
     }>;
     bridgeProof: Uint8Array[];  // array of 32-byte hashes
+    /**
+     * Optional Address Lookup Table for this market. When provided, the TX
+     * is built as a versioned message that references accounts via 1-byte
+     * indices, allowing larger batches (subtreeSize=32) to fit in 1232 bytes.
+     */
+    lookupTablePubkey?: string;
   }): Promise<string> {
     if (!this.isReady()) {
       throw new Error('Anchor client not ready');
@@ -2528,24 +2721,35 @@ export class AnchorClient {
     const argsBuffer = Buffer.concat(bufParts);
     const data = Buffer.concat([discriminator, argsBuffer]);
 
-    // Build remaining accounts â€” recipient USDC ATAs in same order as settlements
-    const remainingAccounts = await Promise.all(
-      params.settlements.map(async (entry) => {
-        const recipientPubkey = new PublicKey(entry.recipient);
-        const ata = await getAssociatedTokenAddress(USDC_MINT, recipientPubkey);
-        return { pubkey: ata, isSigner: false, isWritable: true };
-      }),
-    );
-
-    // Pre-create ATAs if needed (idempotent)
-    const createAtaIxs: TransactionInstruction[] = [];
+    // Resolve every recipient's USDC ATA exactly once and decide whether we
+    // can skip the createIdempotent ix for it (cache says it already exists).
+    // Skipping shaves ~42 bytes per entry from the TX (createATA framing +
+    // recipient wallet account meta), which is what unlocks subtreeSize=8 on
+    // the V3 sizing formula. The ATA cache (knownAtas) is shared with the
+    // match path; a positive entry is effectively permanent because ATAs
+    // can't be uncreated.
+    const ataDecisions: Array<{ ata: PublicKey; recipient: PublicKey; skippedCreate: boolean }> = [];
     for (const entry of params.settlements) {
       const recipientPubkey = new PublicKey(entry.recipient);
+      const ata = await getAssociatedTokenAddress(USDC_MINT, recipientPubkey);
+      ataDecisions.push({ ata, recipient: recipientPubkey, skippedCreate: this.ataIsKnown(ata) });
+    }
+
+    const remainingAccounts = ataDecisions.map((d) => ({
+      pubkey: d.ata,
+      isSigner: false,
+      isWritable: true,
+    }));
+
+    // Only emit createATA instructions for ATAs we don't already know exist.
+    const createAtaIxs: TransactionInstruction[] = [];
+    for (const d of ataDecisions) {
+      if (d.skippedCreate) continue;
       createAtaIxs.push(
         createAssociatedTokenAccountIdempotentInstruction(
           this.relayerKeypair!.publicKey,
-          await getAssociatedTokenAddress(USDC_MINT, recipientPubkey),
-          recipientPubkey,
+          d.ata,
+          d.recipient,
           USDC_MINT,
         ),
       );
@@ -2566,13 +2770,55 @@ export class AnchorClient {
     });
 
     const allIxs = [...createAtaIxs, instruction];
-    const { signature } = await this.submitTransaction(
-      allIxs, [],
-      `BatchSettleV3 ${params.settlements.length} entries (Market ${params.marketPubkey.slice(0, 8)})`,
-      { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
-    );
-    logger.info(`BatchSettleV3 executed: ${signature} (${params.settlements.length} settlements, subtree=${params.subtreeSize})`);
-    return signature;
+
+    // Optionally use a versioned TX with a market-specific Address Lookup
+    // Table. This shrinks each account reference from 32 bytes to 1 byte,
+    // letting subtreeSize=32 fit comfortably in 1232 bytes. If the ALT can't
+    // be loaded for any reason, fall back to a legacy TX (which works as
+    // long as the sizing formula chose a small-enough k).
+    let lookupTableAccounts: AddressLookupTableAccount[] | undefined;
+    if (params.lookupTablePubkey) {
+      try {
+        const lut = await this.fetchLookupTable(params.lookupTablePubkey);
+        if (lut) {
+          lookupTableAccounts = [lut];
+        } else {
+          logger.warn(`[BatchSettleV3] ALT ${params.lookupTablePubkey.slice(0, 8)} not yet observable; using legacy TX (k must fit without ALT compression)`);
+        }
+      } catch (err: any) {
+        logger.warn(`[BatchSettleV3] ALT fetch failed (${err.message}); using legacy TX`);
+      }
+    }
+
+    try {
+      const { signature } = await this.submitTransaction(
+        allIxs, [],
+        `BatchSettleV3 ${params.settlements.length} entries (Market ${params.marketPubkey.slice(0, 8)})`,
+        {
+          priorityMicroLamports: 50000,  // 5x priority for settlement speed
+          addressLookupTableAccounts: lookupTableAccounts,
+        }
+      );
+      // TX landed → every recipient's USDC ATA now provably exists. Mark
+      // them all so future batches for these recipients can skip createATA.
+      for (const d of ataDecisions) this.markAtaExists(d.ata);
+      logger.info(
+        `BatchSettleV3 executed: ${signature} ` +
+        `(${params.settlements.length} settlements, subtree=${params.subtreeSize}, ` +
+        `createAtaSkipped=${params.settlements.length - createAtaIxs.length}/${params.settlements.length}, ` +
+        `alt=${lookupTableAccounts ? 'yes' : 'no'})`
+      );
+      return signature;
+    } catch (err) {
+      // Evict the cache for entries we trusted on this attempt — if we
+      // skipped createATA but the TX still failed, the ATA may not actually
+      // exist (rare: cache poisoning, ATA was closed by user, etc.). The
+      // BullMQ retry will then re-include the createATA.
+      for (const d of ataDecisions) {
+        if (d.skippedCreate) this.knownAtas.delete(d.ata.toBase58());
+      }
+      throw err;
+    }
   }
 
   /**

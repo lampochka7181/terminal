@@ -17,6 +17,10 @@ CREATE TABLE IF NOT EXISTS settlement_trees (
   padded_size INT NOT NULL,                  -- power of 2 ≥ total_leaves
   winner_outcome VARCHAR(3) NOT NULL,        -- 'YES' | 'NO'
   leaves JSONB NOT NULL,                     -- [{index, recipient, amountMicroUsdc, positionId, userId}]
+  lookup_table_pubkey VARCHAR(44),           -- ALT used for batch settle versioned TXs (NULL = legacy TX path)
   posted_tx_signature VARCHAR(88),
   posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Idempotent column add for databases created before the ALT support landed.
+ALTER TABLE settlement_trees ADD COLUMN IF NOT EXISTS lookup_table_pubkey VARCHAR(44);

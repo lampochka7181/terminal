@@ -4,7 +4,7 @@ import { TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddress } from '@solana/spl-to
 import { db, markets, settlements, settlementTrees, users } from '../db/index.js';
 import { positionService } from '../services/position.service.js';
 import { marketService } from '../services/market.service.js';
-import { anchorClient, getYesMintPda, getNoMintPda, fetchMarketV2OnChainState, fetchSettlementBitmap } from '../lib/anchor-client.js';
+import { anchorClient, AnchorClient, getYesMintPda, getNoMintPda, fetchMarketV2OnChainState, fetchSettlementBitmap } from '../lib/anchor-client.js';
 import { fetchMintHolders } from '../lib/settlement-snapshot.js';
 import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
 import { buildMerkleTree, createSettlementLeaf, verifyMerkleProof, verifyCompactBridgeProof, type SettlementLeaf, type MerkleTree } from '../lib/merkle-tree.js';
@@ -80,6 +80,13 @@ interface SettlingState {
   totalBatches: number;
   batchSignatures: string[];
   rootPosted?: boolean; // Set by combined resolve+postMerkleRoot to skip redundant postMerkleRoot call
+  /**
+   * Address Lookup Table for batch settle versioned TXs. Set after the ALT
+   * is created and observable on-chain; absent for small markets that take
+   * the legacy TX path. Threaded into every batch job's payload so the
+   * onchain-submit worker can build a versioned TX referencing it.
+   */
+  lookupTablePubkey?: string;
 }
 const settlingState = new Map<string, SettlingState>();
 
@@ -390,41 +397,99 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
     }
   }
 
+  // Step 2.5: Build an Address Lookup Table for this market when it's worth
+  // it. ALT compresses each account reference from 32 bytes → 1 byte in a
+  // versioned TX, which lets subtreeSize=32 fit in 1232 bytes. Below the
+  // threshold, ALT setup overhead (~3-5s of create+extend TXs) outweighs
+  // the per-batch savings, so we skip it.
+  //
+  // Idempotent: skips if state already carries an ALT pubkey from a previous
+  // cycle (loaded from settlement_trees.lookup_table_pubkey).
+  const shouldUseAlt = state.leaves.length >= AnchorClient.ALT_RECIPIENT_THRESHOLD &&
+                       state.leaves.length <= AnchorClient.MAX_ADDRESSES_PER_LUT - 7; // -7 for fixed accounts
+  if (shouldUseAlt && !state.lookupTablePubkey) {
+    try {
+      const recipientWallets = state.leaves.map((l) => l.recipient);
+      const altPk = await anchorClient.createMarketLookupTable(
+        new PublicKey(marketPubkey),
+        recipientWallets,
+      );
+      if (altPk) {
+        // Wait for the ALT to be active (referenceable in versioned TXs).
+        // Expected address count = 7 fixed + dedupedAtas (deduped by owner).
+        const dedupedRecipientCount = new Set(recipientWallets.map((w) => w.toBase58())).size;
+        const expectedAddressCount = 7 + dedupedRecipientCount;
+        const ready = await anchorClient.waitForLookupTableActive(altPk, expectedAddressCount);
+        if (ready) {
+          state.lookupTablePubkey = altPk;
+          await updateSettlementTreeLookupTable(marketId, altPk).catch((err: any) => {
+            logger.warn(`[MerkleSettler] Failed to persist ALT pubkey for ${marketId}: ${err.message}`);
+          });
+          logger.info(
+            `[MerkleSettler] ALT ready for ${market.asset}-${market.timeframe}: ` +
+            `${altPk.slice(0, 8)} (${expectedAddressCount} addresses) — batches will use versioned TX with subtreeSize=32`
+          );
+        } else {
+          logger.warn(`[MerkleSettler] ALT ${altPk.slice(0, 8)} not active in time; falling back to legacy TX path`);
+        }
+      }
+    } catch (err: any) {
+      // ALT setup is best-effort: failure means we fall back to the legacy
+      // TX path (smaller subtreeSize), which still works.
+      logger.warn(`[MerkleSettler] ALT setup failed for ${marketId}, falling back: ${err.message}`);
+    }
+  }
+
   // Step 3: Create settlement_jobs and enqueue to BullMQ (parallel!)
   //
   // V3 compact batching: instead of per-leaf full proofs, we group consecutive
   // leaves into subtree-aligned batches with a single shared bridge proof.
-  // This saves ~4-8x TX space, allowing 8-16 settlements per TX vs 1-2 in V2.
+  // This saves ~4-8x TX space, allowing 8-32 settlements per TX vs 1-2 in V2.
   //
   // Fallback to V2 for tiny trees where compact batching doesn't help.
 
   const TX_LIMIT = 1232;
-  // Calibrated from measured 1237-byte TX for k=8 on devnet (49-holder tree,
-  // 2026-04-18). Solving: 1237 = 425 + 3*32 + 8*X → X = 89.5 → round up to 96.
-  // The old 44-byte estimate omitted: per-entry createATA ix framing, the
-  // recipient wallet account meta (it's written by createATA even if the ATA
-  // is the "remaining account"), and compact-u16 account-index overhead.
+  // Sizing constants for legacy (non-ALT) TXs. Per-entry assumes the worst
+  // case: createATA ix is included for every recipient. With Phase A's ATA
+  // cache, warm batches skip createATA (~42 bytes/entry savings), but we
+  // keep the conservative number so first-time runs still fit.
+  //
+  // Empirical baseline (2026-04-18, 49-holder market, all createATA emitted):
+  //   1237 bytes for k=8 → 89.5 bytes/entry → round up to 96.
   const FIXED_OVERHEAD = 425;  // sig + header + blockhash + 6 fixed accounts + ix framing + discriminator
   const PER_ENTRY_OVERHEAD = 96;  // recipient ATA meta + createATA framing + wallet meta + amount + compact-u16
 
+  // ALT-aware sizing: when an ALT compresses every account reference to 1
+  // byte, the per-entry cost drops dramatically. Each entry only contributes
+  // its 1-byte ATA index (in the ix's account-list) + 8 bytes for the amount
+  // value + ~3 bytes for the createATA ix framing (still emitted for cold ATAs).
+  // Fixed overhead also shrinks because the 6 fixed accounts compress too.
+  const ALT_FIXED_OVERHEAD = 280;     // sig + header + blockhash + ALT lookup metadata + 6 compressed account refs + ix framing
+  const ALT_PER_ENTRY_OVERHEAD = 14;  // 1-byte ATA index + 8-byte amount + ~5 bytes createATA framing (cold)
+
   const treeDepth = Math.ceil(Math.log2(Math.max(state.leaves.length, 2)));
   const paddedCount = state.tree.paddedSize;
+  const altActive = !!state.lookupTablePubkey;
 
   /**
    * Find optimal subtree size (largest power-of-2 that fits in TX).
    * Returns 0 to signal V2 fallback when compact batching doesn't help.
    */
-  function getOptimalSubtreeSize(depth: number): number {
-    for (const k of [16, 8, 4]) {
+  function getOptimalSubtreeSize(depth: number, withAlt: boolean): number {
+    const fixed = withAlt ? ALT_FIXED_OVERHEAD : FIXED_OVERHEAD;
+    const perEntry = withAlt ? ALT_PER_ENTRY_OVERHEAD : PER_ENTRY_OVERHEAD;
+    // Try k=32 first when ALT is active; legacy path tops out at k=16.
+    const candidates = withAlt ? [32, 16, 8, 4] : [16, 8, 4];
+    for (const k of candidates) {
       const bridgeDepth = depth - Math.log2(k);
       if (bridgeDepth < 0) continue;
-      const txSize = FIXED_OVERHEAD + bridgeDepth * 32 + k * PER_ENTRY_OVERHEAD;
+      const txSize = fixed + bridgeDepth * 32 + k * perEntry;
       if (txSize <= TX_LIMIT - 52) return k; // 52-byte safety margin
     }
     return 0; // V2 fallback
   }
 
-  const subtreeSize = getOptimalSubtreeSize(treeDepth);
+  const subtreeSize = getOptimalSubtreeSize(treeDepth, altActive);
   const useV3 = subtreeSize > 0 && state.leaves.length > 2 && state.leaves.length <= 8192;
 
   if (!state.batchesCreated) {
@@ -555,6 +620,11 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
             bridgeProof: bridgeProof.map(p => Buffer.from(p).toString('hex')),
             marketId,
             batchIndex: thisBatchIdx,
+            // Optional: ALT pubkey for versioned-TX path. When present, the
+            // worker fetches this ALT and submits a versioned TX referencing
+            // it, allowing subtreeSize=32 to fit. When absent, falls back to
+            // a legacy TX (smaller subtree sizes).
+            lookupTablePubkey: state.lookupTablePubkey,
           },
         }, { jobId }).catch(err => {
           logger.error(`[MerkleSettler] Failed to enqueue V3 batch ${thisBatchIdx}: ${err.message}`);
@@ -813,6 +883,13 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
   // Clean up persisted merkle tree — market is fully settled and finalized
   // on-chain, so the tree no longer serves any recovery purpose. Keeping it
   // wastes ~1KB per resolved market over time.
+  //
+  // NOTE: if state.lookupTablePubkey is set, the on-chain ALT account is
+  // NOT closed here (Solana requires a 512-slot deactivation cooldown
+  // before closeLookupTable can run, ~3-4 minutes). That ~0.003 SOL of
+  // rent stays locked until a separate ALT-sweeper job (TODO) processes
+  // deactivated tables. For devnet/perf testing the leak is negligible;
+  // for production, build the sweeper before scaling.
   await db.execute(sql`
     DELETE FROM settlement_trees WHERE market_id = ${marketId}::uuid
   `).catch((err: any) => {
@@ -1015,7 +1092,7 @@ export async function persistSettlementTree(
   await db.execute(sql`
     INSERT INTO settlement_trees (
       market_id, root, total_amount, total_leaves, padded_size,
-      winner_outcome, leaves, posted_tx_signature, posted_at
+      winner_outcome, leaves, lookup_table_pubkey, posted_tx_signature, posted_at
     )
     VALUES (
       ${marketId}::uuid,
@@ -1025,10 +1102,24 @@ export async function persistSettlementTree(
       ${state.tree.paddedSize},
       ${winnerOutcome},
       ${JSON.stringify(leavesJson)}::jsonb,
+      ${state.lookupTablePubkey ?? null},
       ${postedTxSignature},
       NOW()
     )
     ON CONFLICT (market_id) DO NOTHING
+  `);
+}
+
+/**
+ * Update an existing settlement_trees row's lookup_table_pubkey. Used after
+ * the ALT is built (which happens AFTER the tree is initially persisted, so
+ * the column is null on first insert).
+ */
+async function updateSettlementTreeLookupTable(marketId: string, lookupTablePubkey: string): Promise<void> {
+  await db.execute(sql`
+    UPDATE settlement_trees
+    SET lookup_table_pubkey = ${lookupTablePubkey}
+    WHERE market_id = ${marketId}::uuid
   `);
 }
 
@@ -1041,7 +1132,7 @@ export async function persistSettlementTree(
  */
 export async function loadSettlementTree(marketId: string): Promise<SettlingState | null> {
   const result = await db.execute(sql`
-    SELECT root, total_amount::text AS total_amount, total_leaves, padded_size, leaves
+    SELECT root, total_amount::text AS total_amount, total_leaves, padded_size, leaves, lookup_table_pubkey
     FROM settlement_trees
     WHERE market_id = ${marketId}::uuid
     LIMIT 1
@@ -1083,5 +1174,6 @@ export async function loadSettlementTree(marketId: string): Promise<SettlingStat
     batchesCreated: false,
     totalBatches: 0,
     batchSignatures: [],
+    lookupTablePubkey: row.lookup_table_pubkey ?? undefined,
   };
 }

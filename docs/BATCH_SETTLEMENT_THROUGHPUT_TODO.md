@@ -1,6 +1,6 @@
 # Batch Settlement Throughput — Optimization Backlog
 
-**Status:** Backlog (not blocking)
+**Status:** Options A and B shipped 2026-04-19. C deferred.
 **Last updated:** 2026-04-19
 
 ## Current state
@@ -33,7 +33,7 @@ To get back to k=8 (or higher) we need to **shave bytes from the TX**. Three opt
 
 ---
 
-## Option A — Skip `createAssociatedTokenAccountIdempotent` for cached ATAs
+## ☑ Option A — Skip `createAssociatedTokenAccountIdempotent` for cached ATAs (shipped 2026-04-19)
 
 **Win:** ~12 bytes/entry. Drops per-entry cost from ~96 → ~84. Then k=8 fits at 1193 bytes (just under the 1180 cap with safety margin tightened a touch).
 
@@ -51,9 +51,9 @@ To get back to k=8 (or higher) we need to **shave bytes from the TX**. Three opt
 
 ---
 
-## Option B — Address Lookup Tables (ALTs) + versioned transactions
+## ☑ Option B — Address Lookup Tables (ALTs) + versioned transactions (shipped 2026-04-19)
 
-**Win:** account references shrink from 32 bytes → 1 byte. Could fit k=16 easily, k=32 with care.
+**Win:** account references shrink from 32 bytes → 1 byte. Now picks k=32 when ALT is in use; k=16/k=8/k=4 still available as fallbacks.
 
 **Why it works:** Solana versioned TXs can reference accounts via an on-chain `AddressLookupTable` instead of inlining each pubkey. For batch settlement, the account list per TX includes:
 - 6 fixed accounts (market, vault, bitmap, relayer, token program, system program) → put in a per-market or global ALT.
@@ -89,6 +89,27 @@ If Option A gets us to k=8 at ~1193 bytes, two parallel V3 instructions for two 
 **When to do it:** only if A + B together still aren't enough.
 
 ---
+
+## Implementation notes (A + B as shipped)
+
+**Option A — `batchSettleV3` ATA cache reuse.**
+- Shares the existing `AnchorClient.knownAtas` `Set<string>` with the match path. Cache keys are ATA pubkeys (not owner pubkeys), so YES/NO mint ATAs and USDC ATAs coexist without collision.
+- New `ataDecisions` array tracks per-entry skip decisions. Successful TX → mark all entries as known. Failed TX → evict the entries we relied on (in case the cache was wrong). BullMQ retries with the eviction in place re-include the createATA.
+- Logged via `createAtaSkipped=N/M` in the success line so we can see cache hit rate over time.
+
+**Option B — Address Lookup Tables.**
+- Per-market lifecycle: ALT created at settlement time (not market activation), populated with 7 fixed accounts + deduped recipient ATAs in `MAX_ADDRESSES_PER_EXTEND`-sized chunks (28 addresses per `extendLookupTable` TX), then waited until observable + 1 slot before referenceable.
+- Threshold: `ALT_RECIPIENT_THRESHOLD = 64`. Below this, ALT setup overhead (~3-5s of create+extend TXs) outweighs per-batch savings — markets stay on the legacy TX path with k=4/k=8.
+- Cap: `MAX_ADDRESSES_PER_LUT = 256`. Markets above 249 holders fall back to legacy. (For markets that big, multi-ALT support is a future enhancement.)
+- Storage: `settlement_trees.lookup_table_pubkey` (nullable). Persisted right after ALT becomes active so post-root crash recovery can find it.
+- Versioned-TX support: `submitTransaction` grew an `addressLookupTableAccounts` option. When present it builds a `MessageV0` + `VersionedTransaction`; otherwise legacy `Transaction` (current behavior). Both produce a serialized byte buffer that the existing send/simulate/confirm paths consume uniformly.
+- Sizing: `getOptimalSubtreeSize` is now ALT-aware. With ALT it tries [32, 16, 8, 4]; without it stays at [16, 8, 4]. Constants `ALT_FIXED_OVERHEAD = 280` and `ALT_PER_ENTRY_OVERHEAD = 14` are conservative estimates — calibrate against runtime once we have empirical numbers.
+- Cleanup deferred: ALT rent (~0.003 SOL) stays locked after market settles. A separate sweeper job needs to call `deactivateLookupTable` then wait 512 slots then `closeLookupTable`. Not built yet.
+
+**What still doesn't ship in this round:**
+- ALT sweeper for rent reclamation (rent leak per market — fine for devnet, must build before mainnet scale).
+- Empirical recalibration of `ALT_PER_ENTRY_OVERHEAD` — the 14 number is a defensible guess. If runtime measurement shows headroom, we could maybe raise it, but k=32 already fits and there are no larger power-of-2 candidates.
+- Pre-warming the ALT during market activation (would shave 3-5s off the first batch latency).
 
 ## Decision matrix
 

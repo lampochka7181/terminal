@@ -205,6 +205,11 @@ export const settlementTrees = pgTable('settlement_trees', {
   paddedSize: integer('padded_size').notNull(),      // next power of 2 ≥ totalLeaves
   winnerOutcome: varchar('winner_outcome', { length: 3 }).notNull(), // 'YES' | 'NO'
   leaves: jsonb('leaves').notNull(),                 // Array<{ index, recipient, amountMicroUsdc, positionId, userId }>
+  // Address Lookup Table for this market's batch settlement TXs. Populated
+  // when the holder count crosses the ALT threshold; null otherwise (small
+  // markets settle with legacy TXs). Lifetime is the same as the tree row's:
+  // created at post-root, closed after market finalize.
+  lookupTablePubkey: varchar('lookup_table_pubkey', { length: 44 }),
   postedTxSignature: varchar('posted_tx_signature', { length: 88 }),
   postedAt: timestamp('posted_at').defaultNow().notNull(),
 });

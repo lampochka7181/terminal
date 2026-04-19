@@ -305,6 +305,7 @@ CREATE TABLE settlement_trees (
   padded_size INT NOT NULL,                  -- power of 2 ≥ total_leaves
   winner_outcome VARCHAR(3) NOT NULL,        -- 'YES' | 'NO'
   leaves JSONB NOT NULL,                     -- [{index, recipient, amountMicroUsdc, positionId, userId}]
+  lookup_table_pubkey VARCHAR(44),           -- ALT used for batch settle versioned TXs (NULL = legacy TX path)
   posted_tx_signature VARCHAR(88),
   posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

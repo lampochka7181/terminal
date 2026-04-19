@@ -156,7 +156,7 @@ async function executeBatchSettle(payload: Record<string, any>): Promise<{ succe
  * Execute a V3 compact batch-settle job: call batchSettleV3 and update settlement_jobs table.
  */
 async function executeBatchSettleV3(payload: Record<string, any>): Promise<{ success: boolean; signature?: string; error?: string; errorCode?: string }> {
-  const { marketPubkey, bitmapChunkIndex, startIndex, subtreeSize, settlements: batchSettlements, bridgeProof, marketId, batchIndex } = payload;
+  const { marketPubkey, bitmapChunkIndex, startIndex, subtreeSize, settlements: batchSettlements, bridgeProof, marketId, batchIndex, lookupTablePubkey } = payload;
 
   try {
     // Mark as SUBMITTED
@@ -196,6 +196,7 @@ async function executeBatchSettleV3(payload: Record<string, any>): Promise<{ suc
       subtreeSize,
       settlements: deserializedSettlements,
       bridgeProof: deserializedBridgeProof,
+      lookupTablePubkey,
     });
 
     // Mark as COMPLETED
