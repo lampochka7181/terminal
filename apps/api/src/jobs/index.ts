@@ -6,6 +6,7 @@ import { orderExpirerJob } from './order-expirer.js';
 import { marketCloserJob } from './market-closer.js';
 import { merkleSettlerJob } from './merkle-settler.js';
 import { marketReconcilerJob } from './market-reconciler.js';
+import { driftReconcilerJob } from './drift-reconciler.js';
 import { reconciliationJob } from '../queue/jobs/reconciliation.job.js';
 import { relayerPoolService } from '../services/relayer-pool.service.js';
 import { pool } from '../db/index.js';
@@ -102,6 +103,15 @@ const jobs: JobConfig[] = [
     job: () => relayerPoolService.autoFundKeeper(),
     enabled: !isPerfMode,
     startupDelayMs: 40000,
+  },
+  {
+    // Observational — logs DB-vs-chain position drift so we can hunt the
+    // upstream tracking bug. Does not mutate any state.
+    name: 'Drift Reconciler',
+    intervalMs: 60 * 1000,
+    job: driftReconcilerJob,
+    enabled: !isPerfMode,
+    startupDelayMs: 65000,
   },
 ];
 

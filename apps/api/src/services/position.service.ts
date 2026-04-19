@@ -63,15 +63,19 @@ export class PositionService {
   }
 
   /**
-   * Get or create position for user in market
+   * Get or create position for user in market — race-safe.
+   *
+   * The previous SELECT-then-INSERT could race: two concurrent callers both
+   * see "no row", both INSERT, the second hits the (user_id, market_id) UNIQUE
+   * constraint and throws. Callers with `.catch()` swallowed that error and
+   * silently lost the second caller's share update.
+   *
+   * This version does a single INSERT ... ON CONFLICT DO NOTHING and re-reads
+   * on miss. No shares are written here — callers that need to increment
+   * should use `updateAfterTrade`, which upserts atomically.
    */
   async getOrCreate(userId: string, marketId: string): Promise<Position> {
-    const existing = await this.getPosition(userId, marketId);
-    if (existing) {
-      return existing;
-    }
-    
-    const [position] = await db
+    const inserted = await db
       .insert(positions)
       .values({
         userId,
@@ -82,16 +86,39 @@ export class PositionService {
         realizedPnl: '0',
         status: 'OPEN',
       })
+      .onConflictDoNothing()
       .returning();
-    
-    return position;
+
+    if (inserted.length > 0) return inserted[0];
+
+    // Row existed already — fetch and return.
+    const existing = await this.getPosition(userId, marketId);
+    if (!existing) {
+      throw new Error(`Position for user ${userId} in market ${marketId} not found after upsert`);
+    }
+    return existing;
   }
 
   /**
-   * Update position after a trade
-   * 
+   * Update position after a trade — atomic, concurrency-safe.
+   *
    * @param isBuy - true if buying/acquiring shares, false if selling existing shares
    * @param cost - For buys: total cost paid. For sells: proceeds received.
+   *
+   * Implementation notes:
+   * - A single taker market order walks the book and produces N fills, each
+   *   with its own call to this method. Previously this was SELECT→compute→UPDATE
+   *   in JS, which under concurrent fills for the same (user, market) loses
+   *   updates: two callers read the same `current*` snapshot, compute in
+   *   isolation, and the second UPDATE overwrites the first. Across a perf
+   *   test with fresh wallets each taking multiple fills, this produced a
+   *   consistent ~0.1% undercount visible via the DriftReconciler job.
+   * - Fix: use a single atomic `INSERT ... ON CONFLICT DO UPDATE` that reads
+   *   the DB's current values (`positions.*`) inside the UPDATE SET clause.
+   *   Postgres serializes these via the primary-key lock, so two concurrent
+   *   upserts for the same (user, market) accumulate correctly.
+   * - The weighted-average entry price is computed in SQL from live DB values
+   *   so it stays correct under concurrency too.
    */
   async updateAfterTrade(
     userId: string,
@@ -101,84 +128,86 @@ export class PositionService {
     cost: number,
     isBuy: boolean
   ): Promise<void> {
-    const position = await this.getOrCreate(userId, marketId);
-    
-    // Round shares to 6 decimal places to match on-chain precision.
-    // On-chain stores shares as u64 with 6 decimals (e.g., 1.5 shares = 1_500_000).
-    // Math.round is used instead of Math.floor because values going through
-    // float division→multiplication round-trips (e.g., lamports/1e6 then *1e6)
-    // can lose up to ~1e-10 precision. Math.floor would truncate 142856.9999999
-    // to 142856 instead of 142857. Since all share values are exact multiples
-    // of 1e-6, Math.round always gives the correct integer.
+    // Round to match on-chain 6-decimal precision (see previous note on why
+    // Math.round beats Math.floor after float round-trips).
     const truncateToOnChainPrecision = (n: number) => Math.round(n * 1_000_000) / 1_000_000;
-    const sharesToAdd = truncateToOnChainPrecision(shares);
-    
-    const currentYes = parseFloat(position.yesShares || '0');
-    const currentNo = parseFloat(position.noShares || '0');
-    const currentCost = parseFloat(position.totalCost || '0');
-    const currentAvgYes = parseFloat(position.avgEntryYes || '0');
-    const currentAvgNo = parseFloat(position.avgEntryNo || '0');
-    const currentRealizedPnl = parseFloat(position.realizedPnl || '0');
-    
-    let newYes = currentYes;
-    let newNo = currentNo;
-    let newCost = currentCost;
-    let newAvgYes = currentAvgYes;
-    let newAvgNo = currentAvgNo;
-    let newRealizedPnl = currentRealizedPnl;
-    
+    const sharesDelta = truncateToOnChainPrecision(shares);
+    if (sharesDelta <= 0) return;
+
     if (isBuy) {
-      // BUYING: Add shares and increase cost basis
-      if (outcome === 'YES') {
-        const avgPrice = cost / sharesToAdd;
-        newAvgYes = currentYes > 0 
-          ? (currentYes * currentAvgYes + sharesToAdd * avgPrice) / (currentYes + sharesToAdd)
-          : avgPrice;
-        newYes = truncateToOnChainPrecision(currentYes + sharesToAdd);
-      } else {
-        const avgPrice = cost / sharesToAdd;
-        newAvgNo = currentNo > 0
-          ? (currentNo * currentAvgNo + sharesToAdd * avgPrice) / (currentNo + sharesToAdd)
-          : avgPrice;
-        newNo = truncateToOnChainPrecision(currentNo + sharesToAdd);
-      }
-      newCost = currentCost + cost;
-    } else {
-      // SELLING: Reduce shares and calculate realized PnL
-      if (outcome === 'YES') {
-        // Calculate realized PnL: proceeds - cost basis for sold shares
-        const costBasisSold = currentAvgYes * sharesToAdd;
-        const realizedPnL = cost - costBasisSold;  // cost is actually proceeds when selling
-        newRealizedPnl = currentRealizedPnl + realizedPnL;
-        newYes = truncateToOnChainPrecision(Math.max(0, currentYes - sharesToAdd));
-        // Reduce total cost by the cost basis of sold shares
-        newCost = Math.max(0, currentCost - costBasisSold);
-        // Average entry stays the same for remaining shares
-      } else {
-        // Calculate realized PnL for NO shares
-        const costBasisSold = currentAvgNo * sharesToAdd;
-        const realizedPnL = cost - costBasisSold;
-        newRealizedPnl = currentRealizedPnl + realizedPnL;
-        newNo = truncateToOnChainPrecision(Math.max(0, currentNo - sharesToAdd));
-        newCost = Math.max(0, currentCost - costBasisSold);
-      }
+      // Price per share for the shares added in THIS fill (used to weight the
+      // average-entry-price update). Bound away from div-by-zero above.
+      const avgNew = cost / sharesDelta;
+      const yesAdd = outcome === 'YES' ? sharesDelta : 0;
+      const noAdd = outcome === 'NO' ? sharesDelta : 0;
+      const avgYesNew = outcome === 'YES' ? avgNew : 0;
+      const avgNoNew = outcome === 'NO' ? avgNew : 0;
+
+      await db.execute(sql`
+        INSERT INTO positions (
+          user_id, market_id, yes_shares, no_shares, total_cost,
+          avg_entry_yes, avg_entry_no, realized_pnl, status, created_at, updated_at
+        )
+        VALUES (
+          ${userId}::uuid,
+          ${marketId}::uuid,
+          ${yesAdd.toString()}::numeric,
+          ${noAdd.toString()}::numeric,
+          ${cost.toString()}::numeric,
+          ${avgYesNew.toString()}::numeric,
+          ${avgNoNew.toString()}::numeric,
+          '0'::numeric,
+          'OPEN',
+          NOW(),
+          NOW()
+        )
+        ON CONFLICT (user_id, market_id) DO UPDATE SET
+          yes_shares = positions.yes_shares + EXCLUDED.yes_shares,
+          no_shares  = positions.no_shares  + EXCLUDED.no_shares,
+          total_cost = positions.total_cost + EXCLUDED.total_cost,
+          avg_entry_yes = CASE
+            WHEN EXCLUDED.yes_shares > 0 AND (positions.yes_shares + EXCLUDED.yes_shares) > 0 THEN
+              (positions.yes_shares * positions.avg_entry_yes + EXCLUDED.yes_shares * EXCLUDED.avg_entry_yes)
+              / (positions.yes_shares + EXCLUDED.yes_shares)
+            ELSE positions.avg_entry_yes
+          END,
+          avg_entry_no = CASE
+            WHEN EXCLUDED.no_shares > 0 AND (positions.no_shares + EXCLUDED.no_shares) > 0 THEN
+              (positions.no_shares * positions.avg_entry_no + EXCLUDED.no_shares * EXCLUDED.avg_entry_no)
+              / (positions.no_shares + EXCLUDED.no_shares)
+            ELSE positions.avg_entry_no
+          END,
+          status = 'OPEN',
+          updated_at = NOW()
+      `);
+      return;
     }
-    
-    await db
-      .update(positions)
-      .set({
-        yesShares: newYes.toString(),
-        noShares: newNo.toString(),
-        totalCost: newCost.toString(),
-        avgEntryYes: newAvgYes.toString(),
-        avgEntryNo: newAvgNo.toString(),
-        realizedPnl: newRealizedPnl.toString(),
-        // Re-open position if adding shares to a settled position
-        // This handles the case where user closes a position and opens a new one on the same market
-        status: isBuy ? 'OPEN' : position.status,
-        updatedAt: new Date(),
-      })
-      .where(eq(positions.id, position.id));
+
+    // SELL path — decrement shares and accumulate realized PnL atomically.
+    // We don't INSERT-on-miss here: selling from a nonexistent position is a
+    // logical no-op (no shares to reduce). If the row doesn't exist, the
+    // UPDATE WHERE clause matches nothing and we return cleanly.
+    if (outcome === 'YES') {
+      await db.execute(sql`
+        UPDATE positions SET
+          realized_pnl  = positions.realized_pnl
+                          + (${cost.toString()}::numeric - positions.avg_entry_yes * ${sharesDelta.toString()}::numeric),
+          total_cost    = GREATEST(0::numeric, positions.total_cost - positions.avg_entry_yes * ${sharesDelta.toString()}::numeric),
+          yes_shares    = GREATEST(0::numeric, positions.yes_shares - ${sharesDelta.toString()}::numeric),
+          updated_at    = NOW()
+        WHERE user_id = ${userId}::uuid AND market_id = ${marketId}::uuid
+      `);
+    } else {
+      await db.execute(sql`
+        UPDATE positions SET
+          realized_pnl  = positions.realized_pnl
+                          + (${cost.toString()}::numeric - positions.avg_entry_no * ${sharesDelta.toString()}::numeric),
+          total_cost    = GREATEST(0::numeric, positions.total_cost - positions.avg_entry_no * ${sharesDelta.toString()}::numeric),
+          no_shares     = GREATEST(0::numeric, positions.no_shares - ${sharesDelta.toString()}::numeric),
+          updated_at    = NOW()
+        WHERE user_id = ${userId}::uuid AND market_id = ${marketId}::uuid
+      `);
+    }
   }
 
   /**

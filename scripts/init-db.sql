@@ -293,6 +293,22 @@ CREATE TABLE relayer_wallets (
 );
 CREATE INDEX idx_relayer_wallets_selection ON relayer_wallets (status, active_jobs) WHERE status = 'active';
 
+-- Settlement trees — authoritative merkle tree persisted at post-root time.
+-- Retries / crash recovery load leaves+proofs from here rather than rebuilding
+-- from mutable positions (which would produce a different tree after any
+-- partial settlement has already executed on-chain).
+CREATE TABLE settlement_trees (
+  market_id UUID PRIMARY KEY REFERENCES markets(id),
+  root TEXT NOT NULL,                        -- 64-char lowercase hex
+  total_amount NUMERIC(20,0) NOT NULL,       -- microUSDC
+  total_leaves INT NOT NULL,
+  padded_size INT NOT NULL,                  -- power of 2 ≥ total_leaves
+  winner_outcome VARCHAR(3) NOT NULL,        -- 'YES' | 'NO'
+  leaves JSONB NOT NULL,                     -- [{index, recipient, amountMicroUsdc, positionId, userId}]
+  posted_tx_signature VARCHAR(88),
+  posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Settlement jobs for parallel batch settlement (Phase 7)
 CREATE TABLE settlement_jobs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

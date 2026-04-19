@@ -277,11 +277,29 @@ export interface MarketV2ChainState {
   strikePriceRaw: bigint;
   strikePrice: number;
   openInterest: bigint; // Raw open_interest (USDC lamports)
+  // Merkle settlement state (populated when has_merkle_root=true)
+  hasMerkleRoot: boolean;
+  settlementMerkleRoot: Uint8Array;        // 32 bytes, zero-filled if !hasMerkleRoot
+  totalSettlementAmount: bigint;
+  settlementAmountPaid: bigint;
+  settlementsProcessed: bigint;
+  settlementsTotal: bigint;
 }
 
+// Offsets for the merkle settlement block, counted forward from open_interest.
+// open_interest (8) + settlement_merkle_root (32) + has_merkle_root (1) ...
+const MARKET_V2_MERKLE_ROOT_OFFSET = MARKET_V2_OPEN_INTEREST_OFFSET + 8;                      // 266
+const MARKET_V2_HAS_MERKLE_ROOT_OFFSET = MARKET_V2_MERKLE_ROOT_OFFSET + 32;                   // 298
+const MARKET_V2_TOTAL_SETTLEMENT_AMOUNT_OFFSET = MARKET_V2_HAS_MERKLE_ROOT_OFFSET + 1;        // 299
+const MARKET_V2_SETTLEMENT_AMOUNT_PAID_OFFSET = MARKET_V2_TOTAL_SETTLEMENT_AMOUNT_OFFSET + 8; // 307
+const MARKET_V2_SETTLEMENTS_PROCESSED_OFFSET = MARKET_V2_SETTLEMENT_AMOUNT_PAID_OFFSET + 8;   // 315
+const MARKET_V2_SETTLEMENTS_TOTAL_OFFSET = MARKET_V2_SETTLEMENTS_PROCESSED_OFFSET + 8;        // 323
+const MARKET_V2_MERKLE_BLOCK_END = MARKET_V2_SETTLEMENTS_TOTAL_OFFSET + 8;                    // 331
+
 /**
- * Read the on-chain status and open_interest of a MarketV2 account.
- * Returns null if the account does not exist (already finalized/closed).
+ * Read the on-chain status, open_interest, and merkle settlement state of a
+ * MarketV2 account. Returns null if the account does not exist (already
+ * finalized/closed).
  */
 export async function fetchMarketV2OnChainState(
   connection: Connection,
@@ -297,13 +315,76 @@ export async function fetchMarketV2OnChainState(
   const status = CHAIN_STATUS_MAP[statusRaw] ?? 'OPEN';
   const openInterest = info.data.readBigUInt64LE(MARKET_V2_OPEN_INTEREST_OFFSET);
 
+  let hasMerkleRoot = false;
+  let settlementMerkleRoot = new Uint8Array(32);
+  let totalSettlementAmount = 0n;
+  let settlementAmountPaid = 0n;
+  let settlementsProcessed = 0n;
+  let settlementsTotal = 0n;
+
+  if (info.data.length >= MARKET_V2_MERKLE_BLOCK_END) {
+    settlementMerkleRoot = new Uint8Array(
+      info.data.slice(MARKET_V2_MERKLE_ROOT_OFFSET, MARKET_V2_MERKLE_ROOT_OFFSET + 32)
+    );
+    hasMerkleRoot = info.data[MARKET_V2_HAS_MERKLE_ROOT_OFFSET] !== 0;
+    totalSettlementAmount = info.data.readBigUInt64LE(MARKET_V2_TOTAL_SETTLEMENT_AMOUNT_OFFSET);
+    settlementAmountPaid = info.data.readBigUInt64LE(MARKET_V2_SETTLEMENT_AMOUNT_PAID_OFFSET);
+    settlementsProcessed = info.data.readBigUInt64LE(MARKET_V2_SETTLEMENTS_PROCESSED_OFFSET);
+    settlementsTotal = info.data.readBigUInt64LE(MARKET_V2_SETTLEMENTS_TOTAL_OFFSET);
+  }
+
   return {
     status,
     statusRaw,
     strikePriceRaw,
     strikePrice: Number(strikePriceRaw) / 100_000_000,
     openInterest,
+    hasMerkleRoot,
+    settlementMerkleRoot,
+    totalSettlementAmount,
+    settlementAmountPaid,
+    settlementsProcessed,
+    settlementsTotal,
   };
+}
+
+/**
+ * Fetch the settlement_bitmap account for a market+chunk and return the set of
+ * leaf indices that have already been claimed. One bitmap account covers 8192
+ * leaves (1024 bytes × 8 bits). For markets with more than 8192 leaves, call
+ * this once per chunk and union the results.
+ *
+ * Returns an empty set if the bitmap PDA doesn't exist yet (chunk not
+ * initialized, or no batches have run).
+ *
+ * SettlementBitmap layout (from state_v2.rs):
+ *   8 (discriminator) + 32 (market) + 2 (chunk_index) + 1024 (bitmap) + 1 (bump)
+ */
+export async function fetchSettlementBitmap(
+  connection: Connection,
+  marketPubkey: PublicKey,
+  chunkIndex: number,
+): Promise<Set<number>> {
+  const pda = getSettlementBitmapPda(marketPubkey, chunkIndex);
+  const info = await connection.getAccountInfo(pda);
+  const claimed = new Set<number>();
+  if (!info || !info.data) return claimed;
+
+  const BITMAP_OFFSET = 8 + 32 + 2;
+  const BITMAP_BYTES = 1024;
+  if (info.data.length < BITMAP_OFFSET + BITMAP_BYTES) return claimed;
+
+  const base = chunkIndex * 8192;
+  for (let byte = 0; byte < BITMAP_BYTES; byte++) {
+    const b = info.data[BITMAP_OFFSET + byte];
+    if (b === 0) continue;
+    for (let bit = 0; bit < 8; bit++) {
+      if (b & (1 << bit)) {
+        claimed.add(base + byte * 8 + bit);
+      }
+    }
+  }
+  return claimed;
 }
 
 /**
@@ -328,6 +409,22 @@ export class AnchorClient {
   private blockhashInflight: Promise<{ blockhash: string; lastValidBlockHeight: number }> | null = null;
   private readonly BLOCKHASH_CACHE_TTL_MS = 5000; // Reuse blockhash for 5s (valid for ~60-90s, saves RPC calls under sustained load)
 
+  // â”€â”€ ATA existence cache (saves 4 RPC calls per match once warm) â”€â”€
+  // Once an ATA exists on-chain it cannot be uncreated, so a positive result
+  // is effectively permanent. We cap the set at ~50k entries to bound memory
+  // (that's ~1.7MB of pubkey strings, plenty for an active trading session).
+  private readonly knownAtas = new Set<string>();
+  private readonly KNOWN_ATA_CAP = 50_000;
+
+  private markAtaExists(ata: PublicKey): void {
+    if (this.knownAtas.size >= this.KNOWN_ATA_CAP) return; // stop growing; existing entries stay valid
+    this.knownAtas.add(ata.toBase58());
+  }
+
+  private ataIsKnown(ata: PublicKey): boolean {
+    return this.knownAtas.has(ata.toBase58());
+  }
+
   // â”€â”€ Helius Sender (15 tx/sec via Jito dual-routing) â”€â”€
   private readonly heliusSenderUrl: string;
   private readonly jitoTipLamports: number;
@@ -345,27 +442,60 @@ export class AnchorClient {
     '4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or',
   ];
 
+  /**
+   * Derive a WebSocket URL for Solana confirmation subscriptions from an HTTP
+   * RPC URL. Helius exposes WS at the same host with wss:// scheme, which also
+   * matches Triton, QuickNode, and the public solana.com endpoints. Returns
+   * undefined if the URL can't be safely converted (e.g. custom proxies).
+   */
+  private deriveWsUrl(httpUrl: string): string | undefined {
+    if (!httpUrl) return undefined;
+    if (httpUrl.startsWith('https://')) return 'wss://' + httpUrl.slice('https://'.length);
+    if (httpUrl.startsWith('http://')) return 'ws://' + httpUrl.slice('http://'.length);
+    return undefined;
+  }
+
+  /**
+   * Resolve the WS endpoint to attach to a given Connection. Prefers the
+   * explicit SOLANA_WS_URL override; otherwise auto-derives from the HTTP URL.
+   * Having a WS endpoint makes confirmTransaction use a single signatureSubscribe
+   * stream instead of polling getSignatureStatuses — the single biggest driver
+   * of per-method rate-limit 429s at modest order rates.
+   */
+  private resolveWsEndpoint(httpUrl: string): string | undefined {
+    if (config.solanaWsUrl) return config.solanaWsUrl;
+    return this.deriveWsUrl(httpUrl);
+  }
+
   constructor() {
+    const mainWs = this.resolveWsEndpoint(config.solanaRpcUrl);
     this.connection = new Connection(
       config.solanaRpcUrl,
-      { commitment: 'confirmed' }
+      { commitment: 'confirmed', wsEndpoint: mainWs }
     );
 
     // Build execution connection pool from all available RPC URLs
     const execUrl = config.solanaExecutionRpcUrl || config.solanaRpcUrl;
-    this.executionConnection = new Connection(execUrl, { commitment: 'confirmed' });
+    const execWs = this.resolveWsEndpoint(execUrl);
+    this.executionConnection = new Connection(execUrl, { commitment: 'confirmed', wsEndpoint: execWs });
     this.execConnectionPool.push(this.executionConnection);
 
     // Add additional RPC endpoints to the pool
     const additionalUrls = [config.solanaRpcUrl2, config.solanaRpcUrl3].filter(u => u);
     for (const url of additionalUrls) {
-      this.execConnectionPool.push(new Connection(url, { commitment: 'confirmed' }));
+      this.execConnectionPool.push(new Connection(url, { commitment: 'confirmed', wsEndpoint: this.resolveWsEndpoint(url) }));
     }
 
     if (this.execConnectionPool.length > 1) {
       logger.info(`ðŸ”— RPC connection pool: ${this.execConnectionPool.length} endpoints (${this.execConnectionPool.length * 50} est. RPC/s)`);
     } else if (config.solanaExecutionRpcUrl) {
       logger.info(`ðŸ”— Separate execution RPC configured: ${execUrl.slice(0, 50)}...`);
+    }
+
+    if (execWs) {
+      logger.info(`ðŸ”Œ WS confirmation endpoint: ${execWs.slice(0, 50)}... (signatureSubscribe via onSignature)`);
+    } else {
+      logger.warn(`âš ï¸  No WS endpoint configured — confirmViaWs will time out every TX; set SOLANA_WS_URL or use an https:// RPC URL`);
     }
 
     // Helius Sender setup (mainnet ONLY: 15 tx/sec via Jito dual-routing)
@@ -508,6 +638,63 @@ export class AnchorClient {
       logger.warn(`[Sender] Helius Sender fetch failed: ${err.message}`);
       return null; // Fall back to standard send
     }
+  }
+
+  /**
+   * WS-only confirmation via signatureSubscribe. Replaces web3.js's
+   * confirmTransaction which spawns an internal getBlockHeight polling loop
+   * that leaks unhandled-rejection 429s on rate-limited RPC providers.
+   *
+   * Returns either the signature result (with its err field) or a timed-out
+   * sentinel. No HTTP polling; the subscription is cleaned up on both the
+   * success and timeout paths.
+   */
+  private confirmViaWs(
+    conn: Connection,
+    signature: string,
+    commitment: 'processed' | 'confirmed' | 'finalized',
+    timeoutMs: number,
+    contextLabel: string,
+  ): Promise<{ value: { err: any }; timedOut?: false } | { value: { err: null }; timedOut: true }> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let subId: number | null = null;
+
+      const cleanup = () => {
+        if (subId !== null) {
+          // removeSignatureListener returns a Promise; swallow rejections to
+          // avoid leaking if the socket is already gone.
+          Promise.resolve(conn.removeSignatureListener(subId)).catch(() => {});
+          subId = null;
+        }
+      };
+
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        logger.debug(`[${contextLabel}] confirmViaWs timeout for ${signature.slice(0, 16)}...`);
+        resolve({ value: { err: null }, timedOut: true });
+      }, timeoutMs);
+
+      try {
+        subId = conn.onSignature(
+          signature,
+          (result) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            cleanup();
+            resolve({ value: { err: result.err } });
+          },
+          commitment,
+        );
+      } catch (err: any) {
+        // onSignature is synchronous in web3.js but defensive — if the WS
+        // subscription can't be created at all, fall through to timeout.
+        logger.warn(`[${contextLabel}] confirmViaWs subscribe failed: ${err?.message}`);
+      }
+    });
   }
 
   /**
@@ -808,28 +995,37 @@ export class AnchorClient {
         { skipPreflight: true, maxRetries: 0 }
       );
 
-      const resendIntervalMs = 2000;
-      const resendTimer = setInterval(async () => {
-        for (const conn of this.execConnectionPool) {
-          try {
-            await conn.sendRawTransaction(serializedTx, { skipPreflight: true, maxRetries: 0 });
-          } catch { /* ignore */ }
-        }
+      const resendIntervalMs = config.solanaResendIntervalMs;
+      const resendTimer = setInterval(() => {
+        // Fire-and-forget sends across the pool. Each send has its own try/catch
+        // AND we attach a terminal .catch to the outer Promise so that any
+        // rejection (including provider 429s surfacing asynchronously) cannot
+        // escape as an unhandledRejection.
+        (async () => {
+          for (const conn of this.execConnectionPool) {
+            try {
+              await conn.sendRawTransaction(serializedTx, { skipPreflight: true, maxRetries: 0 });
+            } catch { /* ignore */ }
+          }
+        })().catch(() => { /* defensive: never leak */ });
       }, resendIntervalMs);
 
       try {
         const MAX_CONFIRM_TIMEOUT_MS = 10_000;
 
-        const confirmationPromise = execConn.confirmTransaction(
-          { signature, blockhash, lastValidBlockHeight },
-          'confirmed'
+        // Bypass web3.js's confirmTransaction because it spawns an internal
+        // getBlockHeight polling loop to check blockhash expiry. Under load
+        // that loop hits Helius per-method limits, and the rejections leak
+        // out with no user-code frame on the stack (they're siblings of the
+        // promise we await, not the promise itself). Using onSignature
+        // directly gives us a pure WS subscription with no HTTP polling.
+        const confirmation = await this.confirmViaWs(
+          execConn,
+          signature,
+          'confirmed',
+          MAX_CONFIRM_TIMEOUT_MS,
+          contextLabel,
         );
-
-        const timeoutPromise = new Promise<{ value: { err: null }, timedOut: true }>((resolve) => {
-          setTimeout(() => resolve({ value: { err: null }, timedOut: true }), MAX_CONFIRM_TIMEOUT_MS);
-        });
-
-        const confirmation = await Promise.race([confirmationPromise, timeoutPromise]) as any;
 
         if (confirmation.timedOut) {
           logger.warn(`[${contextLabel}] Confirmation timeout (${MAX_CONFIRM_TIMEOUT_MS}ms) for ${signature.slice(0, 16)}... — will retry`);
@@ -1496,34 +1692,33 @@ export class AnchorClient {
     const createAtaIxs: TransactionInstruction[] = [];
     const conn = this.getConnection();
 
-    // Helper to check if ATA exists and add creation instruction if needed
+    // Helper to check if ATA exists and add creation instruction if needed.
+    // An ATA, once created, cannot be closed back into non-existence for share
+    // tokens, so a cached hit is safe to trust indefinitely. On a miss we fall
+    // back to an RPC getAccountInfo and cache the result on success.
     const maybeCreateAta = async (ata: PublicKey, owner: PublicKey, mint: PublicKey) => {
+      if (this.ataIsKnown(ata)) return; // cache hit — skip RPC and skip ix
       try {
         const info = await conn.getAccountInfo(ata);
-        if (!info) {
-          createAtaIxs.push(
-            createAssociatedTokenAccountIdempotentInstruction(
-              ataPayer,
-              ata,
-              owner,
-              mint,
-              TOKEN_2022_PROGRAM_ID,
-              ASSOCIATED_TOKEN_PROGRAM_ID
-            )
-          );
+        if (info) {
+          this.markAtaExists(ata);
+          return;
         }
       } catch {
-        createAtaIxs.push(
-          createAssociatedTokenAccountIdempotentInstruction(
-            ataPayer,
-            ata,
-            owner,
-            mint,
-            TOKEN_2022_PROGRAM_ID,
-            ASSOCIATED_TOKEN_PROGRAM_ID
-          )
-        );
+        // fall through to enqueue creation on RPC failure — safer than silently
+        // skipping; createAssociatedTokenAccountIdempotentInstruction is a no-op
+        // if the ATA already exists.
       }
+      createAtaIxs.push(
+        createAssociatedTokenAccountIdempotentInstruction(
+          ataPayer,
+          ata,
+          owner,
+          mint,
+          TOKEN_2022_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        )
+      );
     };
 
     // Check all 4 ATAs in parallel
@@ -1533,6 +1728,16 @@ export class AnchorClient {
       maybeCreateAta(takerYesAta, takerWallet, yesMint),
       maybeCreateAta(takerNoAta, takerWallet, noMint),
     ]);
+
+    // After a successful send the ATAs in createAtaIxs will exist on-chain.
+    // We mark them as known so the next match for the same wallets skips the
+    // 4 getAccountInfo calls entirely (the common case once traders are warm).
+    if (createAtaIxs.length === 0) {
+      this.markAtaExists(makerYesAta);
+      this.markAtaExists(makerNoAta);
+      this.markAtaExists(takerYesAta);
+      this.markAtaExists(takerNoAta);
+    }
 
     const authIxs: TransactionInstruction[] = [];
     if (makerRequiresAuth) {
@@ -1582,8 +1787,13 @@ export class AnchorClient {
       );
     }
 
+    // When Ed25519 auth instructions are present, using a fee payer override adds
+    // a second signer (64 bytes) which can push the TX over Solana's 1232-byte limit.
+    // In that case, use the relayer as fee payer (it's already a required signer as authority).
+    const useOverride = authIxs.length === 0 ? params.feePayerKeypair : undefined;
+
     const result = await this.submitTransaction([...authIxs, matchIx], [], `MatchV2 ${params.matchSize} shares`, {
-      feePayerOverride: params.feePayerKeypair,
+      feePayerOverride: useOverride,
       skipSimulation: true, // Speed-critical: skip preflight to save 100-500ms
       omitComputeBudgetIxs: true,
       omitJitoTip: true,
@@ -2478,59 +2688,6 @@ export class AnchorClient {
     return signature;
   }
 
-  /**
-   * Atomically resolve a V2 market AND post the merkle root in one TX.
-   * Saves ~2s by eliminating one full TX round-trip between resolve and postMerkleRoot.
-   * Market transitions directly from Open/Closed â†’ Settling.
-   */
-  async resolveAndPostMerkleRootV2(params: {
-    marketPubkey: string;
-    outcome: 'YES' | 'NO';
-    finalPrice: number;
-    merkleRoot: Uint8Array;    // 32 bytes
-    totalAmount: bigint;       // USDC native units (6 decimals)
-    totalSettlements: number;
-  }): Promise<string> {
-    if (!this.isReady()) {
-      throw new Error('Anchor client not ready');
-    }
-
-    const market = new PublicKey(params.marketPubkey);
-    const bitmapPda = getSettlementBitmapPda(market, 0);
-
-    const discriminator = computeDiscriminator('resolve_and_post_merkle_root_v2');
-
-    // Args: outcome (u8) + final_price (u64) + merkle_root [u8;32] + total_amount (u64) + total_settlements (u64)
-    // Total: 1 + 8 + 32 + 8 + 8 = 57 bytes
-    const argsBuffer = Buffer.alloc(57);
-    argsBuffer.writeUInt8(params.outcome === 'YES' ? 0 : 1, 0);
-    const finalPriceU64 = BigInt(Math.floor(params.finalPrice * 100_000_000));
-    argsBuffer.writeBigUInt64LE(finalPriceU64, 1);
-    Buffer.from(params.merkleRoot).copy(argsBuffer, 9, 0, 32);
-    argsBuffer.writeBigUInt64LE(params.totalAmount, 41);
-    argsBuffer.writeBigUInt64LE(BigInt(params.totalSettlements), 49);
-
-    const data = Buffer.concat([discriminator, argsBuffer]);
-
-    const instruction = new TransactionInstruction({
-      programId: PROGRAM_ID,
-      keys: [
-        { pubkey: market, isSigner: false, isWritable: true },
-        { pubkey: bitmapPda, isSigner: false, isWritable: true },
-        { pubkey: this.relayerKeypair!.publicKey, isSigner: true, isWritable: true },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      ],
-      data,
-    });
-
-    const { signature } = await this.submitTransaction(
-      [instruction], [],
-      `ResolveAndPostMerkleRoot ${params.marketPubkey.slice(0, 8)} (${params.outcome}, ${params.totalSettlements} settlements)`,
-      { priorityMicroLamports: 50000 }  // 5x priority for settlement speed
-    );
-    logger.info(`ResolveAndPostMerkleRootV2 executed: ${signature} (outcome=${params.outcome}, settlements=${params.totalSettlements})`);
-    return signature;
-  }
 }
 
 // Singleton instance

@@ -83,6 +83,24 @@ export const config = {
   // The anchor client round-robins TX submission across all available connections
   solanaRpcUrl2: process.env.SOLANA_RPC_URL_2 || '',
   solanaRpcUrl3: process.env.SOLANA_RPC_URL_3 || '',
+  // WebSocket endpoint for confirmation subscriptions. When set, confirmTransaction
+  // uses signatureSubscribe (single socket) instead of hammering getSignatureStatuses
+  // via HTTP polling. Without this, ~20 in-flight confirmations generate ~100 RPC/s
+  // on getSignatureStatuses alone, which trips Helius per-method rate limits.
+  // If empty, we auto-derive wss:// from the execution HTTP URL when it looks like
+  // Helius (helius-rpc.com) or a standard RPC that supports WS at the same host.
+  solanaWsUrl: process.env.SOLANA_WS_URL || '',
+  // Interval for transaction resends while awaiting confirmation. 2s is aggressive
+  // and multiplies per-method load when many txs are in flight; 5s is a safer
+  // default, especially on shared / developer RPC plans.
+  solanaResendIntervalMs: parseInt(process.env.SOLANA_RESEND_INTERVAL_MS || '5000'),
+  // Worker concurrency for the onchain-submit queue. Each slot holds a TX for the
+  // full confirmation window (~10s on devnet), so concurrency × fan-out-per-slot
+  // determines sustained per-method RPC load. With WS confirmation the per-slot
+  // cost is near zero and you can safely run 50+; on HTTP polling you want this
+  // much lower. Leave unset to use the rate-scaled default in the worker.
+  rpcConfirmConcurrency: parseInt(process.env.RPC_CONFIRM_CONCURRENCY || '0'),
+
   // Helius Sender — ultra-low latency TX submission (15 tx/sec vs 5 tx/sec standard)
   // Dual-routes to validators + Jito. Free, no credits consumed. MAINNET ONLY (Jito required).
   // Backend: http://ewr-sender.helius-rpc.com/fast  Frontend: https://sender.helius-rpc.com/fast

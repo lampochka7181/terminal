@@ -191,6 +191,24 @@ export const settlements = pgTable('settlements', {
   confirmedAt: timestamp('confirmed_at'),
 });
 
+// Settlement trees — the authoritative merkle tree for a market, persisted at
+// post-root time. Once the root is on-chain, any retry MUST use these leaves
+// and proofs; rebuilding from mutable positions/trades produces a different
+// tree whose leaves don't hash into the posted root (root is frozen, positions
+// are not). One row per market. Deleted only after the market is fully settled
+// and rent-reclaimed.
+export const settlementTrees = pgTable('settlement_trees', {
+  marketId: uuid('market_id').primaryKey().references(() => markets.id),
+  root: text('root').notNull(),                      // 64-char lowercase hex (32 bytes)
+  totalAmountMicroUsdc: numeric('total_amount', { precision: 20, scale: 0 }).notNull(), // microUSDC
+  totalLeaves: integer('total_leaves').notNull(),
+  paddedSize: integer('padded_size').notNull(),      // next power of 2 ≥ totalLeaves
+  winnerOutcome: varchar('winner_outcome', { length: 3 }).notNull(), // 'YES' | 'NO'
+  leaves: jsonb('leaves').notNull(),                 // Array<{ index, recipient, amountMicroUsdc, positionId, userId }>
+  postedTxSignature: varchar('posted_tx_signature', { length: 88 }),
+  postedAt: timestamp('posted_at').defaultNow().notNull(),
+});
+
 // Balance ledger table
 export const balanceLedger = pgTable('balance_ledger', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -355,6 +373,8 @@ export type Position = typeof positions.$inferSelect;
 export type NewPosition = typeof positions.$inferInsert;
 export type Settlement = typeof settlements.$inferSelect;
 export type NewSettlement = typeof settlements.$inferInsert;
+export type SettlementTree = typeof settlementTrees.$inferSelect;
+export type NewSettlementTree = typeof settlementTrees.$inferInsert;
 export type BalanceLedgerEntry = typeof balanceLedger.$inferSelect;
 export type NewBalanceLedgerEntry = typeof balanceLedger.$inferInsert;
 export type MarketSnapshot = typeof marketSnapshots.$inferSelect;

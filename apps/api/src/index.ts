@@ -16,7 +16,6 @@ import { redis, checkRedisHealth, connectRedis, closeRedisConnection } from './d
 import { authRoutes } from './routes/auth.js';
 import { marketRoutes } from './routes/markets.js';
 import { orderRoutes } from './routes/orders.js';
-import { perfRoutes } from './routes/perf.js';
 import { userRoutes } from './routes/user.js';
 import { tradesRoutes } from './routes/trades.js';
 import { agentRoutes } from './routes/agents.js';
@@ -395,7 +394,6 @@ async function main() {
   await app.register(authRoutes, { prefix: '/auth' });
   await app.register(marketRoutes, { prefix: '/markets' });
   await app.register(orderRoutes, { prefix: '/orders' });
-  await app.register(perfRoutes, { prefix: '/perf' });
   await app.register(userRoutes, { prefix: '/user' });
   await app.register(tradesRoutes, { prefix: '/trades' });
   await app.register(agentRoutes, { prefix: '/agents' });
@@ -536,12 +534,17 @@ async function main() {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  // Prevent crashes from unhandled promise rejections (e.g., network timeouts)
-  process.on('unhandledRejection', (reason, promise) => {
-    logger.error(`Unhandled promise rejection: ${reason}`);
+  // Prevent crashes from unhandled promise rejections (e.g., network timeouts).
+  // Log a stack trace when available — without it we can't tell which call site
+  // leaked the promise, which makes these impossible to chase down.
+  process.on('unhandledRejection', (reason) => {
+    const err = reason as any;
+    const stack = err?.stack || new Error('captured at unhandledRejection').stack;
+    const msg = err?.message || String(reason);
+    logger.error({ err, stack }, `Unhandled promise rejection: ${msg}`);
   });
   process.on('uncaughtException', (err) => {
-    logger.error(`Uncaught exception (non-fatal): ${err.message}`);
+    logger.error({ err, stack: err.stack }, `Uncaught exception (non-fatal): ${err.message}`);
     // Don't exit — keep the server running
   });
 

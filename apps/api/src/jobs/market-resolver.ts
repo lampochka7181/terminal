@@ -5,8 +5,7 @@ import { priceFeedService } from '../services/price-feed.service.js';
 import { logger, logEvents } from '../lib/logger.js';
 import { broadcastMarketResolved } from '../lib/broadcasts.js';
 import { anchorClient } from '../lib/anchor-client.js';
-import { prepareSettlementData } from './position-settler.js';
-import { triggerMerkleSettlement, preSeedSettlingState, getPreSeededMerkleData, markRootPosted, invalidateSettlingState } from './merkle-settler.js';
+import { triggerMerkleSettlement } from './merkle-settler.js';
 import { tryAdvisoryLock, releaseAdvisoryLock } from '../lib/advisory-lock.js';
 /**
  * Market Resolver Job
@@ -216,70 +215,13 @@ async function resolveMarket(
     }
   };
   
-  // Start settlement prep in parallel with resolve
-  const settlementPrepPending = prepareSettlementData(marketId);
-  
-  // Pre-build merkle tree from settlement data fetched in parallel with resolve TX.
-  // This runs BEFORE the resolve TX confirms, so the tree is ready the instant it does.
-  const settlementPrepData = await settlementPrepPending;
-  if (settlementPrepData && settlementPrepData.positions.length > 0) {
-    preSeedSettlingState(marketId, outcome, settlementPrepData.positions, settlementPrepData.walletMap);
-  }
-
-  // Try combined resolve+postMerkleRoot in a single TX (saves ~2s)
-  const merkleData = getPreSeededMerkleData(marketId);
-  let usedCombinedTx = false;
-
-  if (anchorClient.isReady() && merkleData) {
-    try {
-      const sig = await anchorClient.resolveAndPostMerkleRootV2({
-        marketPubkey: market.pubkey,
-        outcome,
-        finalPrice,
-        merkleRoot: merkleData.merkleRoot,
-        totalAmount: merkleData.totalAmount,
-        totalSettlements: merkleData.totalSettlements,
-      });
-      logger.info(`✅ MarketV2 resolved+merkleRoot in single TX: ${sig}`);
-      markRootPosted(marketId);
-      usedCombinedTx = true;
-    } catch (err: any) {
-      const errorMsg = err.message || '';
-      if (errorMsg.includes('MarketNotExpired') || errorMsg.includes('0x1779')) {
-        logger.warn(`Combined TX failed (clock skew), falling back to separate resolve: ${errorMsg}`);
-      } else if (errorMsg.includes('MarketAlreadyResolved') || errorMsg.includes('0x177B')) {
-        logger.debug(`Market ${marketId} already resolved on-chain, continuing`);
-      } else if (errorMsg.includes('AccountNotInitialized') || errorMsg.includes('0xbc4')) {
-        // L-09: Don't auto-archive on transient RPC — require 3 consecutive confirmations
-        const count = (accountNotFoundCount.get(marketId) || 0) + 1;
-        accountNotFoundCount.set(marketId, count);
-        if (count >= 3) {
-          logger.warn(`Market ${marketId} (${market.pubkey}) confirmed not on-chain after ${count} checks. Marking as archived.`);
-          await marketService.markArchived(marketId);
-          accountNotFoundCount.delete(marketId);
-        } else {
-          logger.warn(`Market ${marketId} (${market.pubkey}) not found on-chain (attempt ${count}/3), will retry.`);
-        }
-        return;
-      } else if (
-        errorMsg.includes('InvalidSettlementAmount') ||
-        errorMsg.includes('0x17ab') ||
-        errorMsg.includes('6059')
-      ) {
-        // Settlement amount exceeds on-chain open_interest — pending match TXs haven't
-        // confirmed yet. Fall back to separate resolve; merkle settler will wait for
-        // on-chain state to converge before posting the root.
-        logger.warn(`Combined TX failed (settlement exceeds open_interest — pending matches), falling back to separate resolve`);
-        invalidateSettlingState(marketId);
-      } else {
-        logger.warn(`Combined TX failed, falling back to separate resolve: ${errorMsg}`);
-      }
-    }
-  }
-
-  // Fallback: separate resolve TX if combined didn't work (no merkle data, or combined failed)
-  if (!usedCombinedTx && anchorClient.isReady()) {
-    logger.info(`Resolving market on-chain (fallback): ${market.pubkey} (outcome=${outcome}, price=${finalPrice})`);
+  // Resolve on-chain (separate TX). The merkle settler then builds the tree
+  // from on-chain mint holders after this TX confirms — no pre-seed, no
+  // combined TX. The combined `resolveAndPostMerkleRootV2` instruction was
+  // removed because it committed to a tree built from stale DB positions,
+  // which was the source of repeated settlement-amount drift incidents.
+  if (anchorClient.isReady()) {
+    logger.info(`Resolving market on-chain: ${market.pubkey} (outcome=${outcome}, price=${finalPrice})`);
     await attemptResolve();
   }
 
@@ -291,9 +233,8 @@ async function resolveMarket(
     outcome, strikePrice: strike, finalPrice,
   });
 
-  // Trigger batch settlement. If combined TX was used, processMarketSettlement
-  // skips postMerkleRoot (rootPosted flag) and goes straight to batch creation.
-  // If fallback was used, it does the normal postMerkleRoot first.
+  // Trigger batch settlement. The merkle settler queries on-chain holders
+  // and posts the root itself.
   const resolvedMarket = { ...market, status: 'RESOLVED' as const, outcome, finalPrice: finalPrice.toString() };
   triggerMerkleSettlement(marketId, resolvedMarket as any).catch(err => {
     logger.warn(`[MarketResolver] Direct merkle trigger failed for ${marketId}, polling will pick up: ${(err as Error).message}`);

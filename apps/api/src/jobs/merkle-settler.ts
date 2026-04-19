@@ -1,10 +1,11 @@
 import { eq, and, inArray, sql } from 'drizzle-orm';
 import { PublicKey } from '@solana/web3.js';
 import { TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddress } from '@solana/spl-token';
-import { db, markets, positions, settlements, trades, users } from '../db/index.js';
+import { db, markets, settlements, settlementTrees, users } from '../db/index.js';
 import { positionService } from '../services/position.service.js';
 import { marketService } from '../services/market.service.js';
-import { anchorClient, getYesMintPda, getNoMintPda, fetchMarketV2OnChainState } from '../lib/anchor-client.js';
+import { anchorClient, getYesMintPda, getNoMintPda, fetchMarketV2OnChainState, fetchSettlementBitmap } from '../lib/anchor-client.js';
+import { fetchMintHolders } from '../lib/settlement-snapshot.js';
 import { syncMarketStatusFromChain } from '../lib/chain-sync.js';
 import { buildMerkleTree, createSettlementLeaf, verifyMerkleProof, verifyCompactBridgeProof, type SettlementLeaf, type MerkleTree } from '../lib/merkle-tree.js';
 import { broadcastUserSettlement } from '../lib/broadcasts.js';
@@ -82,287 +83,6 @@ interface SettlingState {
 }
 const settlingState = new Map<string, SettlingState>();
 
-function previewSettlementLeaves(state: SettlingState, limit: number = 5): string[] {
-  return state.leaves.slice(0, limit).map((leaf) =>
-    `${leaf.recipient.toBase58().slice(0, 8)}:${leaf.amount.toString()}`
-  );
-}
-
-function rebuildSettlementTree(state: SettlingState): void {
-  state.leaves = state.leaves.filter((leaf) => leaf.amount > 0n);
-  const treeLeaves: SettlementLeaf[] = state.leaves.map((leaf) => ({
-    recipient: leaf.recipient,
-    amount: leaf.amount,
-  }));
-  state.tree = buildMerkleTree(treeLeaves);
-  state.totalAmount = state.leaves.reduce((sum, leaf) => sum + leaf.amount, 0n);
-}
-
-function reconcileSmallSettlementDrift(state: SettlingState, targetTotal: bigint): boolean {
-  if (state.leaves.length === 0 || state.totalAmount === targetTotal) {
-    return false;
-  }
-
-  const diff = targetTotal - state.totalAmount;
-  if (diff > 0n) {
-    // Tiny undercount from DB rounding: top up winners so total matches chain exactly.
-    state.leaves[0].amount += diff;
-    rebuildSettlementTree(state);
-    return true;
-  }
-
-  let remaining = -diff;
-  for (const leaf of state.leaves) {
-    if (remaining === 0n) break;
-    const reduction = remaining > leaf.amount ? leaf.amount : remaining;
-    leaf.amount -= reduction;
-    remaining -= reduction;
-  }
-
-  rebuildSettlementTree(state);
-  return true;
-}
-
-async function logSettlementDriftDiagnostics(params: {
-  marketId: string;
-  marketPubkey: string;
-  marketStatus: string;
-  marketOutcome: string | null;
-  winnerOutcome: 'YES' | 'NO';
-  state: SettlingState;
-  reason: string;
-  onChainOpenInterest?: bigint;
-  driftLamports?: bigint;
-  attempt?: number;
-}): Promise<void> {
-  try {
-    const marketRow = await db.execute(sql`
-      SELECT
-        status,
-        outcome,
-        COALESCE(open_interest, '0')::text AS open_interest,
-        COALESCE(total_volume, '0')::text AS total_volume
-      FROM markets
-      WHERE id = ${params.marketId}::uuid
-      LIMIT 1
-    `);
-
-    const positionSummary = await db.execute(sql`
-      SELECT
-        COUNT(*)::int AS total_positions,
-        COUNT(*) FILTER (WHERE status = 'OPEN')::int AS open_positions,
-        COALESCE(SUM(yes_shares::numeric), 0)::text AS yes_shares_sum,
-        COALESCE(SUM(no_shares::numeric), 0)::text AS no_shares_sum,
-        COALESCE(SUM(total_cost::numeric), 0)::text AS total_cost_sum,
-        COALESCE(SUM(
-          CASE
-            WHEN ${params.winnerOutcome} = 'YES' THEN yes_shares::numeric
-            ELSE no_shares::numeric
-          END
-        ), 0)::text AS winning_shares_sum
-      FROM positions
-      WHERE market_id = ${params.marketId}::uuid
-    `);
-
-    const tradeSummary = await db.execute(sql`
-      SELECT
-        tx_status,
-        COUNT(*)::int AS trade_count,
-        COALESCE(SUM(size::numeric), 0)::text AS size_sum,
-        COALESCE(SUM(maker_notional::numeric + taker_notional::numeric), 0)::text AS collateral_sum,
-        COALESCE(SUM(taker_fee::numeric), 0)::text AS taker_fee_sum
-      FROM trades
-      WHERE market_id = ${params.marketId}::uuid
-      GROUP BY tx_status
-      ORDER BY tx_status
-    `);
-
-    const unconfirmedTrades = await db.execute(sql`
-      SELECT
-        id,
-        maker_order_id,
-        taker_order_id,
-        tx_status,
-        tx_signature,
-        error_code,
-        COALESCE(size::numeric, 0)::text AS size,
-        COALESCE(maker_notional::numeric + taker_notional::numeric, 0)::text AS collateral,
-        COALESCE(taker_fee::numeric, 0)::text AS taker_fee,
-        executed_at,
-        confirmed_at
-      FROM trades
-      WHERE market_id = ${params.marketId}::uuid
-        AND (tx_status != 'CONFIRMED' OR confirmed_at IS NULL)
-      ORDER BY executed_at DESC
-      LIMIT 10
-    `);
-
-    logger.warn(
-      {
-        reason: params.reason,
-        marketId: params.marketId,
-        marketPubkey: params.marketPubkey,
-        marketStatus: params.marketStatus,
-        marketOutcome: params.marketOutcome,
-        winnerOutcome: params.winnerOutcome,
-        attempt: params.attempt ?? null,
-        onChainOpenInterest: params.onChainOpenInterest?.toString() ?? null,
-        proposedSettlementTotal: params.state.totalAmount.toString(),
-        driftLamports: params.driftLamports?.toString() ?? null,
-        settlementLeaves: params.state.leaves.length,
-        settlementLeafPreview: previewSettlementLeaves(params.state),
-        dbMarket: marketRow.rows?.[0] ?? null,
-        dbPositions: positionSummary.rows?.[0] ?? null,
-        dbTradesByStatus: tradeSummary.rows ?? [],
-        dbUnconfirmedTrades: unconfirmedTrades.rows ?? [],
-      },
-      '[MerkleSettler] Drift diagnostics'
-    );
-  } catch (diagErr: any) {
-    logger.warn(`[MerkleSettler] Drift diagnostics failed: ${diagErr.message}`);
-  }
-}
-
-async function reversePositionForSettlementRepair(
-  userId: string,
-  marketId: string,
-  outcome: 'YES' | 'NO',
-  shares: number,
-  cost: number,
-  wasBuy: boolean,
-): Promise<void> {
-  const userPositions = await db
-    .select()
-    .from(positions)
-    .where(and(eq(positions.userId, userId), eq(positions.marketId, marketId)))
-    .limit(1);
-
-  if (userPositions.length === 0) {
-    return;
-  }
-
-  const pos = userPositions[0];
-  const isYes = outcome === 'YES';
-
-  if (wasBuy) {
-    const currentShares = parseFloat(isYes ? pos.yesShares || '0' : pos.noShares || '0');
-    const newShares = Math.max(0, currentShares - shares);
-    const currentCost = parseFloat(pos.totalCost || '0');
-    const newCost = Math.max(0, currentCost - cost);
-
-    const updates: Record<string, any> = {
-      totalCost: newCost.toString(),
-      updatedAt: new Date(),
-    };
-
-    if (isYes) {
-      updates.yesShares = newShares.toString();
-      if (newShares <= 0) updates.avgEntryYes = '0';
-    } else {
-      updates.noShares = newShares.toString();
-      if (newShares <= 0) updates.avgEntryNo = '0';
-    }
-
-    await db.update(positions).set(updates).where(eq(positions.id, pos.id));
-    return;
-  }
-
-  const currentShares = parseFloat(isYes ? pos.yesShares || '0' : pos.noShares || '0');
-  const newShares = currentShares + shares;
-  const avgEntry = parseFloat(isYes ? pos.avgEntryYes || '0' : pos.avgEntryNo || '0');
-  const costBasis = avgEntry * shares;
-  const realizedPnl = cost - costBasis;
-  const currentRealizedPnl = parseFloat(pos.realizedPnl || '0');
-
-  const updates: Record<string, any> = {
-    realizedPnl: (currentRealizedPnl - realizedPnl).toString(),
-    totalCost: (parseFloat(pos.totalCost || '0') + costBasis).toString(),
-    updatedAt: new Date(),
-  };
-
-  if (isYes) {
-    updates.yesShares = newShares.toString();
-  } else {
-    updates.noShares = newShares.toString();
-  }
-
-  await db.update(positions).set(updates).where(eq(positions.id, pos.id));
-}
-
-async function repairLegacyFailedTradePositions(marketId: string): Promise<number> {
-  const staleFailedTrades = await db
-    .select({
-      id: trades.id,
-      marketId: trades.marketId,
-      makerUserId: trades.makerUserId,
-      takerUserId: trades.takerUserId,
-      takerSide: trades.takerSide,
-      takerOutcome: trades.takerOutcome,
-      makerOutcome: trades.makerOutcome,
-      size: trades.size,
-      takerPrice: trades.takerPrice,
-      makerPrice: trades.makerPrice,
-    })
-    .from(trades)
-    .where(and(
-      eq(trades.marketId, marketId),
-      eq(trades.txStatus, 'FAILED'),
-      sql`${trades.errorCode} IS NULL`,
-    ));
-
-  if (staleFailedTrades.length === 0) {
-    return 0;
-  }
-
-  for (const trade of staleFailedTrades) {
-    const size = parseFloat(trade.size || '0');
-    if (size <= 0 || !trade.marketId) {
-      continue;
-    }
-
-    const takerPrice = parseFloat(trade.takerPrice || '0');
-    const makerPrice = parseFloat(trade.makerPrice || '0');
-    const takerIsBuy = trade.takerSide === 'BID';
-
-    if (trade.takerUserId) {
-      await reversePositionForSettlementRepair(
-        trade.takerUserId,
-        trade.marketId,
-        (trade.takerOutcome as 'YES' | 'NO') || 'YES',
-        size,
-        size * takerPrice,
-        takerIsBuy,
-      );
-    }
-
-    if (trade.makerUserId) {
-      await reversePositionForSettlementRepair(
-        trade.makerUserId,
-        trade.marketId,
-        (trade.makerOutcome as 'YES' | 'NO') || 'YES',
-        size,
-        size * makerPrice,
-        true,
-      );
-    }
-  }
-
-  await db
-    .update(trades)
-    .set({
-      errorCode: 'SETTLEMENT_POSITION_REPAIR',
-      txSignature: null,
-    })
-    .where(and(
-      eq(trades.marketId, marketId),
-      eq(trades.txStatus, 'FAILED'),
-      sql`${trades.errorCode} IS NULL`,
-    ));
-
-  logger.warn(`[MerkleSettler] Repaired ${staleFailedTrades.length} legacy failed trade position(s) before settlement`);
-  return staleFailedTrades.length;
-}
-
 export async function merkleSettlerJob(): Promise<void> {
   if (!anchorClient.isReady()) {
     return;
@@ -407,84 +127,6 @@ export async function merkleSettlerJob(): Promise<void> {
   }
 }
 
-/**
- * Pre-seed the settling state from already-fetched settlement data.
- * Called from market-resolver DURING the resolve TX (parallel prep) so the
- * merkle tree is ready the instant the resolve TX confirms — saves ~300ms
- * of DB queries that buildSettlementState would otherwise do.
- */
-export function preSeedSettlingState(
-  marketId: string,
-  outcome: 'YES' | 'NO',
-  positions: Array<{ id: string; userId: string | null; yesShares: string | null; noShares: string | null }>,
-  walletMap: Map<string, string | null>,
-): boolean {
-  if (settlingState.has(marketId)) return false;
-
-  const leaves: SettlingState['leaves'] = [];
-  for (const position of positions) {
-    const winningSharesStr = outcome === 'YES'
-      ? (position.yesShares || '0')
-      : (position.noShares || '0');
-
-    // M-05: Integer arithmetic for microUSDC conversion
-    const amount = decimalToMicroUsdc(winningSharesStr);
-    if (amount <= 0n) continue;
-
-    const wallet = position.userId ? walletMap.get(position.userId) : null;
-    if (!wallet) continue;
-
-    leaves.push({ recipient: new PublicKey(wallet), amount, positionId: position.id, userId: position.userId });
-  }
-
-  if (leaves.length === 0) return false;
-
-  const treeLeaves: SettlementLeaf[] = leaves.map(l => ({ recipient: l.recipient, amount: l.amount }));
-  const tree = buildMerkleTree(treeLeaves);
-  const totalAmount = leaves.reduce((sum, l) => sum + l.amount, 0n);
-
-  settlingState.set(marketId, { leaves, tree, totalAmount, batchesCreated: false, totalBatches: 0, batchSignatures: [] });
-  logger.info(`[MerkleSettler] Pre-seeded merkle tree: ${leaves.length} leaves, totalAmount=${totalAmount}, root=${Buffer.from(tree.root).toString('hex').slice(0, 16)}...`);
-  return true;
-}
-
-/**
- * Get the pre-seeded merkle tree info for the combined resolve+postMerkleRoot instruction.
- * Returns null if no state is pre-seeded for this market.
- */
-export function getPreSeededMerkleData(marketId: string): {
-  merkleRoot: Uint8Array;
-  totalAmount: bigint;
-  totalSettlements: number;
-} | null {
-  const state = settlingState.get(marketId);
-  if (!state) return null;
-  return {
-    merkleRoot: state.tree.root,
-    totalAmount: state.totalAmount,
-    totalSettlements: state.leaves.length,
-  };
-}
-
-/**
- * Mark that the merkle root was already posted on-chain (via combined instruction).
- * processMarketSettlement will skip the separate postMerkleRoot call.
- */
-export function markRootPosted(marketId: string): void {
-  const state = settlingState.get(marketId);
-  if (state) {
-    state.rootPosted = true;
-  }
-}
-
-/**
- * Invalidate pre-seeded settling state for a market.
- * Called when the combined resolve+postMerkleRoot fails (e.g., settlement
- * amount exceeds open_interest due to pending match TXs).
- */
-export function invalidateSettlingState(marketId: string): void {
-  settlingState.delete(marketId);
-}
 
 /**
  * Direct trigger for merkle settlement — called from market-resolver and
@@ -554,261 +196,197 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
   const settlementStartMs = Date.now();
   logger.info(`[MerkleSettler] Processing market ${marketId} (${market.asset}-${market.timeframe}), outcome=${outcome}`);
 
-  // Step 1: Build settlement state
-  let state = settlingState.get(marketId);
+  // ─────────────────────────────────────────────────────────────────────────
+  // ROUTER: post-root vs pre-root.
+  //
+  // Once the merkle root is on-chain, the tree is immutable. Any rebuild from
+  // current DB state will produce a *different* tree whose leaves won't hash
+  // into the posted root (see: partial-settlement drift incident 2026-04-17).
+  //
+  // If has_merkle_root on-chain, load the authoritative tree from
+  // settlement_trees and skip drift + postMerkleRoot. The downstream batch
+  // enqueue logic filters against the on-chain bitmap so already-claimed
+  // leaves aren't re-submitted.
+  //
+  // If has_merkle_root on-chain AND no persisted tree exists, we've lost the
+  // authoritative state — escalate to SETTLEMENT_FAILED instead of silently
+  // rebuilding from current mutable DB state.
+  // ─────────────────────────────────────────────────────────────────────────
+  let claimedLeafIndices: Set<number> | null = null;
+  let state: SettlingState | undefined;
+  try {
+    const chain = await fetchMarketV2OnChainState(
+      anchorClient.getConnection(),
+      new PublicKey(marketPubkey),
+    );
+    if (chain?.hasMerkleRoot) {
+      state = settlingState.get(marketId);
+      if (!state) {
+        const loaded = await loadSettlementTree(marketId);
+        if (!loaded) {
+          logger.error(
+            `[MerkleSettler] Market ${marketId} (${market.asset}-${market.timeframe}) has merkle root on-chain ` +
+            `but no persisted tree in settlement_trees. This means the tree was posted before the ` +
+            `persistence layer was deployed, or the DB row was lost. Rebuilding from mutable DB state would ` +
+            `produce a tree that doesn't hash into the on-chain root. Marking as SETTLEMENT_FAILED.`
+          );
+          await marketService.markSettlementFailed(marketId);
+          settlingState.delete(marketId);
+          marketFailureCount.delete(marketId);
+          return;
+        }
+        state = loaded;
+        state.rootPosted = true; // Skip pre-root drift + postMerkleRoot in existing flow
+        settlingState.set(marketId, state);
+        logger.info(
+          `[MerkleSettler] Loaded persisted tree for ${market.asset}-${market.timeframe}: ` +
+          `${state.leaves.length} leaves, root=${Buffer.from(state.tree.root).toString('hex').slice(0, 16)}...`
+        );
+      } else {
+        // In-memory state exists; ensure rootPosted is set so the post-root
+        // flow below takes effect.
+        state.rootPosted = true;
+      }
+
+      // Read bitmap(s) to know which leaves are already claimed. The enqueue
+      // loop below skips batches whose indices are fully contained in this set.
+      const chunkCount = Math.max(1, Math.ceil(state.leaves.length / 8192));
+      claimedLeafIndices = new Set<number>();
+      for (let chunk = 0; chunk < chunkCount; chunk++) {
+        try {
+          const chunkClaimed = await fetchSettlementBitmap(
+            anchorClient.getConnection(),
+            new PublicKey(marketPubkey),
+            chunk,
+          );
+          for (const idx of chunkClaimed) claimedLeafIndices.add(idx);
+        } catch (bmErr: any) {
+          logger.warn(`[MerkleSettler] Bitmap read failed for chunk ${chunk}: ${bmErr.message}`);
+        }
+      }
+
+      // Fast path: all leaves claimed on-chain → settlement is done; let the
+      // existing step 4+ finalize path run (batch completion check will see
+      // everything COMPLETED / or we re-sync settlement_jobs below).
+      if (
+        chain.settlementsTotal > 0n &&
+        chain.settlementsProcessed >= chain.settlementsTotal
+      ) {
+        logger.info(
+          `[MerkleSettler] On-chain settlement complete (${chain.settlementsProcessed}/${chain.settlementsTotal}) ` +
+          `for ${market.asset}-${market.timeframe}; reconciling DB and finalizing.`
+        );
+        // Mark any non-COMPLETED settlement_jobs as COMPLETED since on-chain
+        // truth says they all landed. Safe: we're post-hoc recording reality.
+        await db.execute(sql`
+          UPDATE settlement_jobs
+          SET status = 'COMPLETED', completed_at = COALESCE(completed_at, NOW())
+          WHERE market_id = ${marketId}::uuid AND status != 'COMPLETED'
+        `).catch(() => { /* non-fatal */ });
+        // batchesCreated is true so the existing code won't re-enqueue.
+        state.batchesCreated = true;
+      }
+    }
+  } catch (err: any) {
+    logger.warn(`[MerkleSettler] Post-root router read failed, falling back to pre-root path: ${err.message}`);
+  }
+
+  // ─── Unified flow (both paths converge here) ────────────────────────────
+  // Step 1: Build settlement state (pre-root only — post-root already loaded)
   if (!state) {
-    const built = await buildSettlementState(market, outcome);
+    state = settlingState.get(marketId);
+  }
+  if (!state) {
+    // Build settlement state from on-chain mint holders. The
+    // `buildSettlementStateFromChain` call invariant-checks
+    // `sum(holders) === open_interest` and returns null if it doesn't match,
+    // which we treat as either "nothing to settle" (open_interest == 0) or a
+    // protocol-level bug requiring manual review (SETTLEMENT_FAILED).
+    const chainForBuild = await fetchMarketV2OnChainState(
+      anchorClient.getConnection(),
+      new PublicKey(marketPubkey),
+    );
+    if (!chainForBuild) {
+      logger.warn(`[MerkleSettler] No on-chain state for ${marketId}, will retry`);
+      return;
+    }
+    const built = await buildSettlementStateFromChain(market, outcome, chainForBuild.openInterest);
     if (!built) {
-      await marketService.markSettled(marketId);
-      logEvents.marketSettled({
-        marketId, asset: market.asset, timeframe: market.timeframe,
-        positionsSettled: 0, totalPayout: 0,
-      });
+      if (chainForBuild.openInterest === 0n) {
+        await marketService.markSettled(marketId);
+        logEvents.marketSettled({
+          marketId, asset: market.asset, timeframe: market.timeframe,
+          positionsSettled: 0, totalPayout: 0,
+        });
+      } else {
+        await marketService.markSettlementFailed(marketId);
+      }
       return;
     }
     state = built;
     settlingState.set(marketId, state);
   }
 
-  // Step 2: Validate settlement amount against on-chain open_interest, then post merkle root
+  // Step 2: Post merkle root on-chain.
   //
-  // The matching engine updates DB positions IMMEDIATELY when orders match, but
-  // on-chain match TXs go through BullMQ and may still be pending. Once the market
-  // resolves on-chain, pending match TXs will FAIL (market no longer Open), and the
-  // db-sync worker reverses those positions. We must wait for this to happen.
+  // No pre-root drift check needed — buildSettlementStateFromChain already
+  // enforced sum(holders) === open_interest as an invariant, so the tree we
+  // post is guaranteed to match. If state.rootPosted is true (post-root path
+  // loaded an existing tree from settlement_trees), we skip posting.
   if (!state.rootPosted) {
     try {
-      const chainState = await fetchMarketV2OnChainState(
-        anchorClient.getConnection(),
-        new PublicKey(marketPubkey),
-      );
-      if (chainState) {
-        const onChainOI = chainState.openInterest;
-        if (state.totalAmount !== onChainOI) {
-          const PRECISION_DRIFT_THRESHOLD = 1000n; // 1000 lamports = $0.001
-
-          if (state.totalAmount > onChainOI) {
-            const repairedTradeCount = await repairLegacyFailedTradePositions(marketId);
-            if (repairedTradeCount > 0) {
-              settlingState.delete(marketId);
-              const rebuiltAfterRepair = await buildSettlementState(market, outcome);
-              if (!rebuiltAfterRepair) {
-                await marketService.markSettled(marketId);
-                marketFailureCount.delete(marketId);
-                return;
-              }
-
-              state = rebuiltAfterRepair;
-              settlingState.set(marketId, state);
-
-              if (state.totalAmount <= onChainOI) {
-                logger.warn(
-                  `[MerkleSettler] Settlement drift resolved after repairing ${repairedTradeCount} legacy failed trade(s): ` +
-                  `totalAmount=${state.totalAmount}, onChainOpenInterest=${onChainOI}`
-                );
-                marketFailureCount.delete(marketId);
-              }
-            }
-          }
-
-          if (state.totalAmount !== onChainOI) {
-            const drift = state.totalAmount - onChainOI;
-            const absDrift = drift < 0n ? -drift : drift;
-
-            if (absDrift <= PRECISION_DRIFT_THRESHOLD) {
-              const beforeAdjust = state.totalAmount;
-              await logSettlementDriftDiagnostics({
-                marketId,
-                marketPubkey,
-                marketStatus: market.status,
-                marketOutcome: market.outcome,
-                winnerOutcome: outcome,
-                state,
-                reason: drift < 0n ? 'pre_post_root_precision_top_up' : 'pre_post_root_precision_cap',
-                onChainOpenInterest: onChainOI,
-                driftLamports: drift,
-              });
-              reconcileSmallSettlementDrift(state, onChainOI);
-              settlingState.set(marketId, state);
-              marketFailureCount.delete(marketId);
-              logger.warn(
-                `[MerkleSettler] Reconciled small settlement drift to exact on-chain open_interest: ` +
-                `before=${beforeAdjust}, after=${state.totalAmount}, drift=${drift}`
-              );
-            }
-
-            if (state.totalAmount === onChainOI) {
-              // Precision drift has been reconciled in-memory; continue to postMerkleRoot.
-            } else if (state.totalAmount > onChainOI) {
-              const count = (marketFailureCount.get(marketId) || 0) + 1;
-              marketFailureCount.set(marketId, count);
-
-            // Small drift (<1000 lamports / $0.001) is precision rounding from
-            // float→integer aggregation and will NEVER self-resolve. Cap immediately.
-            // Larger drift may be from pending match TXs that haven't been reversed
-            // yet — give them 2 cycles to propagate before capping.
-            const isSmallDrift = drift <= PRECISION_DRIFT_THRESHOLD;
-            const shouldCap = isSmallDrift || count >= 3;
-
-            if (!shouldCap) {
-              await logSettlementDriftDiagnostics({
-                marketId,
-                marketPubkey,
-                marketStatus: market.status,
-                marketOutcome: market.outcome,
-                winnerOutcome: outcome,
-                state,
-                reason: 'pre_post_root_drift_waiting_for_reversal',
-                onChainOpenInterest: onChainOI,
-                driftLamports: drift,
-                attempt: count,
-              });
-              logger.warn(
-                `[MerkleSettler] totalAmount=${state.totalAmount} > on-chain open_interest=${onChainOI} ` +
-                `(drift=${drift}, attempt ${count}/3). Waiting for pending TX reversals.`
-              );
-              // Invalidate pre-seeded state so next cycle rebuilds from fresh DB
-              settlingState.delete(marketId);
-              return;
-            }
-
-            // Cap to on-chain open_interest (the authoritative USDC vault balance)
-            await logSettlementDriftDiagnostics({
-              marketId,
-              marketPubkey,
-              marketStatus: market.status,
-              marketOutcome: market.outcome,
-              winnerOutcome: outcome,
-              state,
-              reason: isSmallDrift ? 'pre_post_root_precision_cap' : 'pre_post_root_persistent_drift_cap',
-              onChainOpenInterest: onChainOI,
-              driftLamports: drift,
-              attempt: count,
-            });
-            logger.warn(
-              `[MerkleSettler] Capping settlement to on-chain open_interest: ` +
-              `drift=${drift} lamports${isSmallDrift ? ' (precision rounding)' : ` (persisted after ${count} attempts)`}`
-            );
-
-            // Invalidate and rebuild from fresh DB state
-            settlingState.delete(marketId);
-            const rebuilt = await buildSettlementState(market, outcome);
-            if (!rebuilt) {
-              await marketService.markSettled(marketId);
-              marketFailureCount.delete(marketId);
-              return;
-            }
-            // Scale each leaf proportionally to fit on-chain open_interest
-            if (rebuilt.totalAmount > onChainOI) {
-              const scale = Number(onChainOI) / Number(rebuilt.totalAmount);
-              for (const leaf of rebuilt.leaves) {
-                leaf.amount = BigInt(Math.floor(Number(leaf.amount) * scale));
-              }
-              rebuilt.totalAmount = rebuilt.leaves.reduce((s, l) => s + l.amount, 0n);
-              // Math.floor rounds each leaf down, so the sum may be a few lamports below
-              // onChainOI. postMerkleRoot requires total_amount == open_interest (exact),
-              // not just <=. Reconcile the rounding remainder into the largest leaf so the
-              // tree total equals the on-chain vault balance exactly.
-              if (rebuilt.totalAmount !== onChainOI) {
-                reconcileSmallSettlementDrift(rebuilt, onChainOI);
-              }
-              // Rebuild merkle tree with final adjusted amounts
-              const treeLeaves: SettlementLeaf[] = rebuilt.leaves.map(l => ({ recipient: l.recipient, amount: l.amount }));
-              rebuilt.tree = buildMerkleTree(treeLeaves);
-              logger.info(`[MerkleSettler] Capped totalAmount to ${rebuilt.totalAmount} (scale=${scale.toFixed(8)}, drift was ${drift} lamports)`);
-            }
-            state = rebuilt;
-            settlingState.set(marketId, state);
-            marketFailureCount.delete(marketId);
-            } else {
-              await logSettlementDriftDiagnostics({
-                marketId,
-                marketPubkey,
-                marketStatus: market.status,
-                marketOutcome: market.outcome,
-                winnerOutcome: outcome,
-                state,
-                reason: 'pre_post_root_underfunded_settlement_state',
-                onChainOpenInterest: onChainOI,
-                driftLamports: drift,
-              });
-              logger.warn(
-                `[MerkleSettler] Settlement total is below on-chain open_interest by ${absDrift} lamports. ` +
-                `This is larger than expected precision drift; waiting for rebuild.`
-              );
-              settlingState.delete(marketId);
-              return;
-            }
-          }
-        }
-      }
-    } catch (err: any) {
-      logger.warn(`[MerkleSettler] Could not fetch on-chain market state: ${err.message}`);
-      // Continue anyway — the postMerkleRoot call will fail with a clearer error if needed
-    }
-  }
-
-  if (state.rootPosted) {
-    logger.info(`[MerkleSettler] Merkle root already posted via combined instruction for ${market.asset}-${market.timeframe}, skipping to batch creation`);
-    marketFailureCount.delete(marketId);
-  } else try {
-    const sig = await anchorClient.postMerkleRoot({
-      marketPubkey,
-      merkleRoot: state.tree.root,
-      totalAmount: state.totalAmount,
-      totalSettlements: state.leaves.length,
-    });
-    logger.info(`[MerkleSettler] Merkle root posted for ${market.asset}-${market.timeframe}: ${sig}`);
-    marketFailureCount.delete(marketId);
-    // Skip syncMarketStatusFromChain — the TX just confirmed so we know the
-    // on-chain state is SETTLING. DB stays RESOLVED until finalize. (~300ms saved)
-  } catch (err: any) {
-    const msg = err.message || '';
-    if (msg.includes('MerkleRootAlreadySet') || msg.includes('already in use') || msg.includes('MarketNotSettling')) {
-      logger.debug(`[MerkleSettler] Merkle root already posted for ${marketId}, continuing`);
+      const sig = await anchorClient.postMerkleRoot({
+        marketPubkey,
+        merkleRoot: state.tree.root,
+        totalAmount: state.totalAmount,
+        totalSettlements: state.leaves.length,
+      });
+      logger.info(`[MerkleSettler] Merkle root posted for ${market.asset}-${market.timeframe}: ${sig}`);
+      // Persist the tree we just committed on-chain. On crash recovery the
+      // post-root path loads from this row instead of rebuilding (which
+      // would produce a different tree once any batch has executed).
+      await persistSettlementTree(marketId, state, outcome, sig).catch((persistErr: any) => {
+        logger.error(`[MerkleSettler] Failed to persist settlement tree for ${marketId}: ${persistErr.message}`);
+      });
       marketFailureCount.delete(marketId);
-    } else if (msg.includes('MarketNotResolved') || msg.includes('0x177a')) {
-      // Market is NOT resolved on-chain yet — can't post merkle root.
-      const count = (marketFailureCount.get(marketId) || 0) + 1;
-      marketFailureCount.set(marketId, count);
-      if (count >= MAX_SETTLEMENT_FAILURES) {
-        logger.error(`[MerkleSettler] Market ${marketId} (${market.asset}-${market.timeframe}) not resolved on-chain after ${count} attempts — marking as SETTLEMENT_FAILED`);
+      // Skip syncMarketStatusFromChain — the TX just confirmed so we know the
+      // on-chain state is SETTLING. DB stays RESOLVED until finalize. (~300ms saved)
+    } catch (err: any) {
+      const msg = err.message || '';
+      if (msg.includes('MerkleRootAlreadySet') || msg.includes('already in use') || msg.includes('MarketNotSettling')) {
+        logger.debug(`[MerkleSettler] Merkle root already posted for ${marketId}, continuing`);
+        marketFailureCount.delete(marketId);
+      } else if (msg.includes('MarketNotResolved') || msg.includes('0x177a')) {
+        // Market is NOT resolved on-chain yet — can't post merkle root.
+        const count = (marketFailureCount.get(marketId) || 0) + 1;
+        marketFailureCount.set(marketId, count);
+        if (count >= MAX_SETTLEMENT_FAILURES) {
+          logger.error(`[MerkleSettler] Market ${marketId} (${market.asset}-${market.timeframe}) not resolved on-chain after ${count} attempts — marking as SETTLEMENT_FAILED`);
+          await marketService.markSettlementFailed(marketId);
+          settlingState.delete(marketId);
+          marketFailureCount.delete(marketId);
+        } else {
+          logger.warn(`[MerkleSettler] Market ${marketId} not resolved on-chain (attempt ${count}/${MAX_SETTLEMENT_FAILURES}), will retry next cycle`);
+        }
+        return;
+      } else if (
+        msg.includes('InvalidSettlementAmount') ||
+        msg.includes('0x17ab') ||
+        msg.includes('6059')
+      ) {
+        // Should be unreachable now that the chain-built tree is invariant-
+        // checked, but keep the handler so a program bug surfaces clearly.
+        logger.error(
+          `[MerkleSettler] InvalidSettlementAmount despite chain-sourced invariant ` +
+          `(state.totalAmount=${state.totalAmount}). Marking as SETTLEMENT_FAILED.`
+        );
         await marketService.markSettlementFailed(marketId);
         settlingState.delete(marketId);
         marketFailureCount.delete(marketId);
+        return;
       } else {
-        logger.warn(`[MerkleSettler] Market ${marketId} not resolved on-chain (attempt ${count}/${MAX_SETTLEMENT_FAILURES}), will retry next cycle`);
+        throw err;
       }
-      return;
-    } else if (
-      msg.includes('InvalidSettlementAmount') ||
-      msg.includes('0x17ab') ||
-      msg.includes('6059')
-    ) {
-      // Hit despite pre-check — race between fetch and TX, or chain state changed.
-      // Invalidate and retry; the pre-check logic on next cycle will cap immediately
-      // for small drifts or after 3 cycles for larger ones.
-      const chainState = await fetchMarketV2OnChainState(
-        anchorClient.getConnection(),
-        new PublicKey(marketPubkey),
-      ).catch(() => null);
-      await logSettlementDriftDiagnostics({
-        marketId,
-        marketPubkey,
-        marketStatus: market.status,
-        marketOutcome: market.outcome,
-        winnerOutcome: outcome,
-        state,
-        reason: 'post_merkle_root_invalid_settlement_amount',
-        onChainOpenInterest: chainState?.openInterest,
-        driftLamports: chainState ? state.totalAmount - chainState.openInterest : undefined,
-      });
-      logger.warn(`[MerkleSettler] InvalidSettlementAmount despite pre-check. Invalidating state for rebuild with cap.`);
-      settlingState.delete(marketId);
-      // Don't reset failure count — let the pre-check cap logic use it
-      return;
-    } else {
-      throw err;
     }
   }
 
@@ -821,8 +399,13 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
   // Fallback to V2 for tiny trees where compact batching doesn't help.
 
   const TX_LIMIT = 1232;
+  // Calibrated from measured 1237-byte TX for k=8 on devnet (49-holder tree,
+  // 2026-04-18). Solving: 1237 = 425 + 3*32 + 8*X → X = 89.5 → round up to 96.
+  // The old 44-byte estimate omitted: per-entry createATA ix framing, the
+  // recipient wallet account meta (it's written by createATA even if the ATA
+  // is the "remaining account"), and compact-u16 account-index overhead.
   const FIXED_OVERHEAD = 425;  // sig + header + blockhash + 6 fixed accounts + ix framing + discriminator
-  const PER_ENTRY_OVERHEAD = 44;  // amount(8) + ATA account key(32) + createATA dedup(~4)
+  const PER_ENTRY_OVERHEAD = 96;  // recipient ATA meta + createATA framing + wallet meta + amount + compact-u16
 
   const treeDepth = Math.ceil(Math.log2(Math.max(state.leaves.length, 2)));
   const paddedCount = state.tree.paddedSize;
@@ -855,6 +438,81 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
         const realCount = Math.min(subtreeSize, state.leaves.length - startIndex);
         if (realCount <= 0) continue; // skip all-padding subtrees
 
+        // Partial-subtree fallback: when realCount < subtreeSize the V3 compact
+        // instruction has produced InvalidMerkleProof on-chain (2026-04-18,
+        // 1-leaf subtree of size 8). The V2 single-leaf path is proven and
+        // handles the remainder cleanly, so route those leaves through it
+        // instead of wrestling with V3 partial-subtree padding semantics.
+        if (realCount < subtreeSize) {
+          for (let k = 0; k < realCount; k++) {
+            const leafIndex = startIndex + k;
+            if (claimedLeafIndices && claimedLeafIndices.has(leafIndex)) {
+              logger.debug(`[MerkleSettler] Skipping claimed remainder leaf ${leafIndex}`);
+              continue;
+            }
+            const leaf = state.leaves[leafIndex];
+            const thisBatchIdx = batchIdx++;
+            const proof = state.tree.getProof(leafIndex);
+            const leafHash = createSettlementLeaf(leaf.recipient, leaf.amount);
+            if (!verifyMerkleProof(proof, state.tree.root, leafHash, leafIndex)) {
+              throw new Error(`[MerkleSettler] V2 fallback local proof verification failed for leaf ${leafIndex}`);
+            }
+            await db.execute(sql`
+              INSERT INTO settlement_jobs (market_id, batch_index, recipients, amounts, proofs, status)
+              VALUES (
+                ${marketId}::uuid,
+                ${thisBatchIdx},
+                ${JSON.stringify([leaf.recipient.toBase58()])}::jsonb,
+                ${JSON.stringify([leaf.amount.toString()])}::jsonb,
+                ${JSON.stringify([{ index: leafIndex, proof: proof.map(p => Buffer.from(p).toString('hex')) }])}::jsonb,
+                'PENDING'
+              )
+              ON CONFLICT (market_id, batch_index) DO NOTHING
+            `);
+            const jobId = `batch-settle-${marketId}-${thisBatchIdx}`;
+            await onchainSubmitQueue.add('batch-settle', {
+              type: 'batch-settle' as const,
+              idempotencyKey: jobId,
+              payload: {
+                marketPubkey,
+                bitmapChunkIndex: Math.floor(leafIndex / 8192),
+                settlements: [{
+                  recipient: leaf.recipient.toBase58(),
+                  amount: leaf.amount.toString(),
+                  index: leafIndex,
+                  proof: proof.map(p => Buffer.from(p).toString('hex')),
+                }],
+                marketId,
+                batchIndex: thisBatchIdx,
+              },
+            }, { jobId }).catch(err => {
+              logger.error(`[MerkleSettler] Failed to enqueue V2-fallback remainder leaf ${leafIndex}: ${err.message}`);
+            });
+          }
+          continue; // Skip V3 enqueue for this partial subtree
+        }
+
+        // Reserve batchIdx eagerly so that skipping a fully-claimed batch
+        // doesn't shift downstream batch indices. This keeps batch_index ↔
+        // startIndex stable across pre-root and post-root cycles, so any
+        // existing settlement_jobs row matches the row we'd insert.
+        const thisBatchIdx = batchIdx;
+        batchIdx++;
+
+        // Post-root retry: skip batches where every leaf is already claimed
+        // on-chain (bitmap set). Saves a pointless TX that would fail with
+        // AlreadyClaimed and burn a worker slot.
+        if (claimedLeafIndices) {
+          let allClaimed = true;
+          for (let k = 0; k < realCount; k++) {
+            if (!claimedLeafIndices.has(startIndex + k)) { allClaimed = false; break; }
+          }
+          if (allClaimed) {
+            logger.debug(`[MerkleSettler] Skipping fully-claimed V3 batch ${thisBatchIdx} @ index=${startIndex}`);
+            continue;
+          }
+        }
+
         const batchLeaves = state.leaves.slice(startIndex, startIndex + realCount);
         const bridgeProof = state.tree.getSubtreeBridgeProof(startIndex, subtreeSize);
 
@@ -871,7 +529,7 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
           INSERT INTO settlement_jobs (market_id, batch_index, recipients, amounts, proofs, status)
           VALUES (
             ${marketId}::uuid,
-            ${batchIdx},
+            ${thisBatchIdx},
             ${JSON.stringify(batchLeaves.map(l => l.recipient.toBase58()))}::jsonb,
             ${JSON.stringify(batchLeaves.map(l => l.amount.toString()))}::jsonb,
             ${JSON.stringify({ version: 'v3', startIndex, subtreeSize, bridgeProof: bridgeProof.map(p => Buffer.from(p).toString('hex')) })}::jsonb,
@@ -881,7 +539,7 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
         `);
 
         // Enqueue as V3 batch-settle job
-        const jobId = `batch-settle-v3-${marketId}-${batchIdx}`;
+        const jobId = `batch-settle-v3-${marketId}-${thisBatchIdx}`;
         await onchainSubmitQueue.add('batch-settle-v3', {
           type: 'batch-settle-v3' as const,
           idempotencyKey: jobId,
@@ -896,13 +554,11 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
             })),
             bridgeProof: bridgeProof.map(p => Buffer.from(p).toString('hex')),
             marketId,
-            batchIndex: batchIdx,
+            batchIndex: thisBatchIdx,
           },
         }, { jobId }).catch(err => {
-          logger.error(`[MerkleSettler] Failed to enqueue V3 batch ${batchIdx}: ${err.message}`);
+          logger.error(`[MerkleSettler] Failed to enqueue V3 batch ${thisBatchIdx}: ${err.message}`);
         });
-
-        batchIdx++;
       }
 
       state.totalBatches = batchIdx;
@@ -922,6 +578,20 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
       for (let start = 0, batchIdx = 0; start < state.leaves.length; batchIdx++) {
         const chunkBoundary = (Math.floor(start / 8192) + 1) * 8192;
         const end = Math.min(start + batchSize, state.leaves.length, chunkBoundary);
+
+        // Post-root retry: skip batches whose leaves are fully claimed on-chain
+        if (claimedLeafIndices) {
+          let allClaimed = true;
+          for (let idx = start; idx < end; idx++) {
+            if (!claimedLeafIndices.has(idx)) { allClaimed = false; break; }
+          }
+          if (allClaimed) {
+            logger.debug(`[MerkleSettler] Skipping fully-claimed V2 batch [${start}..${end})`);
+            start = end;
+            continue;
+          }
+        }
+
         const batchLeaves = state.leaves.slice(start, end);
 
         const batchSettlements = batchLeaves.map((leaf, i) => {
@@ -1140,118 +810,86 @@ async function processMarketSettlement(market: typeof markets.$inferSelect): Pro
     DELETE FROM settlement_jobs WHERE market_id = ${marketId}::uuid
   `);
 
+  // Clean up persisted merkle tree — market is fully settled and finalized
+  // on-chain, so the tree no longer serves any recovery purpose. Keeping it
+  // wastes ~1KB per resolved market over time.
+  await db.execute(sql`
+    DELETE FROM settlement_trees WHERE market_id = ${marketId}::uuid
+  `).catch((err: any) => {
+    logger.warn(`[MerkleSettler] Failed to clean settlement_trees row for ${marketId}: ${err.message}`);
+  });
+
   const settlementElapsedMs = Date.now() - settlementStartMs;
   logger.info(`[MerkleSettler] Market ${market.asset}-${market.timeframe} fully settled [${settlementElapsedMs}ms total]`);
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-async function buildSettlementState(
+/**
+ * Chain-sourced settlement state builder.
+ *
+ * Queries the winning mint's holders on-chain (via Helius DAS, or gPA fallback)
+ * and builds leaves directly from token account balances. The invariant
+ *   sum(holder balances) === market.open_interest
+ * must hold by protocol construction — if it doesn't, the Anchor program
+ * itself has a bug (mint supplies out of sync with the vault) and we refuse
+ * to post a tree. The caller escalates to SETTLEMENT_FAILED.
+ *
+ * Does not read the DB `positions` table. DB drift cannot propagate here.
+ */
+async function buildSettlementStateFromChain(
   market: typeof markets.$inferSelect,
   outcome: 'YES' | 'NO',
+  onChainOpenInterest: bigint,
 ): Promise<SettlingState | null> {
-  const openPositions = await positionService.getPositionsForSettlement(market.id);
-  if (openPositions.length === 0) return null;
+  const marketPubkey = new PublicKey(market.pubkey);
+  const winnerMint = outcome === 'YES' ? getYesMintPda(marketPubkey) : getNoMintPda(marketPubkey);
 
-  // Fetch FAILED trades to subtract phantom shares from position aggregation.
-  //
-  // When an on-chain tx fails, db-sync reverses the optimistic position update. But
-  // if that reversal itself fails silently, or if the historical makerIsBuying bug
-  // caused the reversal to ADD shares instead of subtract (for opening trades), the
-  // position retains phantom shares. Subtracting here prevents totalAmount from
-  // exceeding on-chain open_interest and causing error 6059.
-  //
-  // Phantom share sources per trade:
-  //   - Opening trade (takerSide='BID'): both taker (takerOutcome) and maker (makerOutcome)
-  //     received phantom shares from optimistic update.
-  //   - Closing trade (takerSide='ASK'): db-sync reversal is correct for this path;
-  //     any phantom from closing FAILED trades reduces taker position (no inflation risk).
-  const failedTrades = await db
-    .select({
-      takerUserId: trades.takerUserId,
-      makerUserId: trades.makerUserId,
-      takerSide: trades.takerSide,
-      takerOutcome: trades.takerOutcome,
-      makerOutcome: trades.makerOutcome,
-      size: trades.size,
-    })
-    .from(trades)
-    .where(and(eq(trades.marketId, market.id), eq(trades.txStatus, 'FAILED')));
-
-  // Build per-user phantom share map for the winning outcome.
-  // Only opening trades (takerSide='BID') can inflate the winning-side position.
-  const phantomMicroByUser = new Map<string, bigint>();
-  for (const trade of failedTrades) {
-    if (trade.takerSide !== 'BID') continue; // closing-trade failures don't inflate positions
-    const size = parseFloat(trade.size || '0');
-    if (size <= 0) continue;
-    const sizeMicro = BigInt(Math.round(size * 1_000_000));
-
-    if (trade.takerUserId && trade.takerOutcome === outcome) {
-      const prev = phantomMicroByUser.get(trade.takerUserId) ?? 0n;
-      phantomMicroByUser.set(trade.takerUserId, prev + sizeMicro);
-    }
-    if (trade.makerUserId && trade.makerOutcome === outcome) {
-      const prev = phantomMicroByUser.get(trade.makerUserId) ?? 0n;
-      phantomMicroByUser.set(trade.makerUserId, prev + sizeMicro);
-    }
+  const holders = await fetchMintHolders(anchorClient.getConnection(), winnerMint);
+  if (holders.length === 0) {
+    logger.warn(`[MerkleSettler] No on-chain holders of the winning mint for ${market.asset}-${market.timeframe} — nothing to settle`);
+    return null;
   }
 
-  if (phantomMicroByUser.size > 0) {
-    logger.warn(
-      `[MerkleSettler] Subtracting phantom ${outcome} shares from ${phantomMicroByUser.size} ` +
-      `position(s) (${failedTrades.length} FAILED trade(s) in market ${market.id})`
+  const totalAmount = holders.reduce((sum, h) => sum + h.amount, 0n);
+
+  // Invariant: the sum of winning-side balances must equal open_interest. If
+  // it doesn't, either (a) the market account we just read is stale vs the
+  // mint state, or (b) the program has a bug. Retry once on stale reads; if
+  // still off, bail and let the caller escalate.
+  if (totalAmount !== onChainOpenInterest) {
+    logger.error(
+      `[MerkleSettler] Invariant violation for ${market.asset}-${market.timeframe}: ` +
+      `sum(holders)=${totalAmount}, open_interest=${onChainOpenInterest}, drift=${totalAmount - onChainOpenInterest}. ` +
+      `This should not happen on a correctly-functioning program — refusing to post a tree.`
     );
+    return null;
   }
 
-  const userIds = [...new Set(openPositions.map(p => p.userId).filter(Boolean) as string[])];
-  const userWallets = userIds.length > 0
+  // Resolve wallet → userId for WS notifications. Users without a DB row get
+  // paid (the on-chain proof is all they need) but receive no WS push.
+  const walletStrings = holders.map((h) => h.owner.toBase58());
+  const userRows = walletStrings.length > 0
     ? await db.select({ id: users.id, walletAddress: users.walletAddress })
         .from(users)
-        .where(inArray(users.id, userIds))
+        .where(inArray(users.walletAddress, walletStrings))
     : [];
-  const walletMap = new Map(userWallets.map(u => [u.id, u.walletAddress]));
+  const walletToUserId = new Map(userRows.map((u) => [u.walletAddress, u.id]));
 
-  const leaves: SettlingState['leaves'] = [];
-  for (const position of openPositions) {
-    const winningSharesStr = outcome === 'YES'
-      ? (position.yesShares || '0')
-      : (position.noShares || '0');
-
-    // M-05: Use integer arithmetic instead of parseFloat to avoid precision loss
-    const rawAmount = decimalToMicroUsdc(winningSharesStr);
-
-    // Subtract phantom shares from FAILED opening trades. Math.max(0n,...) prevents
-    // going negative if db-sync already correctly reversed some or all phantom shares.
-    const phantomMicro = position.userId ? (phantomMicroByUser.get(position.userId) ?? 0n) : 0n;
-    const amount = rawAmount > phantomMicro ? rawAmount - phantomMicro : 0n;
-
-    if (amount <= 0n) continue;
-
-    const wallet = position.userId ? walletMap.get(position.userId) : null;
-    if (!wallet) {
-      logger.warn(`[MerkleSettler] No wallet for user ${position.userId}, position ${position.id}`);
-      continue;
-    }
-
-    leaves.push({
-      recipient: new PublicKey(wallet),
-      amount,
-      positionId: position.id,
-      userId: position.userId,
-    });
-  }
-
-  if (leaves.length === 0) return null;
-
-  const treeLeaves: SettlementLeaf[] = leaves.map(l => ({
-    recipient: l.recipient,
-    amount: l.amount,
+  const leaves: SettlingState['leaves'] = holders.map((h) => ({
+    recipient: h.owner,
+    amount: h.amount,
+    positionId: '', // not used downstream for chain-sourced trees
+    userId: walletToUserId.get(h.owner.toBase58()) ?? null,
   }));
-  const tree = buildMerkleTree(treeLeaves);
-  const totalAmount = leaves.reduce((sum, l) => sum + l.amount, 0n);
 
-  logger.info(`[MerkleSettler] Built merkle tree: ${leaves.length} leaves, totalAmount=${totalAmount}, root=${Buffer.from(tree.root).toString('hex').slice(0, 16)}...`);
+  const treeLeaves: SettlementLeaf[] = leaves.map((l) => ({ recipient: l.recipient, amount: l.amount }));
+  const tree = buildMerkleTree(treeLeaves);
+
+  logger.info(
+    `[MerkleSettler] Built merkle tree from chain: ${leaves.length} holders, ` +
+    `totalAmount=${totalAmount}, root=${Buffer.from(tree.root).toString('hex').slice(0, 16)}...`
+  );
 
   return {
     leaves,
@@ -1338,4 +976,112 @@ async function syncSettlementToDb(
     positionsSettled: allPositions.length,
     totalPayout,
   });
+}
+
+// ─── Settlement tree persistence ────────────────────────────────────────────
+//
+// Once the merkle root is posted on-chain the tree is immutable. We write the
+// authoritative leaves + structure here so retries and crash recovery can
+// reconstruct the SettlingState without touching mutable positions/trades.
+
+interface PersistedLeaf {
+  index: number;
+  recipient: string;
+  amountMicroUsdc: string; // bigint-as-string
+  positionId: string;
+  userId: string | null;
+}
+
+/**
+ * Persist the merkle tree for a market at post-root time. Idempotent via PK
+ * on market_id — subsequent calls are no-ops. Call this from every path that
+ * successfully posts a root (combined resolve+post in market-resolver, and
+ * the fallback postMerkleRoot in processMarketSettlement).
+ */
+export async function persistSettlementTree(
+  marketId: string,
+  state: SettlingState,
+  winnerOutcome: 'YES' | 'NO',
+  postedTxSignature: string | null,
+): Promise<void> {
+  const leavesJson: PersistedLeaf[] = state.leaves.map((leaf, i) => ({
+    index: i,
+    recipient: leaf.recipient.toBase58(),
+    amountMicroUsdc: leaf.amount.toString(),
+    positionId: leaf.positionId,
+    userId: leaf.userId,
+  }));
+
+  await db.execute(sql`
+    INSERT INTO settlement_trees (
+      market_id, root, total_amount, total_leaves, padded_size,
+      winner_outcome, leaves, posted_tx_signature, posted_at
+    )
+    VALUES (
+      ${marketId}::uuid,
+      ${Buffer.from(state.tree.root).toString('hex')},
+      ${state.totalAmount.toString()}::numeric,
+      ${state.leaves.length},
+      ${state.tree.paddedSize},
+      ${winnerOutcome},
+      ${JSON.stringify(leavesJson)}::jsonb,
+      ${postedTxSignature},
+      NOW()
+    )
+    ON CONFLICT (market_id) DO NOTHING
+  `);
+}
+
+/**
+ * Load the persisted tree for a market and reconstruct a SettlingState. The
+ * merkle tree structure (including the root and all internal nodes) is
+ * rebuilt from leaves via the deterministic builder — since buildMerkleTree
+ * is a pure function of the (recipient, amount) pairs, the reconstructed root
+ * will match the persisted root byte-for-byte. Returns null if no row exists.
+ */
+export async function loadSettlementTree(marketId: string): Promise<SettlingState | null> {
+  const result = await db.execute(sql`
+    SELECT root, total_amount::text AS total_amount, total_leaves, padded_size, leaves
+    FROM settlement_trees
+    WHERE market_id = ${marketId}::uuid
+    LIMIT 1
+  `);
+  const row = result.rows?.[0] as any;
+  if (!row) return null;
+
+  const persistedLeaves: PersistedLeaf[] = row.leaves;
+  const leaves: SettlingState['leaves'] = persistedLeaves
+    .sort((a, b) => a.index - b.index)
+    .map((p) => ({
+      recipient: new PublicKey(p.recipient),
+      amount: BigInt(p.amountMicroUsdc),
+      positionId: p.positionId,
+      userId: p.userId,
+    }));
+
+  const treeLeaves: SettlementLeaf[] = leaves.map((l) => ({ recipient: l.recipient, amount: l.amount }));
+  const tree = buildMerkleTree(treeLeaves);
+
+  // Sanity check: reconstructed root must match persisted root. If not, the
+  // row is corrupted or buildMerkleTree is non-deterministic (should never
+  // happen) — fail loud instead of submitting leaves that won't verify.
+  const expectedRootHex = (row.root as string).toLowerCase();
+  const actualRootHex = Buffer.from(tree.root).toString('hex');
+  if (expectedRootHex !== actualRootHex) {
+    logger.error(
+      `[MerkleSettler] Persisted tree mismatch for ${marketId}: ` +
+      `expected root=${expectedRootHex}, rebuilt=${actualRootHex}. Refusing to use.`
+    );
+    return null;
+  }
+
+  const totalAmount = BigInt(row.total_amount);
+  return {
+    leaves,
+    tree,
+    totalAmount,
+    batchesCreated: false,
+    totalBatches: 0,
+    batchSignatures: [],
+  };
 }

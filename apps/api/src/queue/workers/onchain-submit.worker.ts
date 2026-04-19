@@ -391,11 +391,28 @@ export function startOnchainSubmitWorker(): Worker {
   const extraTxPerSec = extraRpcCount * 2;
   const ratePerSec = baseTxPerSec + extraTxPerSec;
 
-  // Concurrency = max in-flight jobs. Each job holds a slot for ~10-15s on devnet (confirmation time).
-  // Too high → confirmation polling overwhelms RPC rate limits (each active job polls ~0.5 RPC/s).
-  // Formula: ratePerSec × avgConfirmTimeSec, capped conservatively.
-  // With 7 tx/s and ~10s confirm time, we need ~70 slots. But polling overhead limits us to ~40.
-  const concurrency = Math.min(ratePerSec * 5, 50);  // Cap at 50 to limit confirmation polling load
+  // Concurrency = max in-flight jobs. Each job holds a slot for the full
+  // confirmation window (~10-15s on devnet), so concurrency × per-slot-RPC-cost
+  // drives sustained per-method load on the RPC provider.
+  //
+  // With an HTTP-only Connection (no WS endpoint), each slot polls
+  // getSignatureStatuses ~5 req/s, so e.g. 25 slots => 125 req/s on that one
+  // method, which trips Helius per-method limits long before the plan's
+  // overall tx/s budget. With wsEndpoint configured, confirmation is a single
+  // signatureSubscribe per slot and the per-slot cost is near zero.
+  //
+  // Allow explicit override via RPC_CONFIRM_CONCURRENCY so operators can
+  // match their RPC plan without editing code (e.g. set low on Helius Dev,
+  // raise on Business once WS is in place).
+  const defaultConcurrency = Math.min(ratePerSec * 5, 50);
+  const concurrency = config.rpcConfirmConcurrency > 0
+    ? config.rpcConfirmConcurrency
+    : defaultConcurrency;
+  logger.info(
+    `[QUEUE:onchain] concurrency=${concurrency} ` +
+    `(override=${config.rpcConfirmConcurrency > 0 ? 'yes' : 'no'}, ` +
+    `default=${defaultConcurrency}, ratePerSec=${ratePerSec})`
+  );
 
   const worker = new Worker('onchain-submit', processJob, {
     connection: redisOpts(),

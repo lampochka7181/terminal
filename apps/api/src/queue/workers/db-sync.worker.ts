@@ -36,6 +36,19 @@ function redisOpts() {
  * before the on-chain TX confirms. If the TX fails, we need to undo those
  * position changes so the user's shares reflect reality.
  */
+// Strict UUID format check (8-4-4-4-12 hex). The matching service generates a
+// non-UUID synthetic tradeId for one of its on-chain submission paths
+// (`<takerOrderId>-<timestamp>`), and passing that into a `WHERE id = $1::uuid`
+// clause makes Postgres throw `invalid input syntax for type uuid` — which
+// previously bubbled out of the inner SELECT, was swallowed by the function-
+// level try/catch, and skipped the takerOrderId fallback entirely. The result
+// was that every duplicate-clientOrderId-failure (the loser of the dual-enqueue
+// race) left its optimistic position update unreversed → phantom drift.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isUuid(s: unknown): s is string {
+  return typeof s === 'string' && UUID_RE.test(s);
+}
+
 async function reversePositionForFailedTrade(
   tradeId?: string,
   makerOrderId?: string,
@@ -43,22 +56,58 @@ async function reversePositionForFailedTrade(
 ): Promise<{ affectedUserIds: string[]; marketAddress?: string }> {
   const result: { affectedUserIds: string[]; marketAddress?: string } = { affectedUserIds: [] };
   try {
-    // Find the trade record(s) to get details for reversal
+    // Find the trade record(s) to get details for reversal.
+    // Each lookup is wrapped so any single failure (invalid UUID, transient
+    // DB error) doesn't abort the whole reversal — we want to fall through
+    // to alternative identifiers and only give up after exhausting them.
     let tradeRecords: any[] = [];
 
-    if (tradeId) {
-      const result = await db.select().from(trades).where(eq(trades.id, tradeId));
-      tradeRecords = result;
+    if (isUuid(tradeId)) {
+      try {
+        tradeRecords = await db.select().from(trades).where(eq(trades.id, tradeId));
+      } catch (lookupErr: any) {
+        logger.warn(`[QUEUE:db-sync] tradeId lookup failed (${tradeId}): ${lookupErr.message}`);
+      }
+    } else if (tradeId) {
+      // Caller passed a synthetic non-UUID tradeId. Don't even attempt the
+      // lookup — fall through to takerOrderId. This is the common case for
+      // the executeFillsOnChain submission path.
+      logger.debug(`[QUEUE:db-sync] Skipping non-UUID tradeId lookup: ${tradeId}`);
     }
 
-    // If no trade found by ID, try by order IDs
+    // If no trade found by ID, try by order IDs.
     if (tradeRecords.length === 0 && takerOrderId && takerOrderId !== 'pending') {
-      const result = await db.select().from(trades).where(eq(trades.takerOrderId, takerOrderId));
-      tradeRecords = result;
+      try {
+        tradeRecords = await db.select().from(trades).where(eq(trades.takerOrderId, takerOrderId));
+      } catch (lookupErr: any) {
+        logger.warn(`[QUEUE:db-sync] takerOrderId lookup failed (${takerOrderId}): ${lookupErr.message}`);
+      }
+    }
+
+    // Last resort: makerOrderId. Less reliable because a single maker order
+    // can be matched against many trades, but better than silently dropping.
+    if (
+      tradeRecords.length === 0 &&
+      makerOrderId &&
+      !makerOrderId.startsWith('mm_synth_') &&
+      !makerOrderId.startsWith('mm_bailout_') &&
+      !makerOrderId.startsWith('aggregated-mm-')
+    ) {
+      try {
+        tradeRecords = await db.select().from(trades).where(eq(trades.makerOrderId, makerOrderId));
+      } catch (lookupErr: any) {
+        logger.warn(`[QUEUE:db-sync] makerOrderId lookup failed (${makerOrderId}): ${lookupErr.message}`);
+      }
     }
 
     if (tradeRecords.length === 0) {
-      logger.debug(`[QUEUE:db-sync] No trade found for position reversal (tradeId=${tradeId})`);
+      // Elevated to WARN — silently skipping reversal is what produced the
+      // 6.59 USDC phantom drift seen on 2026-04-18. This message is the only
+      // signal that a position was inflated without being reversed.
+      logger.warn(
+        `[QUEUE:db-sync] No trade found for position reversal — phantom position likely. ` +
+        `tradeId=${tradeId} makerOrderId=${makerOrderId} takerOrderId=${takerOrderId}`
+      );
       return result;
     }
 
@@ -130,9 +179,18 @@ async function reversePositionForFailedTrade(
 }
 
 /**
- * Reverse a single user's position update.
- * Buy reversal: subtract shares, reduce total cost
- * Sell reversal: add shares back, undo realized PnL
+ * Reverse a single user's position update — atomic, concurrency-safe.
+ *
+ * Buy reversal: subtract shares, reduce total cost.
+ * Sell reversal: add shares back, undo realized PnL.
+ *
+ * Both operations are expressed as single SQL UPDATE statements that read
+ * from the DB's live values (`positions.*`) rather than a JS-cached snapshot.
+ * Under concurrent writes (e.g., reversal racing with a new fill's
+ * `updateAfterTrade`, or two reversals for adjacent failed trades), this
+ * serializes correctly at the primary-key row lock. The previous
+ * SELECT→compute→UPDATE pattern lost updates under the same load that
+ * produced ~0.1% position undercounts in perf testing.
  */
 async function reverseUserPosition(
   userId: string,
@@ -142,61 +200,62 @@ async function reverseUserPosition(
   cost: number,
   wasBuy: boolean
 ): Promise<void> {
-  const userPositions = await db
-    .select()
-    .from(positions)
-    .where(and(eq(positions.userId, userId), eq(positions.marketId, marketId)))
-    .limit(1);
-
-  if (userPositions.length === 0) return;
-
-  const pos = userPositions[0];
   const isYes = outcome === 'YES';
+  const sharesStr = shares.toString();
+  const costStr = cost.toString();
 
   if (wasBuy) {
-    // Reverse a buy: subtract shares and cost
-    const currentShares = parseFloat(isYes ? pos.yesShares || '0' : pos.noShares || '0');
-    const newShares = Math.max(0, currentShares - shares);
-    const currentCost = parseFloat(pos.totalCost || '0');
-    const newCost = Math.max(0, currentCost - cost);
-
-    const updates: Record<string, any> = {
-      totalCost: newCost.toString(),
-      updatedAt: new Date(),
-    };
-
+    // Reverse a buy: subtract shares and proportional total_cost. When the
+    // reversal zeroes the side, also reset its avgEntry (no basis remains).
     if (isYes) {
-      updates.yesShares = newShares.toString();
-      // Recalculate avgEntry if shares remain, otherwise reset
-      if (newShares <= 0) updates.avgEntryYes = '0';
+      await db.execute(sql`
+        UPDATE positions SET
+          yes_shares    = GREATEST(0::numeric, positions.yes_shares - ${sharesStr}::numeric),
+          total_cost    = GREATEST(0::numeric, positions.total_cost - ${costStr}::numeric),
+          avg_entry_yes = CASE
+            WHEN (positions.yes_shares - ${sharesStr}::numeric) <= 0 THEN 0::numeric
+            ELSE positions.avg_entry_yes
+          END,
+          updated_at    = NOW()
+        WHERE user_id = ${userId}::uuid AND market_id = ${marketId}::uuid
+      `);
     } else {
-      updates.noShares = newShares.toString();
-      if (newShares <= 0) updates.avgEntryNo = '0';
+      await db.execute(sql`
+        UPDATE positions SET
+          no_shares     = GREATEST(0::numeric, positions.no_shares - ${sharesStr}::numeric),
+          total_cost    = GREATEST(0::numeric, positions.total_cost - ${costStr}::numeric),
+          avg_entry_no  = CASE
+            WHEN (positions.no_shares - ${sharesStr}::numeric) <= 0 THEN 0::numeric
+            ELSE positions.avg_entry_no
+          END,
+          updated_at    = NOW()
+        WHERE user_id = ${userId}::uuid AND market_id = ${marketId}::uuid
+      `);
     }
-
-    await db.update(positions).set(updates).where(eq(positions.id, pos.id));
   } else {
-    // Reverse a sell: add shares back, undo realized PnL
-    const currentShares = parseFloat(isYes ? pos.yesShares || '0' : pos.noShares || '0');
-    const newShares = currentShares + shares;
-    const avgEntry = parseFloat(isYes ? pos.avgEntryYes || '0' : pos.avgEntryNo || '0');
-    const costBasis = avgEntry * shares;
-    const realizedPnl = cost - costBasis;
-    const currentRealizedPnl = parseFloat(pos.realizedPnl || '0');
-
-    const updates: Record<string, any> = {
-      realizedPnl: (currentRealizedPnl - realizedPnl).toString(),
-      totalCost: (parseFloat(pos.totalCost || '0') + costBasis).toString(),
-      updatedAt: new Date(),
-    };
-
+    // Reverse a sell: add shares back, restore cost basis (avg_entry * shares
+    // of the added side), undo the realized PnL the original sell booked.
     if (isYes) {
-      updates.yesShares = newShares.toString();
+      await db.execute(sql`
+        UPDATE positions SET
+          yes_shares    = positions.yes_shares + ${sharesStr}::numeric,
+          total_cost    = positions.total_cost + positions.avg_entry_yes * ${sharesStr}::numeric,
+          realized_pnl  = positions.realized_pnl
+                          - (${costStr}::numeric - positions.avg_entry_yes * ${sharesStr}::numeric),
+          updated_at    = NOW()
+        WHERE user_id = ${userId}::uuid AND market_id = ${marketId}::uuid
+      `);
     } else {
-      updates.noShares = newShares.toString();
+      await db.execute(sql`
+        UPDATE positions SET
+          no_shares     = positions.no_shares + ${sharesStr}::numeric,
+          total_cost    = positions.total_cost + positions.avg_entry_no * ${sharesStr}::numeric,
+          realized_pnl  = positions.realized_pnl
+                          - (${costStr}::numeric - positions.avg_entry_no * ${sharesStr}::numeric),
+          updated_at    = NOW()
+        WHERE user_id = ${userId}::uuid AND market_id = ${marketId}::uuid
+      `);
     }
-
-    await db.update(positions).set(updates).where(eq(positions.id, pos.id));
   }
 }
 
@@ -231,8 +290,11 @@ async function processJob(job: Job<DbSyncJobData>): Promise<void> {
   try {
     let updated = false;
 
-    // Update by trade ID (most reliable)
-    if (tradeId) {
+    // Update by trade ID (most reliable). Gate on isUuid: same reason as the
+    // reversal lookup — synthetic non-UUID tradeIds from executeFillsOnChain
+    // would throw `invalid input syntax for type uuid` on this query and
+    // abort the whole try block before the order-id fallbacks could run.
+    if (isUuid(tradeId)) {
       await db.update(trades).set(updateData).where(eq(trades.id, tradeId));
       updated = true;
     }

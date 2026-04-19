@@ -54,3 +54,7 @@ target/
 test-ledger/
 .vercel
 .env*.local
+
+# Loadtest secrets (generated wallets contain private keys)
+apps/loadtest/wallets.json
+apps/loadtest/wallets-*.json
